@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: npm version to publish, for example 1.2.3 or 1.2.3-beta.1.
+        required: true
+        type: string
+      tag:
+        description: npm dist-tag.
+        required: true
+        default: latest
+        type: choice
+        options:
+          - latest
+          - next
+          - beta
+          - alpha
+      access:
+        description: npm package access.
+        required: true
+        default: public
+        type: choice
+        options:
+          - public
+          - restricted
+      dry_run:
+        description: Validate the release without publishing.
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Publish package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          args=("${{ inputs.version }}" "--tag" "${{ inputs.tag }}" "--access" "${{ inputs.access }}" "--provenance")
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            args+=("--dry-run")
+          fi
+          npm run release -- "${args[@]}"

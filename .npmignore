@@ -1,0 +1,48 @@
+# Source and tests
+src/
+*.test.ts
+*.spec.ts
+
+# Local development and build tooling
+build.js
+dev.js
+tsconfig.json
+vitest.config.ts
+scripts/
+
+# Deployment templates
+deploy/
+
+# Docker and local compose files
+.dockerignore
+Dockerfile
+docker-compose.yml
+toolhub.config.compose.json
+
+# CI, editor, and local agent metadata
+.github/
+.claude/
+.agents/
+.codex/
+.vscode/
+.idea/
+
+# Runtime and local configuration
+.env
+.env.*
+gateway.config.json
+.agent-data/
+
+# Test/build byproducts
+coverage/
+.nyc_output/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# dist/ and bin/ are intentionally included.

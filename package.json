@@ -1,19 +1,38 @@
 {
-  "name": "gateway",
+  "name": "next-ai-gateway",
   "version": "1.0.0",
+  "description": "TypeScript Fastify AI protocol gateway for OpenAI, Anthropic, Gemini, MCP and agent workflows.",
   "main": "dist/index.js",
+  "bin": {
+    "next-ai-gateway": "bin/next-ai-gateway.js"
+  },
   "scripts": {
     "dev": "node dev.js",
     "build": "node build.js",
     "start": "node dist/index.js",
+    "prepack": "npm run build",
+    "release": "node scripts/release.mjs",
     "test:sdk:responses": "node scripts/test-openai-responses-sdk.mjs",
     "test": "vitest",
     "test:coverage": "vitest --coverage"
   },
-  "keywords": [],
+  "keywords": [
+    "ai",
+    "gateway",
+    "openai",
+    "anthropic",
+    "gemini",
+    "mcp",
+    "fastify"
+  ],
   "author": "",
   "license": "MIT",
-  "description": "",
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "ts-node": {
     "compilerOptions": {
       "module": "CommonJS"

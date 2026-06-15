@@ -1,5 +1,5 @@
 {
-  "name": "next-ai-gateway",
+  "name": "@the-next-ai/ai-gateway",
   "version": "1.0.0",
   "description": "TypeScript Fastify AI protocol gateway for OpenAI, Anthropic, Gemini, MCP and agent workflows.",
   "main": "dist/index.js",

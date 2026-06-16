@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http';
-import { createServer as createHttp2Server, type Http2Server } from 'node:http2';
+import { createServer as createHttp2Server, type Http2Server, type ServerHttp2Stream } from 'node:http2';
 import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer } from 'ws';
@@ -319,7 +319,7 @@ async function startConfigGrpcJsonServer(payload: unknown): Promise<{
     }
   );
 
-  server.on('stream', (stream, headers) => {
+  server.on('stream', (stream: ServerHttp2Stream, headers) => {
     const chunks: Buffer[] = [];
     stream.on('data', (chunk) => {
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));

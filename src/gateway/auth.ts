@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { FastifyRequest, preHandlerHookHandler } from 'fastify';
-import { isInternalIp } from '../mcp-gateway/policy';
+import { isInternalIp } from '../shared/ip';
 import type { GatewayAuthConfig, GatewayRequestIdentity } from '../types';
 import { readBearerToken, readHeader } from '../utils';
 

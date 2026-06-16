@@ -1145,7 +1145,7 @@ class StdioMcpServerClient {
     this.pendingRequests.delete(id);
 
     if ('error' in payload && isObject(payload.error)) {
-      const errorPayload = payload as JsonRpcErrorResponse;
+      const errorPayload = payload as unknown as JsonRpcErrorResponse;
       pending.reject(
         new Error(
           `MCP request failed (${this.server.name}): ${errorPayload.error.code} ${errorPayload.error.message}`
@@ -1155,7 +1155,7 @@ class StdioMcpServerClient {
     }
 
     if ('result' in payload) {
-      const successPayload = payload as JsonRpcSuccessResponse;
+      const successPayload = payload as unknown as JsonRpcSuccessResponse;
       pending.resolve(successPayload.result);
       return;
     }
@@ -1524,7 +1524,7 @@ class WebSocketMcpServerClient implements McpServerClient {
     this.pendingRequests.delete(id);
 
     if ('error' in payload && isObject(payload.error)) {
-      const errorPayload = payload as JsonRpcErrorResponse;
+      const errorPayload = payload as unknown as JsonRpcErrorResponse;
       pending.reject(
         new Error(
           `MCP request failed (${this.server.name}): ${errorPayload.error.code} ${errorPayload.error.message}`
@@ -1534,7 +1534,7 @@ class WebSocketMcpServerClient implements McpServerClient {
     }
 
     if ('result' in payload) {
-      const successPayload = payload as JsonRpcSuccessResponse;
+      const successPayload = payload as unknown as JsonRpcSuccessResponse;
       pending.resolve(successPayload.result);
       return;
     }

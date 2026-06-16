@@ -441,7 +441,7 @@ function countImageInputs(value: unknown): number {
     return 1;
   }
 
-  return Object.values(value).reduce((sum, item) => sum + countImageInputs(item), 0);
+  return Object.values(value).reduce<number>((sum, item) => sum + countImageInputs(item), 0);
 }
 
 function isImageBlock(value: Record<string, unknown>): boolean {

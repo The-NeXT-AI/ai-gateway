@@ -161,7 +161,7 @@ describe('openai sdk responses integration', () => {
 });
 
 function createInjectFetch(app: ReturnType<typeof Fastify>) {
-  return async function injectFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  return async function injectFetch(input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> {
     const request = new Request(input, init);
     const url = new URL(request.url);
 
@@ -301,7 +301,7 @@ function createConfig(providers: ProviderConfig[]): GatewayConfig {
         headers: {}
       }
     }
-  } as GatewayConfig;
+  } as unknown as GatewayConfig;
 }
 
 function createProviderConfig(

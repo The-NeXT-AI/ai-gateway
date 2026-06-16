@@ -101,7 +101,7 @@ function createConfig(): GatewayConfig {
     providers: [],
     defaultTargetProviders: [],
     openaiBaseUrl: 'https://api.openai.com/v1'
-  } as GatewayConfig;
+  } as unknown as GatewayConfig;
 }
 
 function createProviderConfig(name: string): ProviderConfig {

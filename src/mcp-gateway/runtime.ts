@@ -2,6 +2,9 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
 import type { FastifyRequest } from 'fastify';
 import { createMcpAgentToolProvider, type AgentToolProvider } from '../agent/tools';
+import { createInitialGuards } from '../agent/guards';
+import { createInitialTaskState } from '../agent/task-state';
+import { createTranscriptWindow } from '../agent/transcript-window';
 import type {
   AgentEvent,
   AgentSessionState,
@@ -789,17 +792,20 @@ function buildExecutionInput(
 
   return {
     args,
-    session: {
-      sessionId,
-      agentId: 'mcp-gateway',
-      systemPrompt: 'MCP gateway runtime session',
-      allowedTools: [toolName],
-      memoryRefs: [],
-      messages: [],
-      pendingToolCalls: {},
-      lastEventOffset: 0,
-      updatedAt: now
-    },
+      session: {
+        sessionId,
+        agentId: 'mcp-gateway',
+        systemPrompt: 'MCP gateway runtime session',
+        allowedTools: [toolName],
+        memoryRefs: [],
+        messages: [],
+        pendingToolCalls: {},
+        taskState: createInitialTaskState(sessionId),
+        transcriptWindow: createTranscriptWindow(),
+        guards: createInitialGuards(),
+        lastEventOffset: 0,
+        updatedAt: now
+      },
     event: {
       id: randomUUID(),
       type: 'TOOL_CALL_REQUESTED',

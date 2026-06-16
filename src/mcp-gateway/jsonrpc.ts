@@ -135,7 +135,7 @@ export function buildJsonRpcErrorResponse(
   };
 }
 
-function isValidJsonRpcId(value: unknown): boolean {
+function isValidJsonRpcId(value: unknown): value is string | number | null | undefined {
   return value === undefined || value === null || typeof value === 'string' || typeof value === 'number';
 }
 

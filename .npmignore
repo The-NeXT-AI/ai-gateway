@@ -6,7 +6,7 @@ src/
 # Local development and build tooling
 build.js
 dev.js
-tsconfig.json
+tsconfig*.json
 vitest.config.ts
 scripts/
 

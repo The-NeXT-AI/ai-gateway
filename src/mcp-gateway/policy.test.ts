@@ -1,3 +1,4 @@
+import { describe, expect, it } from 'vitest';
 import type { AgentToolDefinition } from '../agent/types';
 import type { McpGatewayConfig, McpGatewayPrincipalConfig } from '../types';
 import {

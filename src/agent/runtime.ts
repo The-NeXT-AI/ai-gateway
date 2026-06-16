@@ -1643,7 +1643,7 @@ export class EventDrivenAgentRuntime {
         selectedModelRef = parseProviderModelReference(session.model);
         if (session.model && !selectedModelRef) {
           this.publishInternalEvent(triggerEvent, 'AGENT_REPLY', {
-            text: `Invalid session model format "${session.model}". Use provider/model or providerName/model, e.g. openai/gpt-4o-mini or iflow/qwen3-coder-plus.`
+            text: `Invalid session model format "${session.model}". Use provider/model or providerName/model, e.g. openai/gpt-4o-mini or custom-provider/custom-model.`
           });
           return;
         }
@@ -1742,7 +1742,7 @@ export class EventDrivenAgentRuntime {
                 } finally {
                   if (streamTimedOut) {
                     try {
-                      streamIterator.return?.()?.catch?.(() => undefined);
+                      streamIterator.return?.(undefined)?.catch?.(() => undefined);
                     } catch {
                       // Ignore generator cleanup failures; timeout handling continues below.
                     }
@@ -3090,7 +3090,7 @@ function normalizeExternalSessionSnapshots(value: unknown[]): PersistedSessionSn
 
     const eventsCandidate = Array.isArray(item.events) ? item.events : [];
     snapshots.push({
-      state: stateCandidate as AgentSessionState,
+      state: stateCandidate as unknown as AgentSessionState,
       events: eventsCandidate as AgentEventRecord[]
     });
   }
@@ -3189,10 +3189,13 @@ function resolveAgentRuntimeConfig(config: GatewayConfig): {
   const runtime = isObject(config.agent?.runtime)
     ? (config.agent.runtime as Partial<Record<string, unknown>>)
     : undefined;
+  const configuredSessionLockTimeoutMs = runtime?.sessionLockTimeoutMs;
 
   const sessionLockTimeoutMs =
-    Number.isFinite(runtime?.sessionLockTimeoutMs) && (runtime.sessionLockTimeoutMs as number) > 0
-      ? Math.floor(runtime.sessionLockTimeoutMs as number)
+    typeof configuredSessionLockTimeoutMs === 'number' &&
+    Number.isFinite(configuredSessionLockTimeoutMs) &&
+    configuredSessionLockTimeoutMs > 0
+      ? Math.floor(configuredSessionLockTimeoutMs)
       : DEFAULT_SESSION_LOCK_TIMEOUT_MS;
 
   return {

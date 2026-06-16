@@ -131,12 +131,7 @@ describe('parseProviderStreamChunks', () => {
     const ssePayload = frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('');
 
     const response = new Response(
-      new ReadableStream<string>({
-        start(controller) {
-          controller.enqueue(ssePayload);
-          controller.close();
-        }
-      }),
+      ssePayload,
       {
         status: 200,
         headers: {
@@ -210,7 +205,7 @@ describe('buildProviderRequest', () => {
           }
         }
       }
-    } as GatewayConfig;
+    } as unknown as GatewayConfig;
 
     const previousSecret = process.env.AUTH_INTROSPECTION_SHARED_SECRET;
     process.env.AUTH_INTROSPECTION_SHARED_SECRET = 'internal-secret';

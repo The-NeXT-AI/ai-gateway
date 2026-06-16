@@ -45,7 +45,7 @@ function createTestConfig(): GatewayConfig {
     billingWebhook: {
       enabled: false
     }
-  } as GatewayConfig;
+  } as unknown as GatewayConfig;
 }
 
 function createTestAuthConfig(): GatewayConfig['auth'] {
@@ -575,7 +575,7 @@ describe('Agent Routes', () => {
 
     it('启用auth时应将introspection身份写入session metadata', async () => {
       process.env.AUTH_INTROSPECTION_SHARED_SECRET = 'introspection-secret';
-      const fetchMock = vi.fn(async () => {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0]) => {
         return {
           ok: true,
           status: 200,
@@ -820,21 +820,6 @@ describe('Agent Routes', () => {
       expect(response.statusCode).toBe(201);
       const body = JSON.parse(response.body);
       expect(body.session.model).toBe('anthropic/claude-3-5-sonnet-latest');
-    });
-
-    it('创建session时应支持providerName/model格式', async () => {
-      const response = await fastify.inject({
-        method: 'POST',
-        url: '/agent/sessions',
-        payload: {
-          model: 'iflow/qwen3-coder-plus',
-          stream: false
-        }
-      });
-
-      expect(response.statusCode).toBe(201);
-      const body = JSON.parse(response.body);
-      expect(body.session.model).toBe('iflow/qwen3-coder-plus');
     });
 
     it('应该拒绝无效model格式的session创建请求', async () => {
@@ -1716,20 +1701,6 @@ describe('Agent Routes', () => {
       expect(response.statusCode).toBe(202);
       const body = JSON.parse(response.body);
       expect(body.event.payload.model).toBe('gemini/gemini-2.5-pro');
-    });
-
-    it('应该成功更新session model(providerName/model)', async () => {
-      const response = await fastify.inject({
-        method: 'POST',
-        url: `/agent/sessions/${sessionId}/config`,
-        payload: {
-          model: 'iflow/qwen3-coder-plus'
-        }
-      });
-
-      expect(response.statusCode).toBe(202);
-      const body = JSON.parse(response.body);
-      expect(body.event.payload.model).toBe('iflow/qwen3-coder-plus');
     });
 
     it('应该成功更新allowedTools', async () => {

@@ -1,5 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
+import { createInitialGuards } from './guards';
+import { createInitialTaskState } from './task-state';
+import { createTranscriptWindow } from './transcript-window';
 import { createMcpAgentToolProvider } from './tools';
 import type { AgentToolExecutionInput } from './types';
 
@@ -746,6 +749,9 @@ function buildExecutionInput(args: Record<string, unknown>): AgentToolExecutionI
       memoryRefs: [],
       messages: [],
       pendingToolCalls: {},
+      taskState: createInitialTaskState('session-1'),
+      transcriptWindow: createTranscriptWindow(),
+      guards: createInitialGuards(),
       lastEventOffset: 0,
       updatedAt: now
     },

@@ -53,6 +53,7 @@ const blockedForwardHeaderSet = new Set([
 
 const internalGatewayQueryParamSet = new Set(['source_adapter', 'source']);
 const codexDefaultInstructions = 'You are a helpful assistant.';
+type WebSocketPayload = RawData | string;
 
 export function registerGatewayResponsesWebSocketRoute(
   fastify: FastifyInstance,
@@ -203,7 +204,7 @@ function bindSocketRelay(
   context: GatewaySocketContext,
   config: GatewayConfig
 ): void {
-  const pendingDownstreamMessages: Array<{ payload: RawData; binary: boolean }> = [];
+  const pendingDownstreamMessages: Array<{ payload: WebSocketPayload; binary: boolean }> = [];
   let pendingUpstreamToDownstreamSends = 0;
   let upstreamCloseForceTimer: NodeJS.Timeout | undefined;
   let upstreamClosePending:
@@ -243,7 +244,7 @@ function bindSocketRelay(
     closePeer(downstreamSocket, code, reason);
   };
 
-  const sendMessageToUpstream = (payload: RawData, binary: boolean): void => {
+  const sendMessageToUpstream = (payload: WebSocketPayload, binary: boolean): void => {
     upstreamSocket.send(payload, { binary }, (error) => {
       if (error) {
         closePeer(downstreamSocket, 1011, 'Upstream send failed.');
@@ -366,7 +367,7 @@ function bindSocketRelay(
 function buildMessageForDownstream(
   raw: RawData,
   isBinary: boolean
-): { payload: RawData; binary: boolean } {
+): { payload: WebSocketPayload; binary: boolean } {
   if (isBinary) {
     return {
       payload: raw,
@@ -403,7 +404,7 @@ function buildMessageForUpstream(
   downstreamSocket: WebSocket,
   fastify: FastifyInstance,
   config: GatewayConfig
-): { payload: RawData; binary: boolean } | undefined {
+): { payload: WebSocketPayload; binary: boolean } | undefined {
   if (isBinary) {
     return {
       payload: raw,

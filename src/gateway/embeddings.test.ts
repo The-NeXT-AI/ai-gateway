@@ -72,7 +72,7 @@ describe('openai embeddings gateway route', () => {
       expect(response.headers['x-gateway-billing-output-tokens']).toBe('0');
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://openai.example/v1/embeddings');
       expect(upstreamInit.headers).toMatchObject({
         authorization: 'Bearer provider-key',
@@ -612,7 +612,7 @@ describe('openai moderations gateway route', () => {
       expect(response.headers['x-gateway-target-provider-name']).toBe('openai-main');
       expect(response.headers['x-gateway-billing-input-tokens']).toBeUndefined();
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [upstreamUrl] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://openai.example/v1/moderations');
       expect(provider.health).toMatchObject({
         status: 'healthy',
@@ -822,7 +822,7 @@ describe('openai image generations gateway route', () => {
       expect(response.headers['x-gateway-billing-input-tokens']).toBe('50');
       expect(response.headers['x-gateway-billing-output-tokens']).toBe('150');
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [upstreamUrl] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://images.example/v1/images/generations');
       expect(provider.health).toMatchObject({
         status: 'healthy',
@@ -1130,7 +1130,7 @@ function createConfig(providers: ProviderConfig[]): GatewayConfig {
         headers: {}
       }
     }
-  } as GatewayConfig;
+  } as unknown as GatewayConfig;
 }
 
 function createProviderConfig(

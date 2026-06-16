@@ -495,7 +495,7 @@ function createWsGatewayTestConfig(openaiBaseUrl: string): GatewayConfig {
         }
       }
     }
-  } as GatewayConfig;
+  } as unknown as GatewayConfig;
 }
 
 async function listen(server: Server): Promise<void> {

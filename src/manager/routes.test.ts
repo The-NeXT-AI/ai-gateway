@@ -455,6 +455,7 @@ describe('manager config routes', () => {
     const runtimeConfig = createRuntimeConfig();
     runtimeConfig.providerExternal = {
       enabled: true,
+      transport: 'http',
       endpoint: 'http://localhost:3001/gateway/providers',
       timeoutMs: 5000,
       apiKeyHeader: 'x-provider-external-key',
@@ -546,7 +547,7 @@ describe('manager config routes', () => {
 
       expect(response.statusCode).toBe(200);
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://openai.example/v1/models');
       expect(upstreamInit.method).toBe('GET');
       expect(upstreamInit.headers).toMatchObject({
@@ -773,8 +774,13 @@ function createRuntimeConfig(): GatewayConfig {
     },
     billingWebhook: {
       enabled: false,
+      transport: 'http',
       endpoint: undefined,
       timeoutMs: 5000,
+      maxAttempts: 1,
+      baseDelayMs: 10,
+      maxDelayMs: 10,
+      requireAck: false,
       headers: {}
     },
     agent: {
@@ -782,7 +788,25 @@ function createRuntimeConfig(): GatewayConfig {
         type: 'filesystem',
         dir: '.agent-data'
       },
-      mcpServers: []
+      mcpServers: [],
+      runtime: {
+        sessionLockTimeoutMs: 15000,
+        eventWorkerConcurrency: 16,
+        llmRetry: {
+          maxAttempts: 3,
+          baseDelayMs: 200,
+          maxDelayMs: 2000,
+          backoffMultiplier: 2,
+          jitterMs: 100
+        },
+        toolRetry: {
+          maxAttempts: 2,
+          baseDelayMs: 150,
+          maxDelayMs: 1500,
+          backoffMultiplier: 2,
+          jitterMs: 50
+        }
+      }
     },
     mcpGateway: {
       enabled: false,
@@ -810,7 +834,7 @@ function createRuntimeConfig(): GatewayConfig {
         scopesSupported: []
       }
     }
-  };
+  } as unknown as GatewayConfig;
 }
 
 function createProviderConfig(

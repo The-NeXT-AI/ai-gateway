@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { GatewayConfig } from '../types';
 import { createAgentRuntime } from './runtime';
-import type { AgentModelClient, AgentToolProvider } from './types';
+import type { AgentToolProvider } from './tools';
+import type { AgentModelClient } from './types';
 
 vi.setConfig({ testTimeout: 20_000 });
 
@@ -47,7 +48,7 @@ function createTestConfig(): GatewayConfig {
     billingWebhook: {
       enabled: false
     }
-  } as GatewayConfig;
+  } as unknown as GatewayConfig;
 }
 
 describe('EventDrivenAgentRuntime cancellation', () => {
@@ -123,7 +124,7 @@ describe('EventDrivenAgentRuntime cancellation', () => {
     const originalFetch = global.fetch;
     let capturedInit: RequestInit | undefined;
 
-    global.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    global.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       capturedInit = init;
       return new Response(
         JSON.stringify({
@@ -164,7 +165,7 @@ describe('EventDrivenAgentRuntime cancellation', () => {
     }) as typeof fetch;
 
     const externalConfig = createTestConfig();
-    (externalConfig.agent as Record<string, unknown>).external = {
+    (externalConfig.agent as unknown as Record<string, unknown>).external = {
       enabled: true,
       transport: 'http',
       endpoint: 'https://external.example.com/agent-state',
@@ -193,7 +194,7 @@ describe('EventDrivenAgentRuntime cancellation', () => {
       expect(session).toBeDefined();
       expect(session?.agentId).toBe('external-agent-1');
 
-      const headers = new Headers(capturedInit?.headers as HeadersInit);
+      const headers = new Headers(capturedInit?.headers);
       expect(capturedInit?.method).toBe('GET');
       expect(headers.get('x-agent-external-key')).toBe('external-secret');
       expect(headers.get('x-client-id')).toBe('gateway-test');
@@ -204,7 +205,7 @@ describe('EventDrivenAgentRuntime cancellation', () => {
 
   it('hydrates agents and sessions from stdio external source when enabled', async () => {
     const externalConfig = createTestConfig();
-    (externalConfig.agent as Record<string, unknown>).external = {
+    (externalConfig.agent as unknown as Record<string, unknown>).external = {
       enabled: true,
       transport: 'stdio',
       command: process.execPath,
@@ -246,7 +247,7 @@ describe('EventDrivenAgentRuntime cancellation', () => {
       '});'
     ].join('');
     const externalConfig = createTestConfig();
-    (externalConfig.agent as Record<string, unknown>).external = {
+    (externalConfig.agent as unknown as Record<string, unknown>).external = {
       enabled: true,
       transport: 'stdio',
       command: process.execPath,
@@ -836,7 +837,7 @@ describe('EventDrivenAgentRuntime cancellation', () => {
     const encoder = new TextEncoder();
     let callCount = 0;
 
-    global.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+    global.fetch = async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       callCount += 1;
       const body =
         typeof init?.body === 'string'
@@ -931,7 +932,7 @@ describe('EventDrivenAgentRuntime cancellation', () => {
     let streamCallCount = 0;
     let nonStreamCallCount = 0;
 
-    global.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+    global.fetch = async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const body =
         typeof init?.body === 'string'
           ? (JSON.parse(init.body) as Record<string, unknown>)

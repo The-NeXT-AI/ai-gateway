@@ -13,7 +13,7 @@ import { resetProviderConcurrencyForTests } from './upstream-concurrency';
 import { resetGatewayPrecheckStateForTests } from './precheck';
 import { closeRawTraceManager, initializeRawTraceManager } from '../raw-trace';
 import { closeCodexOauthStateStore, updateDistributedCredentialEncryption } from '../provider/plugins';
-import type { GatewayConfig, ProviderConfig, ProviderPluginConfig } from '../types';
+import type { GatewayConfig, ProviderConfig, ProviderPluginConfig, TargetAdapter } from '../types';
 
 describe('gateway routes protocol conversion', () => {
   afterEach(async () => {
@@ -287,7 +287,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.statusCode).toBe(200);
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://api.openai.com/v1/chat/completions');
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.messages).toEqual([{ role: 'user', content: 'hello from responses' }]);
@@ -641,6 +641,9 @@ describe('gateway routes protocol conversion', () => {
       estimation: {
         charsPerToken: 1,
         defaultMaxOutputTokens: 0
+      },
+      storage: {
+        type: 'memory'
       }
     };
 
@@ -745,8 +748,99 @@ describe('gateway routes protocol conversion', () => {
       expect(response.statusCode).toBe(200);
       expect(response.headers['x-gateway-target-provider-name']).toBe('openai-backup');
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [upstreamUrl] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://backup.example/v1/chat/completions');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('preserves adapter path versions when applying a named OpenAI provider base url override', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json'
+        }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('openai-versioned', 'openai_chat_completions', ['glm-5']);
+    provider.baseurl = 'https://vendor.example/api';
+    const config = createConfig([provider]);
+    const runtime = createGatewayRuntime(config);
+    const targetAdapter: TargetAdapter = {
+      provider: 'openai',
+      buildRequestFromStandard() {
+        return {
+          ok: true,
+          value: {
+            url: 'https://adapter.example/v1/chat/completions?trace=1',
+            headers: {
+              'content-type': 'application/json',
+              authorization: 'Bearer adapter-key'
+            },
+            body: {
+              model: 'glm-5',
+              messages: [{ role: 'user', content: 'hello' }]
+            }
+          }
+        };
+      },
+      toStandardResponse() {
+        return {
+          ok: true,
+          value: {
+            id: 'resp_versioned_path',
+            object: 'response',
+            status: 'completed',
+            model: 'glm-5',
+            output_text: 'ok',
+            output: [
+              {
+                id: 'msg_versioned_path',
+                type: 'message',
+                role: 'assistant',
+                status: 'completed',
+                content: [
+                  {
+                    type: 'output_text',
+                    text: 'ok',
+                    annotations: []
+                  }
+                ]
+              }
+            ],
+            usage: {}
+          }
+        };
+      }
+    };
+    runtime.targetAdapters.register(targetAdapter, { overwrite: true });
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, runtime);
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-versioned'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'hello'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://vendor.example/api/v1/chat/completions?trace=1');
     } finally {
       await app.close();
     }
@@ -826,7 +920,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.headers['x-gateway-fallback-used']).toBe('true');
       expect(response.headers['x-gateway-fallback-count']).toBe('1');
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [upstreamUrl] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://allowed.example/v1/chat/completions');
     } finally {
       await app.close();
@@ -1039,7 +1133,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.headers['content-type']).toContain('text/event-stream');
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      const [, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.stream).toBe(true);
 
@@ -1449,7 +1543,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.headers['content-type']).toContain('text/event-stream');
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://api.anthropic.com/v1/messages');
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.stream).toBe(true);
@@ -1544,7 +1638,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.statusCode).toBe(200);
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://api.anthropic.com/v1/messages');
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.tools).toEqual([
@@ -1697,7 +1791,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.headers['content-type']).toContain('text/event-stream');
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://api.openai.com/v1/responses');
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.stream).toBe(true);
@@ -2045,7 +2139,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.statusCode).toBe(200);
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://api.openai.com/v1/responses');
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.input).toBe('hello native');
@@ -2207,7 +2301,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.headers['content-type']).toContain('text/event-stream');
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://api.openai.com/v1/chat/completions');
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.stream).toBe(true);
@@ -2287,7 +2381,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.headers['content-type']).toContain('text/event-stream');
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://api.openai.com/v1/chat/completions');
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.messages).toEqual([{ role: 'user', content: 'What is the weather in Shanghai?' }]);
@@ -2454,7 +2548,7 @@ describe('gateway routes protocol conversion', () => {
       });
 
       expect(response.statusCode).toBe(200);
-      const [, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.thinking).toEqual({ type: 'enabled' });
       expect(upstreamBody.reasoning_effort).toBe('max');
@@ -2536,7 +2630,7 @@ describe('gateway routes protocol conversion', () => {
       });
 
       expect(enabledResponse.statusCode).toBe(200);
-      const [, enabledUpstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [, enabledUpstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const enabledUpstreamBody = JSON.parse(String(enabledUpstreamInit.body));
       expect(enabledUpstreamBody.thinking).toEqual({ type: 'enabled' });
       expect(enabledUpstreamBody.reasoning_effort).toBe('high');
@@ -2562,7 +2656,7 @@ describe('gateway routes protocol conversion', () => {
       });
 
       expect(disabledResponse.statusCode).toBe(200);
-      const [, disabledUpstreamInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      const [, disabledUpstreamInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
       const disabledUpstreamBody = JSON.parse(String(disabledUpstreamInit.body));
       expect(disabledUpstreamBody.thinking).toEqual({ type: 'disabled' });
       expect(disabledUpstreamBody.reasoning_effort).toBeUndefined();
@@ -2628,7 +2722,7 @@ describe('gateway routes protocol conversion', () => {
       });
 
       expect(response.statusCode).toBe(200);
-      const [, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.reasoning_effort).toBeUndefined();
       expect(upstreamBody.output_config).toEqual({ effort: 'medium' });
@@ -2726,7 +2820,7 @@ describe('gateway routes protocol conversion', () => {
       });
       expect(mainResponse.statusCode).toBe(200);
 
-      const [, mainUpstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [, mainUpstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const mainUpstreamHeaders = mainUpstreamInit.headers as Record<string, string>;
       const mainUpstreamBody = JSON.parse(String(mainUpstreamInit.body));
       expect(mainUpstreamHeaders['x-custom-auth']).toBe('signed-main');
@@ -2752,7 +2846,7 @@ describe('gateway routes protocol conversion', () => {
       });
       expect(backupResponse.statusCode).toBe(200);
 
-      const [, backupUpstreamInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      const [, backupUpstreamInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
       const backupUpstreamHeaders = backupUpstreamInit.headers as Record<string, string>;
       const backupUpstreamBody = JSON.parse(String(backupUpstreamInit.body));
       expect(backupUpstreamHeaders['x-custom-auth']).toBeUndefined();
@@ -2863,7 +2957,7 @@ describe('gateway routes protocol conversion', () => {
       });
 
       expect(response.statusCode).toBe(200);
-      const [, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const upstreamHeaders = upstreamInit.headers as Record<string, string>;
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamHeaders['x-config-auth']).toBe('dynamic-auth-token');
@@ -2988,7 +3082,7 @@ describe('gateway routes protocol conversion', () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://auth.openai.com/oauth/token');
       expect(String(fetchMock.mock.calls[1]?.[0])).toBe('https://chatgpt.com/backend-api/codex/responses');
-      const [, upstreamInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      const [, upstreamInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
       const upstreamHeaders = upstreamInit.headers as Record<string, string>;
       expect(upstreamHeaders.authorization).toBe('Bearer atk-from-codex-refresh');
       expect(upstreamHeaders['ChatGPT-Account-ID']).toBe('acct-test-001');
@@ -3092,7 +3186,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.statusCode).toBe(200);
       expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(String(fetchMock.mock.calls[1]?.[0])).toBe('https://chatgpt.com/backend-api/codex/responses');
-      const [, upstreamInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      const [, upstreamInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
       const upstreamBody = JSON.parse(String(upstreamInit.body || '{}')) as Record<string, unknown>;
       const upstreamHeaders = upstreamInit.headers as Record<string, string>;
       expect(upstreamHeaders.accept).toBe('text/event-stream');
@@ -3181,7 +3275,7 @@ describe('gateway routes protocol conversion', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://chatgpt.com/backend-api/codex/responses');
 
-      const [, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const upstreamHeaders = (upstreamInit.headers || {}) as Record<string, string>;
       expect(upstreamHeaders.authorization).toBe('Bearer atk-encrypted');
 
@@ -3643,8 +3737,13 @@ describe('gateway routes protocol conversion', () => {
     ]);
     config.billingWebhook = {
       enabled: true,
+      transport: 'http',
       endpoint: 'http://billing.local/events',
       timeoutMs: 1000,
+      maxAttempts: 1,
+      baseDelayMs: 10,
+      maxDelayMs: 10,
+      requireAck: false,
       headers: {},
     };
     await initializeBillingPublisher(config.billingQueue, config.billingWebhook);
@@ -3677,7 +3776,7 @@ describe('gateway routes protocol conversion', () => {
       );
 
       const billingPayload = JSON.parse(
-        String((fetchMock.mock.calls[1]?.[1] as RequestInit)?.body),
+        String(((fetchMock.mock.calls[1] as unknown as [string, RequestInit])?.[1])?.body),
       );
       expect(billingPayload.target).toMatchObject({
         provider: 'openai',
@@ -3744,8 +3843,13 @@ describe('gateway routes protocol conversion', () => {
     config.billing.enabled = true;
     config.billingWebhook = {
       enabled: true,
+      transport: 'http',
       endpoint: 'http://billing.local/events',
       timeoutMs: 1000,
+      maxAttempts: 1,
+      baseDelayMs: 10,
+      maxDelayMs: 10,
+      requireAck: false,
       headers: {},
     };
     await initializeBillingPublisher(config.billingQueue, config.billingWebhook);
@@ -3775,7 +3879,7 @@ describe('gateway routes protocol conversion', () => {
       );
 
       const billingPayload = JSON.parse(
-        String((fetchMock.mock.calls[1]?.[1] as RequestInit)?.body),
+        String(((fetchMock.mock.calls[1] as unknown as [string, RequestInit])?.[1])?.body),
       );
       expect(billingPayload.target).toMatchObject({
         provider: 'openai',
@@ -3949,7 +4053,7 @@ describe('gateway routes protocol conversion', () => {
         }
       ]);
 
-      const [, secondInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      const [, secondInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
       const secondBody = JSON.parse(String(secondInit.body));
       expect(JSON.stringify(secondBody.messages)).toContain('search_web');
       expect(JSON.stringify(secondBody.messages)).toContain('fresh result');
@@ -4223,12 +4327,12 @@ describe('gateway routes protocol conversion', () => {
       expect(response.statusCode).toBe(200);
       expect(fetchMock).toHaveBeenCalledTimes(2);
 
-      const [, firstInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [, firstInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const firstBody = JSON.parse(String(firstInit.body));
       expect(firstBody.model).toBe('glm-5');
       expect(firstBody.tools?.[0]?.function?.name || firstBody.tools?.[0]?.name).toBe('search_web');
 
-      const [, secondInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      const [, secondInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
       const secondBody = JSON.parse(String(secondInit.body));
       expect(JSON.stringify(secondBody.messages)).toContain('search_web');
       expect(JSON.stringify(secondBody.messages)).toContain('fresh result');
@@ -4400,11 +4504,11 @@ describe('gateway routes protocol conversion', () => {
       expect(response.headers['content-type']).toContain('text/event-stream');
       expect(fetchMock).toHaveBeenCalledTimes(2);
 
-      const [, firstInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [, firstInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const firstBody = JSON.parse(String(firstInit.body));
       expect(firstBody.stream).toBeUndefined();
 
-      const [, secondInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      const [, secondInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
       const secondBody = JSON.parse(String(secondInit.body));
       expect(secondBody.stream).toBeUndefined();
 
@@ -4707,7 +4811,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.statusCode).toBe(200);
       expect(executedToolNames).toEqual(['browser.search_web']);
 
-      const [, firstInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [, firstInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const firstBody = JSON.parse(String(firstInit.body));
       expect(firstBody.tools?.[0]?.function?.name || firstBody.tools?.[0]?.name).toBe('search_web');
 
@@ -4805,7 +4909,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.statusCode).toBe(200);
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://api.openai.com/v1/chat/completions');
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.model).toBe('MiniMax-M2.7');
@@ -4923,7 +5027,7 @@ describe('gateway routes protocol conversion', () => {
       expect(response.statusCode).toBe(200);
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      const [, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.model).toBe('MiniMax-M2.7');
       expect(upstreamBody.messages).toHaveLength(1);
@@ -5127,7 +5231,7 @@ function createConfig(
         headers: {}
       }
     }
-  } as GatewayConfig;
+  } as unknown as GatewayConfig;
 }
 
 async function waitForCondition(predicate: () => boolean): Promise<void> {

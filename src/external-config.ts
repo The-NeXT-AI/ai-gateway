@@ -327,11 +327,10 @@ async function fetchGatewayConfigPayloadFromStdio(
       finish(undefined, new Error(`External gateway config stdio exited with code ${code ?? 'null'} signal ${signal ?? 'null'}${suffix}`));
     });
 
-    child.stdin?.end(`${JSON.stringify({ type: 'gateway_config_request' })}\n`, (error) => {
-      if (error) {
-        finish(undefined, error instanceof Error ? error : new Error(String(error)));
-      }
+    child.stdin?.once('error', (error) => {
+      finish(undefined, error instanceof Error ? error : new Error(String(error)));
     });
+    child.stdin?.end(`${JSON.stringify({ type: 'gateway_config_request' })}\n`);
   });
 }
 

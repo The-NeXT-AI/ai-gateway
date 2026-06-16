@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { describe, expect, it } from 'vitest';
 import type { McpGatewayConfig } from '../types';
 import { createMcpGatewayRuntime, McpGatewayOAuthError } from './runtime';
 

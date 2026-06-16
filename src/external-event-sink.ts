@@ -268,11 +268,10 @@ async function publishJsonEventToStdio(
       finish(new Error(`Stdio event sink exited with code ${code ?? 'null'} signal ${signal ?? 'null'}${suffix}`));
     });
 
-    child.stdin?.end(`${JSON.stringify(event)}\n`, (error) => {
-      if (error) {
-        finish(error instanceof Error ? error : new Error(String(error)));
-      }
+    child.stdin?.once('error', (error) => {
+      finish(error instanceof Error ? error : new Error(String(error)));
     });
+    child.stdin?.end(`${JSON.stringify(event)}\n`);
   });
 }
 

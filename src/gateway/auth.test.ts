@@ -325,7 +325,7 @@ describe('gateway auth', () => {
       return;
     }
 
-    const fetchOptions = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+    const fetchOptions = (fetchMock.mock.calls[0] as unknown as [string, RequestInit] | undefined)?.[1];
     const requestBody = fetchOptions?.body ? JSON.parse(fetchOptions.body as string) : {};
     expect(requestBody.token).toBe('fallback-token');
   });
@@ -361,7 +361,7 @@ describe('gateway auth', () => {
       return;
     }
 
-    const fetchOptions = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+    const fetchOptions = (fetchMock.mock.calls[0] as unknown as [string, RequestInit] | undefined)?.[1];
     const requestBody = fetchOptions?.body ? JSON.parse(fetchOptions.body as string) : {};
     expect(requestBody.token).toBe('codex-token-123');
   });

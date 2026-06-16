@@ -1180,9 +1180,10 @@ function resolveScopedHeaders(
     return {};
   }
 
+  const modelHeaders = model ? providerConfig.extraHeaders.byModel[model] : undefined;
   return {
     ...providerConfig.extraHeaders.default,
-    ...(providerConfig.extraHeaders.byModel[model] || {})
+    ...(modelHeaders || {})
   };
 }
 
@@ -1194,9 +1195,10 @@ function resolveScopedBody(
     return {};
   }
 
+  const modelBody = model ? providerConfig.extraBody.byModel[model] : undefined;
   return {
     ...providerConfig.extraBody.default,
-    ...(providerConfig.extraBody.byModel[model] || {})
+    ...(modelBody || {})
   };
 }
 
@@ -1207,7 +1209,7 @@ function resolveProviderBillingRate(
   targetProviderConfig?: ProviderConfig
 ): BillingRate | undefined {
   const providerConfig = targetProviderConfig || findProviderConfigByType(config.providers, provider);
-  return providerConfig?.billing.byModel[model] || providerConfig?.billing.default;
+  return (model ? providerConfig?.billing.byModel[model] : undefined) || providerConfig?.billing.default;
 }
 
 function readBodyModel(body: Record<string, unknown>): string | undefined {

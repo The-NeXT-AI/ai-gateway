@@ -89,12 +89,12 @@ export function registerMcpGatewayRoutes(fastify: FastifyInstance, runtime: McpG
         codeChallenge: readObjectParam(query.code_challenge),
         codeChallengeMethod: readObjectParam(query.code_challenge_method)
       });
-      return reply.redirect(302, redirect);
+      return reply.redirect(redirect, 302);
     } catch (error) {
       if (error instanceof McpGatewayOAuthError && redirectUri) {
         const errorRedirect = buildOAuthErrorRedirect(redirectUri, error.error, error.message, state);
         if (errorRedirect) {
-          return reply.redirect(302, errorRedirect);
+          return reply.redirect(errorRedirect, 302);
         }
       }
 
@@ -157,8 +157,8 @@ function ensureFormBodyParser(fastify: FastifyInstance): void {
   );
 }
 
-function parseFormBody(body: string): Record<string, string | string[]> {
-  const params = new URLSearchParams(body);
+function parseFormBody(body: string | Buffer): Record<string, string | string[]> {
+  const params = new URLSearchParams(Buffer.isBuffer(body) ? body.toString('utf8') : body);
   const parsed: Record<string, string | string[]> = {};
   for (const [key, value] of params.entries()) {
     const existing = parsed[key];
@@ -199,7 +199,9 @@ function parseOAuthTokenRequest(request: FastifyRequest): {
 }
 
 function readBasicAuthClientId(authorizationHeader: unknown): string | undefined {
-  const authorization = readHeader(authorizationHeader);
+  const authorization = Array.isArray(authorizationHeader) || typeof authorizationHeader === 'string'
+    ? readHeader(authorizationHeader)
+    : undefined;
   if (!authorization) {
     return undefined;
   }

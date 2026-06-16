@@ -363,7 +363,7 @@ export async function collectAnthropicNonStreamPayloadFromEventStream(
           state.toolBlocks.set(blockIndex, {
             id: asString(block?.id) || `toolu_${randomUUID().replace(/-/g, '')}`,
             name,
-            inputJson: normalizeStreamToolArguments(block.input)
+            inputJson: normalizeStreamToolArguments(block?.input)
           });
           state.activeToolBlockIndex = blockIndex;
         }

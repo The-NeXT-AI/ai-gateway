@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { BillingResult } from '../billing';
 import { buildBillingHeaders, calculateUsageBilling, publishBillingEvent } from '../billing';
+import type { AgentToolDefinition } from '../agent/types';
 import type {
-  AgentToolDefinition,
   GatewayBillingTrace,
   GatewayConfig,
   GatewayRequestClientContext,
@@ -67,7 +67,7 @@ import {
   markRawTraceCaptureSubmitted,
   readRawRequestBody,
 } from '../raw-trace';
-import { matchesAnyPattern } from '../mcp-gateway/policy';
+import { matchesAnyPattern } from '../shared/pattern';
 
 interface ProviderAttemptFailure {
   provider: Provider;
@@ -2751,10 +2751,14 @@ function rewriteVirtualStandardInputContentMediaReferences(
     };
   }
 
-  return {
-    ...item,
-    input: replaceVirtualMultimodalReferenceValue(item.input, references)
-  };
+  if (item.type === 'tool_use') {
+    return {
+      ...item,
+      input: replaceVirtualMultimodalReferenceValue(item.input, references)
+    };
+  }
+
+  return item;
 }
 
 function replaceVirtualMultimodalReferenceValue(
@@ -2858,8 +2862,12 @@ function describeVirtualMultimodalBlock(
     ) || `- document: ${asString(block.title) || asString(block.name) || 'attached document'}`;
   }
 
-  if (isObject(block.inlineData) || isObject(block.inline_data)) {
-    const inlineData = isObject(block.inlineData) ? block.inlineData : block.inline_data;
+  const inlineData = isObject(block.inlineData)
+    ? block.inlineData
+    : isObject(block.inline_data)
+      ? block.inline_data
+      : undefined;
+  if (inlineData) {
     return describeVirtualMultimodalReference(
       registerVirtualMultimodalReference(rewriteState, {
         kind: 'media',
@@ -2869,8 +2877,12 @@ function describeVirtualMultimodalBlock(
     ) || `- inline media: ${asString(inlineData.mimeType) || asString(inlineData.mime_type) || 'unknown mime type'}`;
   }
 
-  if (isObject(block.fileData) || isObject(block.file_data)) {
-    const fileData = isObject(block.fileData) ? block.fileData : block.file_data;
+  const fileData = isObject(block.fileData)
+    ? block.fileData
+    : isObject(block.file_data)
+      ? block.file_data
+      : undefined;
+  if (fileData) {
     return describeVirtualMultimodalReference(
       registerVirtualMultimodalReference(rewriteState, {
         kind: 'file',
@@ -4820,7 +4832,7 @@ function sumOptionalUsageTokens(...values: Array<number | undefined>): number | 
     return undefined;
   }
 
-  return values.reduce((sum, value) => sum + (value || 0), 0);
+  return values.reduce<number>((sum, value) => sum + (value || 0), 0);
 }
 
 function extractBillingCacheDurationSeconds(

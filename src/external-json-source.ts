@@ -227,11 +227,10 @@ async function requestExternalJsonFromStdio(
       finish(undefined, new Error(`${options.label} stdio exited with code ${code ?? 'null'} signal ${signal ?? 'null'}${suffix}`));
     });
 
-    child.stdin?.end(`${JSON.stringify(options.payload ?? { type: `${options.label}_request` })}\n`, (error) => {
-      if (error) {
-        finish(undefined, error instanceof Error ? error : new Error(String(error)));
-      }
+    child.stdin?.once('error', (error) => {
+      finish(undefined, error instanceof Error ? error : new Error(String(error)));
     });
+    child.stdin?.end(`${JSON.stringify(options.payload ?? { type: `${options.label}_request` })}\n`);
   });
 }
 

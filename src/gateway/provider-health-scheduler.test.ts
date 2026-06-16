@@ -40,7 +40,7 @@ describe('provider health scheduler', () => {
     const results = await runScheduledProviderHealthChecks(config, logger);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     expect(upstreamUrl).toBe('https://openai.example/v1/models');
     expect(upstreamInit.method).toBe('GET');
     expect(upstreamInit.headers).toMatchObject({

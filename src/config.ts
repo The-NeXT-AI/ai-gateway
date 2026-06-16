@@ -1833,7 +1833,7 @@ function parseStatusCodeTokens(value: unknown): number[] {
   return parsed;
 }
 
-function parseGatewayAuthConfig(value: GatewayAuthJsonConfig | undefined): GatewayAuthConfig {
+function parseGatewayAuthConfig(value: unknown): GatewayAuthConfig {
   const auth = isPlainObject(value) ? (value as GatewayAuthJsonConfig) : undefined;
   const identityHeadersRaw = isPlainObject(auth?.identityHeaders)
     ? (auth?.identityHeaders as GatewayAuthIdentityHeadersJsonConfig)
@@ -1989,28 +1989,30 @@ function parseGatewayAuthMode(value: string | undefined, fallback: GatewayAuthCo
   return fallback;
 }
 
-function parseBillingQueueConfig(value: BillingQueueJsonConfig | undefined): BillingQueueConfig {
+function parseBillingQueueConfig(value: unknown): BillingQueueConfig {
+  const raw = isPlainObject(value) ? (value as BillingQueueJsonConfig) : undefined;
   return {
-    enabled: resolveBoolean(process.env.BILLING_QUEUE_ENABLED, value?.enabled, false),
+    enabled: resolveBoolean(process.env.BILLING_QUEUE_ENABLED, raw?.enabled, false),
     queueName:
-      readString(process.env.BILLING_QUEUE_NAME) || readString(value?.queueName) || 'gateway-billing',
+      readString(process.env.BILLING_QUEUE_NAME) || readString(raw?.queueName) || 'gateway-billing',
     jobName:
-      readString(process.env.BILLING_QUEUE_JOB_NAME) || readString(value?.jobName) || 'billing.usage',
+      readString(process.env.BILLING_QUEUE_JOB_NAME) || readString(raw?.jobName) || 'billing.usage',
     removeOnComplete: resolveInteger(
-      [process.env.BILLING_QUEUE_REMOVE_ON_COMPLETE, value?.removeOnComplete],
+      [process.env.BILLING_QUEUE_REMOVE_ON_COMPLETE, raw?.removeOnComplete],
       1000,
       0
     ),
     removeOnFail: resolveInteger(
-      [process.env.BILLING_QUEUE_REMOVE_ON_FAIL, value?.removeOnFail],
+      [process.env.BILLING_QUEUE_REMOVE_ON_FAIL, raw?.removeOnFail],
       5000,
       0
     )
   };
 }
 
-function parseBillingWebhookConfig(value: BillingWebhookJsonConfig | undefined): BillingWebhookConfig {
-  const headers = parseHeaderMap(value?.headers);
+function parseBillingWebhookConfig(value: unknown): BillingWebhookConfig {
+  const raw = isPlainObject(value) ? (value as BillingWebhookJsonConfig) : undefined;
+  const headers = parseHeaderMap(raw?.headers);
   const apiKeyHeader = normalizeHeaderName(readString(process.env.BILLING_WEBHOOK_API_KEY_HEADER), '');
   const apiKey =
     readString(process.env.BILLING_WEBHOOK_API_KEY) ||
@@ -2027,31 +2029,31 @@ function parseBillingWebhookConfig(value: BillingWebhookJsonConfig | undefined):
 
   const endpoint =
     readString(process.env.BILLING_WEBHOOK_ENDPOINT) ||
-    readString(value?.endpoint) ||
-    readString(value?.url);
+    readString(raw?.endpoint) ||
+    readString(raw?.url);
   const command =
     readString(process.env.BILLING_WEBHOOK_STDIO_COMMAND) ||
-    readString(value?.command);
+    readString(raw?.command);
 
   return {
-    enabled: resolveBoolean(process.env.BILLING_WEBHOOK_ENABLED, value?.enabled, false),
+    enabled: resolveBoolean(process.env.BILLING_WEBHOOK_ENABLED, raw?.enabled, false),
     transport: parseExternalEventSinkTransport(
-      readString(process.env.BILLING_WEBHOOK_TRANSPORT) || readString(value?.transport),
+      readString(process.env.BILLING_WEBHOOK_TRANSPORT) || readString(raw?.transport),
       endpoint,
       command
     ),
     endpoint,
     command,
-    args: resolveStringList(process.env.BILLING_WEBHOOK_STDIO_ARGS, value?.args, []),
-    cwd: readString(process.env.BILLING_WEBHOOK_STDIO_CWD) || readString(value?.cwd),
-    env: parseHeaderMap(value?.env),
+    args: resolveStringList(process.env.BILLING_WEBHOOK_STDIO_ARGS, raw?.args, []),
+    cwd: readString(process.env.BILLING_WEBHOOK_STDIO_CWD) || readString(raw?.cwd),
+    env: parseHeaderMap(raw?.env),
     timeoutMs: resolveInteger(
-      [process.env.BILLING_WEBHOOK_TIMEOUT_MS, value?.timeoutMs],
+      [process.env.BILLING_WEBHOOK_TIMEOUT_MS, raw?.timeoutMs],
       5000,
       50
     ),
-    ...parseExternalEventSinkRetryConfig(value, 'BILLING_WEBHOOK'),
-    requireAck: parseExternalEventSinkRequireAck(value, 'BILLING_WEBHOOK'),
+    ...parseExternalEventSinkRetryConfig(raw, 'BILLING_WEBHOOK'),
+    requireAck: parseExternalEventSinkRequireAck(raw, 'BILLING_WEBHOOK'),
     headers
   };
 }
@@ -2169,14 +2171,15 @@ function parseRawTraceCaptureMode(
   return fallback;
 }
 
-function parseAgentConfig(value: AgentJsonConfig | undefined): AgentConfig {
+function parseAgentConfig(value: unknown): AgentConfig {
+  const raw = isPlainObject(value) ? (value as AgentJsonConfig) : undefined;
   return {
-    mcpServers: parseMcpServerConfigList(value?.mcpServers),
-    storage: parseAgentStorageConfig(value),
-    runtime: parseAgentRuntimeConfig(value),
-    external: parseAgentExternalSourceConfig(value),
-    eventQueue: parseAgentEventQueueConfig(value),
-    eventWebhook: parseAgentEventWebhookConfig(value)
+    mcpServers: parseMcpServerConfigList(raw?.mcpServers),
+    storage: parseAgentStorageConfig(raw),
+    runtime: parseAgentRuntimeConfig(raw),
+    external: parseAgentExternalSourceConfig(raw),
+    eventQueue: parseAgentEventQueueConfig(raw),
+    eventWebhook: parseAgentEventWebhookConfig(raw)
   };
 }
 
@@ -2247,26 +2250,27 @@ function parseAgentRetryPolicyConfig(
   };
 }
 
-function parseMcpGatewayConfig(value: McpGatewayJsonConfig | undefined): McpGatewayConfig {
-  const principals = parseMcpGatewayPrincipalList(value?.principals ?? value?.keys);
+function parseMcpGatewayConfig(value: unknown): McpGatewayConfig {
+  const raw = isPlainObject(value) ? (value as McpGatewayJsonConfig) : undefined;
+  const principals = parseMcpGatewayPrincipalList(raw?.principals ?? raw?.keys);
   const inferredEnabled = principals.length > 0;
   const endpoint = normalizeHttpPath(
-    readString(process.env.MCP_GATEWAY_ENDPOINT) || readString(value?.endpoint) || '/mcp'
+    readString(process.env.MCP_GATEWAY_ENDPOINT) || readString(raw?.endpoint) || '/mcp'
   );
-  const internalCidrs = parseModelList(value?.internalCidrs);
+  const internalCidrs = parseModelList(raw?.internalCidrs);
 
   return {
-    enabled: resolveBoolean(process.env.MCP_GATEWAY_ENABLED, value?.enabled, inferredEnabled),
+    enabled: resolveBoolean(process.env.MCP_GATEWAY_ENABLED, raw?.enabled, inferredEnabled),
     endpoint,
-    websocket: parseMcpGatewayWebSocket(value?.websocket),
+    websocket: parseMcpGatewayWebSocket(raw?.websocket),
     principals,
-    serverExposure: parseMcpGatewayServerExposure(value?.serverExposure),
+    serverExposure: parseMcpGatewayServerExposure(raw?.serverExposure),
     internalCidrs:
       internalCidrs.length > 0
         ? internalCidrs
         : ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8', '::1/128', 'fc00::/7'],
-    guardrails: parseMcpGatewayGuardrails(value?.guardrails),
-    oauth: parseMcpGatewayOauth(value?.oauth)
+    guardrails: parseMcpGatewayGuardrails(raw?.guardrails),
+    oauth: parseMcpGatewayOauth(raw?.oauth)
   };
 }
 

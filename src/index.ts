@@ -174,7 +174,11 @@ fastify.addHook('onClose', async () => {
 });
 
 fastify.get('/health', async () => {
-  return { status: 'ok', timestamp: new Date().toISOString() };
+  return {
+    runtimeId: process.env.CCR_GATEWAY_RUNTIME_ID,
+    status: 'ok',
+    timestamp: new Date().toISOString()
+  };
 });
 
 fastify.get('/metrics', async (_request, reply) => {

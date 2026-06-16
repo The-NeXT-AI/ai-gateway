@@ -1,0 +1,58 @@
+{
+  "host": "0.0.0.0",
+  "port": 3000,
+  "Providers": [
+    {
+      "name": "openai-main",
+      "type": "openai_chat_completions",
+      "apikey": "sk-your-openai-key",
+      "baseurl": "https://api.openai.com/v1",
+      "models": ["gpt-4.1-mini"]
+    }
+  ],
+  "agent": {
+    "storage": {
+      "type": "memory"
+    },
+    "mcpServers": [
+      {
+        "name": "remote-toolhub",
+        "transport": "websocket",
+        "url": "ws://toolhub:3100/mcp/ws",
+        "headers": {
+          "x-client": "edge-agent"
+        },
+        "apiKeyEnv": "MCP_REMOTE_KEY",
+        "protocolVersion": "2024-11-05",
+        "startupTimeoutMs": 10000,
+        "requestTimeoutMs": 30000
+      }
+    ]
+  },
+  "mcpGateway": {
+    "enabled": false,
+    "endpoint": "/mcp",
+    "websocket": {
+      "enabled": false,
+      "endpoint": "/mcp/ws",
+      "auth": {
+        "allowQueryToken": false,
+        "queryTokenParam": "token"
+      }
+    },
+    "principals": [],
+    "serverExposure": {},
+    "internalCidrs": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "::1/128", "fc00::/7"],
+    "guardrails": {
+      "enabled": true,
+      "maxArgumentBytes": 65536,
+      "blockedTools": [],
+      "blockedArgumentKeys": ["password", "secret", "api_key"],
+      "redactArgumentKeys": ["authorization", "token", "api_key", "password", "secret"]
+    },
+    "oauth": {
+      "enabled": false,
+      "scopesSupported": ["mcp:tools:list", "mcp:tools:call"]
+    }
+  }
+}

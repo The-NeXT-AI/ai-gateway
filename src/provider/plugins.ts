@@ -11,6 +11,7 @@ import type {
   ProviderPluginCodexOAuthConfig,
   ProviderPluginMutationConfig,
   ProviderPluginResponseMutationConfig,
+  Result,
   StandardRequest,
   UpstreamRequest
 } from '../types';
@@ -76,6 +77,14 @@ interface CodexOauthResolvedState {
   accessToken?: string;
   refreshToken?: string;
   accountId?: string;
+}
+
+interface CodexOauthTokenRefreshResult {
+  idToken?: string;
+  accessToken?: string;
+  refreshToken?: string;
+  accountId?: string;
+  scope?: string;
 }
 
 const codexOauthStateStore = new Map<string, CodexOauthStoredState>();
@@ -265,7 +274,7 @@ async function applyCodexOauthAuthentication(
   section: string,
   codexOauth: ProviderPluginCodexOAuthConfig,
   context: PluginValueResolveContext
-) {
+): Promise<Result<UpstreamRequest>> {
   const rewrittenUpstreamRequest = rewriteCodexOauthUpstreamUrl(section, context.upstreamRequest, context);
   const normalizedUpstreamRequest = normalizeCodexOauthUpstreamRequestBody(
     section,
@@ -497,7 +506,7 @@ async function requestCodexOauthTokenRefresh(
   codexOauth: ProviderPluginCodexOAuthConfig,
   refreshToken: string,
   context: PluginValueResolveContext
-) {
+): Promise<Result<CodexOauthTokenRefreshResult>> {
   const abortController = new AbortController();
   const timeout = setTimeout(() => {
     abortController.abort();
@@ -887,7 +896,7 @@ function resolveCodexOauthTokenValue(
   fieldName: 'accessToken' | 'refreshToken',
   resolution: ResolvedValue | undefined,
   context: PluginValueResolveContext
-) {
+): Result<string | undefined> {
   if (!resolution) {
     return ok(undefined as string | undefined);
   }
@@ -918,7 +927,7 @@ function decryptCodexEncryptedToken(
   fieldName: string,
   encryptedToken: string,
   context: PluginValueResolveContext
-) {
+): Result<string> {
   const encodedEnvelope = encryptedToken.slice(codexCredentialEncryptedPrefix.length);
   if (!encodedEnvelope) {
     return err(`${section}.${fieldName} encrypted token payload is empty.`);
@@ -1025,7 +1034,7 @@ function decodeBase64CredentialPart(value: string): Buffer | undefined {
   }
 }
 
-function resolveCredentialEncryptionKeyBytes() {
+function resolveCredentialEncryptionKeyBytes(): Result<CredentialEncryptionKeyResolveResult> {
   if (distributedCredentialEncryptionConfig?.keyBytes) {
     return ok({
       keyBytes: distributedCredentialEncryptionConfig.keyBytes,
@@ -1300,7 +1309,7 @@ function applyRequestMutation(
   section: string,
   mutation: ProviderPluginMutationConfig,
   context: PluginValueResolveContext
-) {
+): Result<UpstreamRequest> {
   let upstreamRequest = context.upstreamRequest;
   let nextContext = context;
 
@@ -1403,7 +1412,7 @@ function applyResponseMutation(
   section: string,
   mutation: ProviderPluginResponseMutationConfig,
   context: PluginValueResolveContext
-) {
+): Result<unknown> {
   const payloadResult = applyPayloadMutation(
     section,
     mutation,
@@ -1422,7 +1431,7 @@ function applyPayloadMutation(
   mutation: Pick<ProviderPluginResponseMutationConfig, 'strict' | 'bodySet' | 'bodyMerge' | 'bodyRemove'>,
   context: PluginValueResolveContext,
   payload: unknown
-) {
+): Result<Record<string, unknown>> {
   const mutablePayload = (isPlainObject(payload) ? cloneUnknown(payload) : {}) as Record<string, unknown>;
   let mutableContext = {
     ...context,

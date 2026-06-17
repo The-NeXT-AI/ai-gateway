@@ -327,6 +327,14 @@ export interface GatewayHealthAwareRoutingConfig {
   preferLowerLatency: boolean;
 }
 
+export interface GatewayRoutingConfig {
+  preferSourceProviderForBareModels: boolean;
+}
+
+export interface GatewayModelListConfig {
+  bareModelIds: boolean;
+}
+
 export interface ProviderHealthCheckSchedulerConfig {
   enabled: boolean;
   intervalMs: number;
@@ -627,6 +635,8 @@ export interface GatewayConfig {
   configExternal?: GatewayConfigExternalSourceConfig;
   defaultTargetProvider?: Provider;
   defaultTargetProviders: Provider[];
+  routing?: GatewayRoutingConfig;
+  modelList?: GatewayModelListConfig;
   openaiApiKey?: string;
   anthropicApiKey?: string;
   geminiApiKey?: string;
@@ -730,6 +740,10 @@ export interface StandardUsage {
   cache_duration_seconds?: number;
   cache_ttl_seconds?: number;
   cache_age_seconds?: number;
+  server_tool_use?: {
+    web_search_requests?: number;
+    web_fetch_requests?: number;
+  };
 }
 
 export interface StandardResponse {

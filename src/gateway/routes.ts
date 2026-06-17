@@ -233,6 +233,7 @@ function buildGatewayModelListEntries(config: GatewayConfig): GatewayModelListEn
   const seen = new Set<string>();
   const entries: GatewayModelListEntry[] = [];
   const baseEntries: BaseModelListEntry[] = [];
+  const bareModelIds = config.modelList?.bareModelIds === true;
 
   const pushEntry = (entry: GatewayModelListEntry): void => {
     if (!entry.id || seen.has(entry.id)) {
@@ -251,7 +252,7 @@ function buildGatewayModelListEntries(config: GatewayConfig): GatewayModelListEn
         continue;
       }
 
-      const id = `${providerConfig.name}/${modelName}`;
+      const id = buildBaseModelListId(providerConfig.name, modelName, bareModelIds);
       const entry: BaseModelListEntry = {
         id,
         displayName: modelName,
@@ -279,6 +280,7 @@ function materializeVirtualModelListEntries(
 ): GatewayModelListEntry[] {
   const entries: GatewayModelListEntry[] = [];
   const configuredProviderNames = new Set(baseEntries.map((entry) => entry.providerName));
+  const bareModelIds = config.modelList?.bareModelIds === true;
 
   for (const profile of config.virtualModelProfiles || []) {
     if (!shouldMaterializeVirtualModel(profile)) {
@@ -287,12 +289,12 @@ function materializeVirtualModelListEntries(
 
     for (const baseEntry of baseEntries) {
       for (const prefix of profile.match.prefixes) {
-        const id = `${baseEntry.providerName}/${prefix}${baseEntry.modelName}`;
+        const id = buildPrefixedVirtualModelListId(baseEntry, prefix, bareModelIds);
         entries.push(createVirtualModelListEntry(profile, id, baseEntry.id, baseEntry.ownedBy));
       }
 
       for (const suffix of profile.match.suffixes) {
-        const id = `${baseEntry.providerName}/${baseEntry.modelName}${suffix}`;
+        const id = buildSuffixedVirtualModelListId(baseEntry, suffix, bareModelIds);
         entries.push(createVirtualModelListEntry(profile, id, baseEntry.id, baseEntry.ownedBy));
       }
     }
@@ -302,12 +304,12 @@ function materializeVirtualModelListEntries(
     }
 
     for (const alias of profile.match.exactAliases) {
-      const id = resolveExactVirtualModelAlias(alias, profile.baseModel.fixedModel);
+      const id = resolveExactVirtualModelAlias(alias, profile.baseModel.fixedModel, bareModelIds);
       if (!id) {
         continue;
       }
 
-      const owner = extractProviderName(id);
+      const owner = extractProviderName(id) || extractProviderName(profile.baseModel.fixedModel);
       if (!owner || !configuredProviderNames.has(owner)) {
         continue;
       }
@@ -317,6 +319,30 @@ function materializeVirtualModelListEntries(
   }
 
   return entries;
+}
+
+function buildBaseModelListId(providerName: string, modelName: string, bareModelIds: boolean): string {
+  return bareModelIds ? modelName : `${providerName}/${modelName}`;
+}
+
+function buildPrefixedVirtualModelListId(
+  baseEntry: BaseModelListEntry,
+  prefix: string,
+  bareModelIds: boolean
+): string {
+  return bareModelIds
+    ? `${prefix}${baseEntry.modelName}`
+    : `${baseEntry.providerName}/${prefix}${baseEntry.modelName}`;
+}
+
+function buildSuffixedVirtualModelListId(
+  baseEntry: BaseModelListEntry,
+  suffix: string,
+  bareModelIds: boolean
+): string {
+  return bareModelIds
+    ? `${baseEntry.modelName}${suffix}`
+    : `${baseEntry.providerName}/${baseEntry.modelName}${suffix}`;
 }
 
 function shouldMaterializeVirtualModel(profile: VirtualModelProfileConfig): boolean {
@@ -365,14 +391,15 @@ function resolveProviderOwner(providerConfig: ProviderConfig): string {
 
 function resolveExactVirtualModelAlias(
   alias: string,
-  fixedModelId: string
+  fixedModelId: string,
+  bareModelIds: boolean
 ): string | undefined {
   const normalizedAlias = alias.trim();
   if (!normalizedAlias) {
     return undefined;
   }
 
-  if (normalizedAlias.includes('/')) {
+  if (bareModelIds || normalizedAlias.includes('/')) {
     return normalizedAlias;
   }
 

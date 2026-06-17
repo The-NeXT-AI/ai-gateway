@@ -25,6 +25,7 @@ import type {
   GatewayHealthAwareRoutingConfig,
   GatewayIdempotencyConfig,
   GatewayMetricsConfig,
+  GatewayModelListConfig,
   GatewayPolicyConfig,
   GatewayPolicyRuleConfig,
   GatewayPrecheckConfig,
@@ -33,6 +34,7 @@ import type {
   GatewayPrecheckSubject,
   GatewayRateLimitDimensionConfig,
   GatewayRateLimitMetric,
+  GatewayRoutingConfig,
   GatewayTransparentToolExecutionConfig,
   GatewayTransparentToolUnknownPolicy,
   GatewayUpstreamCircuitBreakerConfig,
@@ -270,6 +272,14 @@ interface GatewayTransparentToolExecutionJsonConfig {
 interface GatewayRoutingJsonConfig {
   healthAware?: unknown;
   policy?: unknown;
+  preferSourceProviderForBareModels?: unknown;
+  preferSourceProviderForBareModel?: unknown;
+}
+
+interface GatewayModelListJsonConfig {
+  bareModelIds?: unknown;
+  bareModelId?: unknown;
+  bare_model_ids?: unknown;
 }
 
 interface GatewayPolicyRuleJsonConfig {
@@ -464,6 +474,7 @@ interface GatewayJsonConfig {
   provider?: unknown;
   defaultTargetProvider?: unknown;
   defaultTargetProviders?: unknown;
+  modelList?: unknown;
   openaiApiKey?: unknown;
   anthropicApiKey?: unknown;
   geminiApiKey?: unknown;
@@ -782,6 +793,8 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
       process.env.DEFAULT_TARGET_PROVIDERS,
       providers
     ),
+    routing: parseGatewayRoutingConfig(routingSettings),
+    modelList: parseGatewayModelListConfig(jsonConfig.modelList),
     openaiApiKey:
       readString(process.env.OPENAI_API_KEY) ||
       openAIProviderConfig?.apikey ||
@@ -1292,6 +1305,27 @@ function parseGatewayHealthAwareRoutingConfig(
       value?.preferLowerLatency,
       true
     )
+  };
+}
+
+function parseGatewayRoutingConfig(value: GatewayRoutingJsonConfig | undefined): GatewayRoutingConfig {
+  return {
+    preferSourceProviderForBareModels: resolveBoolean(
+      process.env.PREFER_SOURCE_PROVIDER_FOR_BARE_MODELS,
+      value?.preferSourceProviderForBareModels ?? value?.preferSourceProviderForBareModel,
+      false
+    )
+  };
+}
+
+function parseGatewayModelListConfig(value: unknown): GatewayModelListConfig {
+  const raw = isPlainObject(value) ? (value as GatewayModelListJsonConfig) : undefined;
+  return {
+    bareModelIds:
+      readBoolean(raw?.bareModelIds) ??
+      readBoolean(raw?.bareModelId) ??
+      readBoolean(raw?.bare_model_ids) ??
+      false
   };
 }
 

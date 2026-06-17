@@ -71,13 +71,15 @@ export function parseAnthropicToStandardResponse(payload: unknown): Result<Stand
   const cacheReadTokens = asNumber(usageRaw?.cache_read_input_tokens) ?? asNumber(usageRaw?.cache_read_tokens);
   const cacheWriteTokens =
     asNumber(usageRaw?.cache_creation_input_tokens) ?? asNumber(usageRaw?.cache_write_tokens);
+  const serverToolUse = isObject(usageRaw?.server_tool_use) ? usageRaw.server_tool_use : undefined;
   const usage: StandardUsage = {
     input_tokens: inputTokens,
     output_tokens: outputTokens,
     total_tokens: sumOptional(inputTokens, outputTokens),
     cache_read_tokens: cacheReadTokens,
     cache_write_tokens: cacheWriteTokens,
-    cache_duration_seconds: extractCacheDurationSeconds(usageRaw)
+    cache_duration_seconds: extractCacheDurationSeconds(usageRaw),
+    server_tool_use: normalizeServerToolUse(serverToolUse)
   };
 
   return ok(createStandardResponse({
@@ -145,6 +147,21 @@ function createStandardResponse(args: {
     usage: args.usage,
     finish_reason: args.finishReason
   };
+}
+
+function normalizeServerToolUse(value: Record<string, unknown> | undefined): StandardUsage['server_tool_use'] {
+  if (!value) {
+    return undefined;
+  }
+
+  const serverToolUse = {
+    web_search_requests: asNumber(value.web_search_requests),
+    web_fetch_requests: asNumber(value.web_fetch_requests)
+  };
+
+  return Object.values(serverToolUse).some((count) => count !== undefined)
+    ? serverToolUse
+    : undefined;
 }
 
 function buildStandardResponseOutputItems(

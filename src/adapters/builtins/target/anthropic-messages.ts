@@ -129,23 +129,11 @@ function standardContentToAnthropicBlocks(
       continue;
     }
 
-    const toolResultBlock: Record<string, unknown> =
-      item.result_format === 'web_search'
-        ? {
-            type: 'tool_result',
-            tool_use_id: item.tool_use_id,
-            content: [
-              {
-                type: 'web_search_tool_result',
-                content: normalizeWebSearchResultContent(item.content)
-              }
-            ]
-          }
-        : {
-            type: 'tool_result',
-            tool_use_id: item.tool_use_id,
-            content: item.content
-          };
+    const toolResultBlock: Record<string, unknown> = {
+      type: 'tool_result',
+      tool_use_id: item.tool_use_id,
+      content: item.content
+    };
     if (item.is_error !== undefined) {
       toolResultBlock.is_error = item.is_error;
     }
@@ -237,15 +225,6 @@ function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Arra
   }
 
   return blocks;
-}
-
-function normalizeWebSearchResultContent(content: string): unknown {
-  try {
-    const parsed = JSON.parse(content) as unknown;
-    return parsed;
-  } catch {
-    return content;
-  }
 }
 
 function mapStandardToolsToAnthropicTools(tools: unknown[] | undefined): Record<string, unknown>[] | undefined {

@@ -71,6 +71,12 @@ export function formatAnthropicMessagesResponse(response: StandardResponse): Rec
     usage.cache_creation_input_tokens = response.usage.cache_write_tokens;
   }
 
+  if (response.usage.server_tool_use) {
+    usage.server_tool_use = {
+      ...response.usage.server_tool_use
+    };
+  }
+
   return {
     id: response.id,
     type: 'message',

@@ -173,7 +173,6 @@ export function normalizeOpenAIResponsesUsage(usageRaw: unknown): Record<string,
       : {};
 
   return {
-    ...usage,
     input_tokens: inputTokens,
     input_tokens_details: {
       ...inputDetails,

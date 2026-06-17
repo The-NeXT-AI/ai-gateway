@@ -1408,6 +1408,10 @@ async function runTransparentToolExecutionLoop(input: {
       toolResolution.executableCalls,
       toolResolution.bindings
     );
+    aggregatedUsage = addServerToolUseToStandardUsage(
+      aggregatedUsage,
+      countTransparentWebSearchToolCalls(toolResolution.executableCalls, toolResolution.bindings)
+    );
     workingRequest = appendVirtualToolResultsToRequest(
       workingRequest,
       lastResponse,
@@ -1712,8 +1716,7 @@ async function handleVirtualModelRequest(
     tools: mergedToolingResult.tools,
     tool_choice: resolveVirtualToolChoice(
       baseStandardRequest.tool_choice,
-      virtualModel.profile.toolChoice,
-      mergedToolingResult.tools.length
+      virtualModel.profile.toolChoice
     )
   };
 
@@ -2089,6 +2092,10 @@ async function handleVirtualModelRequest(
         callPartition.internal,
         mergedToolingResult.toolOwners,
         multimodalRewrite.references
+      );
+      aggregatedUsage = addServerToolUseToStandardUsage(
+        aggregatedUsage,
+        countInternalWebSearchToolCalls(virtualModel.profile, callPartition.internal)
       );
       workingRequest = appendVirtualToolResultsToRequest(
         workingRequest,
@@ -3357,18 +3364,13 @@ function mergeVirtualModelInstructions(
 
 function resolveVirtualToolChoice(
   baseToolChoice: unknown,
-  profileToolChoice: unknown,
-  toolCount: number
+  profileToolChoice: unknown
 ): unknown {
   if (profileToolChoice !== undefined) {
     return profileToolChoice;
   }
 
-  if (toolCount === 0) {
-    return baseToolChoice;
-  }
-
-  return baseToolChoice !== undefined ? baseToolChoice : 'auto';
+  return baseToolChoice;
 }
 
 function extractStandardToolName(tool: unknown): string | undefined {
@@ -3754,8 +3756,64 @@ function mergeStandardUsage(base: StandardUsage, next: StandardUsage): StandardU
     cache_duration_seconds:
       (base.cache_duration_seconds || 0) + (next.cache_duration_seconds || 0) || undefined,
     cache_ttl_seconds: next.cache_ttl_seconds ?? base.cache_ttl_seconds,
-    cache_age_seconds: next.cache_age_seconds ?? base.cache_age_seconds
+    cache_age_seconds: next.cache_age_seconds ?? base.cache_age_seconds,
+    server_tool_use: mergeServerToolUse(base.server_tool_use, next.server_tool_use)
   };
+}
+
+function addServerToolUseToStandardUsage(usage: StandardUsage, webSearchRequests: number): StandardUsage {
+  if (webSearchRequests <= 0) {
+    return usage;
+  }
+
+  return mergeStandardUsage(usage, {
+    server_tool_use: {
+      web_search_requests: webSearchRequests
+    }
+  });
+}
+
+function mergeServerToolUse(
+  base: StandardUsage['server_tool_use'],
+  next: StandardUsage['server_tool_use']
+): StandardUsage['server_tool_use'] {
+  const webSearchRequests =
+    (base?.web_search_requests || 0) + (next?.web_search_requests || 0) || undefined;
+  const webFetchRequests =
+    (base?.web_fetch_requests || 0) + (next?.web_fetch_requests || 0) || undefined;
+
+  if (webSearchRequests === undefined && webFetchRequests === undefined) {
+    return undefined;
+  }
+
+  return {
+    web_search_requests: webSearchRequests,
+    web_fetch_requests: webFetchRequests
+  };
+}
+
+function countInternalWebSearchToolCalls(
+  profile: VirtualModelProfileConfig,
+  toolCalls: StandardResponseFunctionCall[]
+): number {
+  if (!profile.execution.matchWebSearch) {
+    return 0;
+  }
+
+  return toolCalls.filter((toolCall) => isVirtualWebSearchToolName(toolCall.name)).length;
+}
+
+function countTransparentWebSearchToolCalls(
+  toolCalls: StandardResponseFunctionCall[],
+  bindings: Map<string, TransparentToolBinding>
+): number {
+  return toolCalls.filter((toolCall) => {
+    const binding = bindings.get(toolCall.name);
+    return (
+      isVirtualWebSearchToolName(toolCall.name) ||
+      Boolean(binding && isVirtualWebSearchToolName(binding.runtimeToolName))
+    );
+  }).length;
 }
 
 export function parseGeminiTail(tail: string): { model: string; action: 'generateContent' | 'streamGenerateContent' } | null {
@@ -3841,6 +3899,16 @@ function resolveTargetProviders(
     return {
       ok: true,
       value: [routeFromModelReference(providerRefFromModel)]
+    };
+  }
+
+  if (
+    config.routing?.preferSourceProviderForBareModels === true &&
+    (modelRefFromHeader || modelRefFromBody)
+  ) {
+    return {
+      ok: true,
+      value: [{ provider: sourceProvider }]
     };
   }
 

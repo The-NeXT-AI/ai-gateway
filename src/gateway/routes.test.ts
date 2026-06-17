@@ -110,6 +110,47 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('lists bare gateway model ids when configured', async () => {
+    const config = createConfig(
+      [
+        createProviderConfig('r9s-openai', 'openai_chat_completions', ['glm-5.1']),
+        createProviderConfig('r9s-anthropic', 'anthropic_messages', ['glm-5.1'])
+      ],
+      undefined,
+      [
+        createVirtualSuffixProfile('vision', ':vision'),
+        createVirtualSuffixProfile('websearch', ':websearch'),
+        createVirtualSuffixProfile('all', ':all')
+      ]
+    );
+    config.modelList = {
+      bareModelIds: true
+    };
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/v1/models'
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.data.map((entry: { id: string }) => entry.id)).toEqual([
+        'glm-5.1',
+        'glm-5.1:vision',
+        'glm-5.1:websearch',
+        'glm-5.1:all'
+      ]);
+      expect(body.data.every((entry: { id: string }) => !entry.id.includes('/'))).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('lists gateway models in Anthropic format when Anthropic headers are present', async () => {
     const app = Fastify({ logger: false });
     registerGatewayRoutes(
@@ -225,6 +266,68 @@ describe('gateway routes protocol conversion', () => {
           code: 'model_not_found'
         }
       });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('routes bare Anthropic message models to the source provider when configured', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'msg_source_provider',
+          type: 'message',
+          role: 'assistant',
+          model: 'glm-5.1',
+          content: [{ type: 'text', text: 'anthropic target' }],
+          stop_reason: 'end_turn',
+          usage: {
+            input_tokens: 7,
+            output_tokens: 3
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig([
+      createProviderConfig('r9s-openai', 'openai_chat_completions', ['glm-5.1']),
+      createProviderConfig('r9s-anthropic', 'anthropic_messages', ['glm-5.1'])
+    ]);
+    config.defaultTargetProviders = ['openai', 'anthropic'];
+    config.routing = {
+      preferSourceProviderForBareModels: true
+    };
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'glm-5.1',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://api.anthropic.com/v1/messages');
+      expect(JSON.parse(String(upstreamInit.body)).model).toBe('glm-5.1');
     } finally {
       await app.close();
     }
@@ -4291,7 +4394,6 @@ describe('gateway routes protocol conversion', () => {
               visibility: 'internal'
             }
           ],
-          toolChoice: 'auto',
           execution: {
             mode: 'tool_loop',
             maxTurns: 4,
@@ -4331,6 +4433,7 @@ describe('gateway routes protocol conversion', () => {
       const firstBody = JSON.parse(String(firstInit.body));
       expect(firstBody.model).toBe('glm-5');
       expect(firstBody.tools?.[0]?.function?.name || firstBody.tools?.[0]?.name).toBe('search_web');
+      expect(firstBody.tool_choice).toBeUndefined();
 
       const [, secondInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
       const secondBody = JSON.parse(String(secondInit.body));
@@ -5232,6 +5335,38 @@ function createConfig(
       }
     }
   } as unknown as GatewayConfig;
+}
+
+function createVirtualSuffixProfile(
+  key: string,
+  suffix: string
+): NonNullable<GatewayConfig['virtualModelProfiles']>[number] {
+  return {
+    id: `virtual-${key}`,
+    key,
+    displayName: key,
+    enabled: true,
+    match: {
+      exactAliases: [],
+      prefixes: [],
+      suffixes: [suffix]
+    },
+    baseModel: {
+      mode: 'strip_suffix'
+    },
+    tools: [],
+    execution: {
+      mode: 'decorate_only',
+      maxTurns: 1,
+      maxToolCalls: 0,
+      clientToolsPolicy: 'allow',
+      streamMode: 'buffered'
+    },
+    materialization: {
+      enabled: true,
+      includeInGatewayModels: true
+    }
+  };
 }
 
 async function waitForCondition(predicate: () => boolean): Promise<void> {

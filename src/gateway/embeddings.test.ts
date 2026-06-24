@@ -93,6 +93,69 @@ describe('openai embeddings gateway route', () => {
     }
   });
 
+  it('routes public provider model selectors to the matching credential-qualified OpenAI provider', async () => {
+    const fetchMock = vi.fn(async () => {
+      return jsonResponse({
+        object: 'list',
+        data: [{ object: 'embedding', index: 0, embedding: [0.3, 0.4] }],
+        model: 'text-embedding-3-small',
+        usage: {
+          prompt_tokens: 5,
+          total_tokens: 5
+        }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const wrongProvider = createProviderConfig(
+      'Other Embeddings::openai_responses::cred:test-1',
+      ['other-embedding-model'],
+      {
+        apikey: 'wrong-key',
+        baseurl: 'https://wrong.example/v1/'
+      }
+    );
+    const targetProvider = createProviderConfig(
+      'Zhipu AI (China) - Coding Plan::openai_responses::cred:test-1',
+      ['text-embedding-3-small'],
+      {
+        apikey: 'target-key',
+        baseurl: 'https://zhipu.example/v1/'
+      }
+    );
+    const config = createConfig([wrongProvider, targetProvider]);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/embeddings',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'Zhipu AI (China) - Coding Plan/text-embedding-3-small',
+          input: 'hello'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['x-gateway-target-provider-name']).toBe(targetProvider.name);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://zhipu.example/v1/embeddings');
+      expect(upstreamInit.headers).toMatchObject({
+        authorization: 'Bearer target-key'
+      });
+      expect(JSON.parse(String(upstreamInit.body)).model).toBe('text-embedding-3-small');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('rejects a concurrent OpenAI JSON request when provider concurrency is saturated', async () => {
     let resolveFetch!: (response: Response) => void;
     const fetchMock = vi.fn(async () => {

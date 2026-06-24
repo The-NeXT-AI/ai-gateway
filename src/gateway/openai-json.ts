@@ -792,6 +792,27 @@ function isProviderConfigPublicNameSuffix(segment: string): boolean {
   return segment.trim().toLowerCase().startsWith('cred:');
 }
 
+function findProviderConfigBySelectorAlias(
+  providerConfigs: ProviderConfig[],
+  selector: string
+): ProviderConfig | undefined {
+  const exactMatch = findProviderConfigByName(providerConfigs, selector);
+  if (exactMatch) {
+    return exactMatch;
+  }
+
+  const normalizedSelector = selector.trim().toLowerCase();
+  if (!normalizedSelector) {
+    return undefined;
+  }
+
+  return providerConfigs.find((providerConfig) =>
+    providerConfigSelectorAliases(providerConfig).some(
+      (alias) => alias.trim().toLowerCase() === normalizedSelector
+    )
+  );
+}
+
 function parseProviderRouteList(
   value: string | undefined,
   providerConfigs: ProviderConfig[]
@@ -817,7 +838,7 @@ function parseProviderRoute(
     return undefined;
   }
 
-  const byName = findProviderConfigByName(providerConfigs, normalized);
+  const byName = findProviderConfigBySelectorAlias(providerConfigs, normalized);
   if (byName) {
     return {
       provider: providerFromProviderType(byName.type),
@@ -845,7 +866,7 @@ function parseModelReference(
 
   const providerHint = raw.slice(0, slashIndex).trim();
   const model = raw.slice(slashIndex + 1).trim();
-  const providerConfig = findProviderConfigByName(providerConfigs, providerHint);
+  const providerConfig = findProviderConfigBySelectorAlias(providerConfigs, providerHint);
   if (providerConfig) {
     return {
       raw,

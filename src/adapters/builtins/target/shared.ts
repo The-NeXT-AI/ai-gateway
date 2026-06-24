@@ -41,7 +41,10 @@ export function parseOpenAIToStandardResponse(payload: unknown): Result<Standard
       asNumber(inputDetails?.cache_creation_tokens) ??
       asNumber(usageRaw?.cache_creation_tokens) ??
       asNumber(usageRaw?.cache_write_tokens),
-    cache_duration_seconds: extractCacheDurationSeconds(usageRaw, inputDetails)
+    cache_duration_seconds: extractCacheDurationSeconds(usageRaw, inputDetails),
+    server_tool_use: normalizeServerToolUse(
+      isObject(usageRaw?.server_tool_use) ? usageRaw.server_tool_use : undefined
+    )
   };
 
   return ok(createStandardResponse({

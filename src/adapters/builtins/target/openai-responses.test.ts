@@ -3,6 +3,33 @@ import { parseAnthropicMessagesRequest, parseOpenAIResponsesRequest } from '../s
 import { openAIResponsesTargetAdapter } from './openai-responses';
 
 describe('openAIResponsesTargetAdapter', () => {
+  it('preserves OpenAI server tool usage counters in standard responses', () => {
+    const parsed = openAIResponsesTargetAdapter.toStandardResponse({
+      id: 'resp_server_tools',
+      model: 'gpt-5.1',
+      output_text: 'searched',
+      usage: {
+        input_tokens: 10,
+        output_tokens: 4,
+        total_tokens: 14,
+        server_tool_use: {
+          web_search_requests: 2,
+          web_fetch_requests: 1
+        }
+      }
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    expect(parsed.value.usage.server_tool_use).toEqual({
+      web_search_requests: 2,
+      web_fetch_requests: 1
+    });
+  });
+
   it('converts anthropic tool_use/tool_result history into OpenAI chat tool messages', () => {
     const parsed = parseAnthropicMessagesRequest({
       model: 'claude-3-5-sonnet-latest',

@@ -2697,6 +2697,148 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('uses public provider model selectors to select the matching credential-qualified provider', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_public_selector_same_type_1',
+          model: 'glm-5.2',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'ok'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 2,
+            completion_tokens: 1,
+            total_tokens: 3
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const wrongProvider = createProviderConfig(
+      'Other Coding Plan::openai_chat_completions::cred:test-1',
+      'openai_chat_completions',
+      ['wrong-model']
+    );
+    wrongProvider.baseurl = 'https://wrong.example/v1';
+    const targetProvider = createProviderConfig(
+      'Zhipu AI (China) - Coding Plan::openai_chat_completions::cred:test-1',
+      'openai_chat_completions',
+      ['glm-5.2']
+    );
+    targetProvider.baseurl = 'https://zhipu.example/v1';
+    const config = createConfig([wrongProvider, targetProvider]);
+    config.defaultTargetProviders = ['openai'];
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'Zhipu AI (China) - Coding Plan/glm-5.2',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['x-gateway-target-provider-name']).toBe(targetProvider.name);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://zhipu.example/v1/chat/completions');
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.model).toBe('glm-5.2');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('accepts public provider names in x-target-provider for credential-qualified provider names', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_public_target_provider_1',
+          model: 'glm-5.2',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'ok'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 2,
+            completion_tokens: 1,
+            total_tokens: 3
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const targetProvider = createProviderConfig(
+      'Zhipu AI (China) - Coding Plan::openai_chat_completions::cred:test-1',
+      'openai_chat_completions',
+      ['glm-5.2']
+    );
+    targetProvider.baseurl = 'https://zhipu.example/v1';
+    const config = createConfig([targetProvider]);
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'Zhipu AI (China) - Coding Plan'
+        },
+        payload: {
+          model: 'glm-5.2',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['x-gateway-target-provider-name']).toBe(targetProvider.name);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://zhipu.example/v1/chat/completions');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('maps Anthropic thinking controls to DeepSeek OpenAI chat fields', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(
@@ -5155,6 +5297,121 @@ describe('gateway routes protocol conversion', () => {
       expect(response.body).not.toContain('"name":"web_search"');
       expect(response.body).not.toContain('call_web_search_optimistic_1');
       expect(response.body).toContain('data: [DONE]');
+      const completedLine = response.body
+        .split('\n')
+        .find((line) => line.startsWith('data: ') && line.includes('"type":"response.completed"'));
+      expect(completedLine).toBeDefined();
+      const completedEvent = JSON.parse(String(completedLine).slice('data: '.length));
+      expect(completedEvent.response.id).toBe('chatcmpl_virtual_websearch_optimistic_1');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not optimistically relay non-2xx upstream event streams as successful responses', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response('data: {"error":{"message":"invalid key"}}\n\n', {
+        status: 401,
+        headers: {
+          'content-type': 'text/event-stream'
+        }
+      })
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const toolProvider = {
+      listDefinitions: async () => [
+        {
+          name: 'web_search',
+          description: 'Search the web',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      ],
+      has: async () => true,
+      execute: async () => {
+        throw new Error('should not execute');
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'virtual-websearch-optimistic-upstream-error',
+          key: 'websearch',
+          displayName: 'Web Search',
+          enabled: true,
+          match: {
+            exactAliases: [],
+            prefixes: [],
+            suffixes: [':websearch']
+          },
+          baseModel: {
+            mode: 'strip_suffix'
+          },
+          tools: [
+            {
+              name: 'web_search',
+              visibility: 'internal'
+            }
+          ],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 4,
+            clientToolsPolicy: 'deny',
+            matchWebSearch: true,
+            streamMode: 'optimistic'
+          },
+          materialization: {
+            enabled: true,
+            includeInGatewayModels: true
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'openai-main/glm-5:websearch',
+          input: 'What happened today?',
+          stream: true,
+          tools: [
+            {
+              type: 'web_search'
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(401);
+      expect(String(response.headers['content-type'] || '')).not.toContain('text/event-stream');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const body = JSON.parse(response.body);
+      expect(body.error.message).toBe('All target providers failed.');
+      expect(body.error.attempts[0]).toMatchObject({
+        stage: 'upstream_response',
+        status: 401
+      });
     } finally {
       await app.close();
     }

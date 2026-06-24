@@ -2594,7 +2594,7 @@ function emitOpenAIResponsesFramesFromChatChunk(
   tools?: unknown[]
 ): string[] {
   const messageId = asString(payload.id);
-  if (messageId) {
+  if (messageId && !state.started) {
     state.responseId = messageId;
   }
 
@@ -3366,7 +3366,7 @@ function emitAnthropicFramesFromOpenAIChatChunk(
   payload: Record<string, unknown>
 ): string[] {
   const messageId = asString(payload.id);
-  if (messageId) {
+  if (messageId && !state.started) {
     state.messageId = messageId;
   }
 

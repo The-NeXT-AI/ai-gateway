@@ -9,7 +9,7 @@ import type {
 import { ok } from '../../../types';
 import { asString, collectStandardInputMessages, isObject } from '../../../utils';
 import { buildOpenAIHeaders } from '../common';
-import { parseOpenAIToStandardResponse } from './shared';
+import { applyOpenAIChatStreamUsageOption, parseOpenAIToStandardResponse } from './shared';
 import {
   isAnthropicWebSearchTool,
   isOpenAIWebSearchTool,
@@ -73,7 +73,7 @@ export const openAIResponsesTargetAdapter: TargetAdapter = {
       return ok({
         url: `${input.config.openaiBaseUrl}/chat/completions`,
         headers: headersResult.value,
-        body
+        body: applyOpenAIChatStreamUsageOption(body, input.targetProviderConfig)
       });
     }
 
@@ -222,12 +222,6 @@ function standardInputToOpenAIChatMessages(
     }
 
     const toolResults = collectUserToolResults(message.content);
-    if (text) {
-      messages.push({
-        role: 'user',
-        content: text
-      });
-    }
     for (const toolResult of toolResults) {
       messages.push({
         role: 'tool',
@@ -236,6 +230,12 @@ function standardInputToOpenAIChatMessages(
           toolResult.result_format === 'web_search'
             ? formatWebSearchResultText(toolResult.content)
             : toolResult.content
+      });
+    }
+    if (text) {
+      messages.push({
+        role: 'user',
+        content: text
       });
     }
   }

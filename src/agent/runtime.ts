@@ -5,6 +5,7 @@ import type {
   AgentRetryPolicyConfig,
   AgentStorageConfig,
   GatewayConfig,
+  GatewayRequestIdentity,
   Provider,
   ProviderConfig
 } from '../types';
@@ -120,6 +121,7 @@ const DEFAULT_TOOL_RETRY_POLICY: AgentRetryPolicyConfig = {
 export interface CreateAgentInput {
   name: string;
   description?: string;
+  ownerIdentity?: GatewayRequestIdentity;
   systemPrompt?: string;
   model?: string;
   allowedTools?: string[];
@@ -130,6 +132,7 @@ export interface CreateAgentSessionInput {
   sessionId?: string;
   prompt?: string;
   metadata?: Record<string, unknown>;
+  ownerIdentity?: GatewayRequestIdentity;
   correlationId?: string;
   systemPrompt?: string;
   model?: string;
@@ -365,6 +368,7 @@ export class EventDrivenAgentRuntime {
       agentId: randomUUID(),
       name: input.name.trim(),
       description: normalizeOptionalString(input.description),
+      ownerIdentity: cloneGatewayRequestIdentity(input.ownerIdentity),
       systemPrompt: normalizeOptionalString(input.systemPrompt) || DEFAULT_SYSTEM_PROMPT,
       model: normalizeProviderModelReference(input.model),
       allowedTools: normalizedAllowedTools,
@@ -463,8 +467,8 @@ export class EventDrivenAgentRuntime {
     const requestedAgentId = normalizeOptionalString(input.agentId);
     const agent = requestedAgentId
       ? this.agents.get(requestedAgentId)
-      : this.pickFallbackSessionAgent();
-    if (!agent) {
+      : this.pickFallbackSessionAgent(input.ownerIdentity);
+    if (!agent || !canAccessOwnerIdentity(agent.ownerIdentity, input.ownerIdentity)) {
       return {
         ok: false,
         error: 'AGENT_NOT_FOUND'
@@ -490,6 +494,7 @@ export class EventDrivenAgentRuntime {
 
     this.store.ensureSession(sessionId);
     this.store.setSessionAgent(sessionId, agent.agentId, createdAt);
+    this.store.setSessionOwner(sessionId, input.ownerIdentity, createdAt);
     this.store.updateSessionConfig(
       sessionId,
       {
@@ -780,19 +785,21 @@ export class EventDrivenAgentRuntime {
     }
   }
 
-  private pickFallbackSessionAgent(): AgentDefinition | undefined {
+  private pickFallbackSessionAgent(ownerIdentity?: GatewayRequestIdentity): AgentDefinition | undefined {
     if (this.agents.size === 0) {
       return undefined;
     }
 
-    const sorted = [...this.agents.values()].sort((a, b) => {
-      const aTime = a.createdAt || '';
-      const bTime = b.createdAt || '';
-      if (aTime !== bTime) {
-        return aTime < bTime ? -1 : 1;
-      }
-      return a.agentId < b.agentId ? -1 : 1;
-    });
+    const sorted = [...this.agents.values()]
+      .filter((agent) => canAccessOwnerIdentity(agent.ownerIdentity, ownerIdentity))
+      .sort((a, b) => {
+        const aTime = a.createdAt || '';
+        const bTime = b.createdAt || '';
+        if (aTime !== bTime) {
+          return aTime < bTime ? -1 : 1;
+        }
+        return a.agentId < b.agentId ? -1 : 1;
+      });
 
     return sorted[0];
   }
@@ -2738,6 +2745,7 @@ function safeStringify(value: unknown): string {
 function cloneAgent(agent: AgentDefinition): AgentDefinition {
   return {
     ...agent,
+    ownerIdentity: cloneGatewayRequestIdentity(agent.ownerIdentity),
     allowedTools: [...agent.allowedTools]
   };
 }
@@ -2764,6 +2772,7 @@ function normalizeAgentDefinition(value: unknown): AgentDefinition | undefined {
     agentId,
     name,
     description: normalizeOptionalString(value.description),
+    ownerIdentity: normalizeGatewayRequestIdentity(value.ownerIdentity),
     systemPrompt: normalizeOptionalString(value.systemPrompt) || DEFAULT_SYSTEM_PROMPT,
     model: normalizeProviderModelReference(value.model),
     allowedTools: normalizedAllowedTools,
@@ -2771,6 +2780,60 @@ function normalizeAgentDefinition(value: unknown): AgentDefinition | undefined {
     createdAt,
     updatedAt
   };
+}
+
+function canAccessOwnerIdentity(
+  ownerIdentity: GatewayRequestIdentity | undefined,
+  requestIdentity: GatewayRequestIdentity | undefined
+): boolean {
+  if (!ownerIdentity?.billingSubjectKey) {
+    return true;
+  }
+
+  return ownerIdentity.billingSubjectKey === requestIdentity?.billingSubjectKey;
+}
+
+function cloneGatewayRequestIdentity(identity: GatewayRequestIdentity | undefined): GatewayRequestIdentity | undefined {
+  if (!identity?.billingSubjectKey || !identity.source) {
+    return undefined;
+  }
+
+  return {
+    source: identity.source,
+    billingSubjectKey: identity.billingSubjectKey,
+    userId: normalizeOptionalString(identity.userId),
+    tenantId: normalizeOptionalString(identity.tenantId),
+    subject: normalizeOptionalString(identity.subject),
+    organizationId: normalizeOptionalString(identity.organizationId),
+    plan: normalizeOptionalString(identity.plan),
+    apiKeyId: normalizeOptionalString(identity.apiKeyId)
+  };
+}
+
+function normalizeGatewayRequestIdentity(value: unknown): GatewayRequestIdentity | undefined {
+  if (!isObject(value)) {
+    return undefined;
+  }
+
+  const billingSubjectKey = normalizeOptionalString(value.billingSubjectKey);
+  const source = value.source;
+  if (
+    !billingSubjectKey ||
+    (source !== 'trusted_header' && source !== 'http_introspection' && source !== 'static_api_key')
+  ) {
+    return undefined;
+  }
+
+  return cloneGatewayRequestIdentity({
+    source,
+    billingSubjectKey,
+    userId: normalizeOptionalString(value.userId),
+    tenantId: normalizeOptionalString(value.tenantId),
+    subject: normalizeOptionalString(value.subject),
+    organizationId: normalizeOptionalString(value.organizationId),
+    plan: normalizeOptionalString(value.plan),
+    apiKeyId: normalizeOptionalString(value.apiKeyId)
+  });
 }
 
 function normalizeProviderModelReference(value: unknown): string | undefined {

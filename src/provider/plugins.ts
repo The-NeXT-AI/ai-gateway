@@ -1,4 +1,4 @@
-import { createDecipheriv } from 'node:crypto';
+import { createDecipheriv, createHash } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
 import type { ProviderPluginRegistry } from '../adapters/registry';
 import { createDeepSeekThinkingProviderPlugin } from './deepseek-thinking';
@@ -74,6 +74,12 @@ interface CodexOauthStoredState {
 }
 
 interface CodexOauthResolvedState {
+  accessToken?: string;
+  refreshToken?: string;
+  accountId?: string;
+}
+
+interface CodexOauthStateScope {
   accessToken?: string;
   refreshToken?: string;
   accountId?: string;
@@ -333,7 +339,12 @@ async function applyCodexOauthAuthentication(
     return err(`${section}.accountId references missing value: ${accountResolution.missingRef}`);
   }
 
-  const storedState = readCodexOauthState(section, resolveContext);
+  const cacheScope: CodexOauthStateScope = {
+    accessToken,
+    refreshToken,
+    accountId
+  };
+  const storedState = readCodexOauthState(section, resolveContext, cacheScope);
   if (storedState) {
     accessToken = storedState.accessToken || accessToken;
     refreshToken = storedState.refreshToken || refreshToken;
@@ -398,7 +409,7 @@ async function applyCodexOauthAuthentication(
         access_token_length: refreshedTokens.value.accessToken?.length,
         refresh_token_length: refreshedTokens.value.refreshToken?.length
       });
-      persistCodexOauthState(section, resolveContext, {
+      persistCodexOauthState(section, resolveContext, cacheScope, {
         accessToken,
         refreshToken,
         accountId
@@ -489,7 +500,7 @@ async function applyCodexOauthAuthentication(
     account_header: accountId ? codexOauthAccountHeader : undefined
   });
 
-  persistCodexOauthState(section, resolveContext, {
+  persistCodexOauthState(section, resolveContext, cacheScope, {
     accessToken,
     refreshToken,
     accountId
@@ -597,9 +608,10 @@ async function requestCodexOauthTokenRefresh(
 
 function readCodexOauthState(
   section: string,
-  context: PluginValueResolveContext
+  context: PluginValueResolveContext,
+  scope: CodexOauthStateScope
 ): CodexOauthResolvedState | undefined {
-  const stored = codexOauthStateStore.get(buildCodexOauthStateKey(section, context));
+  const stored = codexOauthStateStore.get(buildCodexOauthStateKey(section, context, scope));
   if (!stored) {
     return undefined;
   }
@@ -614,13 +626,14 @@ function readCodexOauthState(
 function persistCodexOauthState(
   section: string,
   context: PluginValueResolveContext,
+  scope: CodexOauthStateScope,
   state: CodexOauthResolvedState
 ): void {
   if (!state.accessToken && !state.refreshToken && !state.accountId) {
     return;
   }
 
-  codexOauthStateStore.set(buildCodexOauthStateKey(section, context), {
+  codexOauthStateStore.set(buildCodexOauthStateKey(section, context, scope), {
     accessToken: state.accessToken,
     refreshToken: state.refreshToken,
     accountId: state.accountId,
@@ -630,15 +643,49 @@ function persistCodexOauthState(
 
 function buildCodexOauthStateKey(
   section: string,
-  context: PluginValueResolveContext
+  context: PluginValueResolveContext,
+  scope: CodexOauthStateScope
 ): string {
   const pluginName = extractPluginNameFromSection(section);
   const providerName = normalizeNonEmptyString(context.targetProviderName) || context.targetProvider;
+  const scopeKey = buildCodexOauthStateScopeKey(context, scope);
   return [
     'codex_oauth',
     sanitizeStateKeySegment(providerName),
-    sanitizeStateKeySegment(pluginName)
+    sanitizeStateKeySegment(pluginName),
+    scopeKey
   ].join(':');
+}
+
+function buildCodexOauthStateScopeKey(
+  context: PluginValueResolveContext,
+  scope: CodexOauthStateScope
+): string {
+  const identity = context.request.gatewayIdentity;
+  if (identity?.billingSubjectKey) {
+    return `identity:${hashStateKeyPart(identity.billingSubjectKey)}`;
+  }
+
+  const accountId = normalizeNonEmptyString(scope.accountId);
+  if (accountId) {
+    return `account:${hashStateKeyPart(accountId)}`;
+  }
+
+  const refreshToken = normalizeTokenValue(scope.refreshToken);
+  if (refreshToken) {
+    return `refresh:${hashStateKeyPart(refreshToken)}`;
+  }
+
+  const accessToken = normalizeTokenValue(scope.accessToken);
+  if (accessToken) {
+    return `access:${hashStateKeyPart(accessToken)}`;
+  }
+
+  return 'global';
+}
+
+function hashStateKeyPart(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 24);
 }
 
 function extractPluginNameFromSection(section: string): string {

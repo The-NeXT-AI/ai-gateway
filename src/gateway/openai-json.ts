@@ -12,7 +12,7 @@ import type {
   StandardUsage,
   UpstreamRequest
 } from '../types';
-import { callUpstream, readUpstreamPayload } from '../upstream/client';
+import { callUpstream, cancelResponseBodyOnAbort, readUpstreamPayload } from '../upstream/client';
 import {
   asNumber,
   isObject,
@@ -21,6 +21,7 @@ import {
   readHeader
 } from '../utils';
 import { applyHealthAwareRouting } from './health-routing';
+import { createClientDisconnectSignal } from './client-disconnect';
 import { evaluateGatewayPolicy, type GatewayPolicyResult } from './policy';
 import { recordProviderHealthFailure, recordProviderHealthResponse } from './provider-health';
 import { evaluateGatewayPrecheck } from './precheck';
@@ -70,6 +71,7 @@ interface OpenAIJsonProviderPluginContext {
   targetProvider: Provider;
   targetProviderConfig?: ProviderConfig;
   model?: string;
+  clientAbortSignal?: AbortSignal;
   forceCodexOauthRefreshOnce?: boolean;
   standardRequest?: StandardRequest;
   plugins: ProviderPlugin[];
@@ -179,6 +181,7 @@ async function handleOpenAIJsonRequest(
   runtime: GatewayRuntime,
   endpoint: OpenAIJsonEndpointConfig
 ) {
+  const clientAbortSignal = createClientDisconnectSignal(request, reply);
   const body = request.body;
   if (!isObject(body)) {
     return sendBadRequest(reply, 'Request body must be a JSON object.');
@@ -195,6 +198,10 @@ async function handleOpenAIJsonRequest(
   let precheckApplied = false;
 
   for (const target of targetProviders) {
+    if (clientAbortSignal.aborted) {
+      return;
+    }
+
     const targetProvider = target.provider;
     const targetProviderConfig = resolveProviderConfig(config, target);
     if (targetProvider !== 'openai') {
@@ -293,6 +300,7 @@ async function handleOpenAIJsonRequest(
       targetProvider,
       targetProviderConfig,
       model,
+      clientAbortSignal,
       standardRequest,
       plugins: runtime.providerPlugins.resolve(targetProvider, targetProviderConfig?.name)
     };
@@ -301,6 +309,9 @@ async function handleOpenAIJsonRequest(
       upstreamRequestResult.value,
       config.upstreamTimeoutMs
     );
+    if (clientAbortSignal.aborted) {
+      return;
+    }
     if (!dispatchResult.ok) {
       attempts.push({
         provider: targetProvider,
@@ -315,7 +326,16 @@ async function handleOpenAIJsonRequest(
 
     const { upstreamRequest, upstreamResponse } = dispatchResult;
 
-    const upstreamPayload = await safeReadUpstreamPayload(endpoint, request, targetProvider, upstreamResponse);
+    const upstreamPayload = await safeReadUpstreamPayload(
+      endpoint,
+      request,
+      targetProvider,
+      upstreamResponse,
+      clientAbortSignal
+    );
+    if (clientAbortSignal.aborted) {
+      return;
+    }
     if (!upstreamResponse.ok) {
       attempts.push({
         provider: targetProvider,
@@ -360,6 +380,10 @@ async function handleOpenAIJsonRequest(
       upstreamResponse.status
     );
     return relayUpstreamResponseWithPayload(reply, upstreamResponse, responsePayload);
+  }
+
+  if (clientAbortSignal.aborted) {
+    return;
   }
 
   const failure = buildFallbackErrorPayload(targetProviders, attempts);
@@ -557,7 +581,8 @@ async function callOpenAIJsonUpstream(
   const slot = await acquireProviderConcurrencySlot(
     context.config,
     context.targetProvider,
-    context.targetProviderConfig
+    context.targetProviderConfig,
+    context.clientAbortSignal
   );
   if (!slot.ok) {
     return {
@@ -576,7 +601,7 @@ async function callOpenAIJsonUpstream(
       upstreamRequest.headers,
       upstreamRequest.body,
       timeoutMs,
-      undefined,
+      context.clientAbortSignal,
       {
         logger: context.request.log,
         requestId: context.request.id,
@@ -586,6 +611,7 @@ async function callOpenAIJsonUpstream(
       },
       context.config.upstreamRetry
     );
+    cancelResponseBodyOnAbort(response, context.clientAbortSignal);
     recordProviderHealthResponse(
       context.targetProviderConfig,
       response.status,
@@ -602,12 +628,14 @@ async function callOpenAIJsonUpstream(
       value: response
     };
   } catch (error) {
-    recordProviderHealthFailure(context.targetProviderConfig, Date.now() - startedAt);
-    recordProviderCircuitBreakerFailure(
-      context.config,
-      context.targetProvider,
-      context.targetProviderConfig
-    );
+    if (!context.clientAbortSignal?.aborted) {
+      recordProviderHealthFailure(context.targetProviderConfig, Date.now() - startedAt);
+      recordProviderCircuitBreakerFailure(
+        context.config,
+        context.targetProvider,
+        context.targetProviderConfig
+      );
+    }
     return {
       ok: false,
       stage: 'upstream_connect',
@@ -1181,11 +1209,15 @@ async function safeReadUpstreamPayload(
   endpoint: OpenAIJsonEndpointConfig,
   request: FastifyRequest,
   provider: Provider,
-  upstreamResponse: Response
+  upstreamResponse: Response,
+  clientAbortSignal?: AbortSignal
 ): Promise<unknown> {
   try {
-    return await readUpstreamPayload(upstreamResponse);
+    return await readUpstreamPayload(upstreamResponse, clientAbortSignal);
   } catch (error) {
+    if (clientAbortSignal?.aborted) {
+      return { read_error: error instanceof Error ? error.message : String(error) };
+    }
     const details = error instanceof Error ? error.message : String(error);
     request.log.warn({ provider, details }, `Failed to parse ${endpoint.displayName.toLowerCase()} upstream payload.`);
     return { read_error: details };

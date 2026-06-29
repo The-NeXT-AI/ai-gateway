@@ -1,3 +1,5 @@
+import type { GatewayRequestIdentity } from '../types';
+
 export type AgentEventType =
   | 'SESSION_CONFIG_UPDATED'
   | 'USER_INPUT'
@@ -154,6 +156,7 @@ export interface AgentPendingToolCall {
 export interface AgentSessionState {
   sessionId: string;
   agentId: string;
+  ownerIdentity?: GatewayRequestIdentity;
   systemPrompt: string;
   model?: string;
   allowedTools: string[];
@@ -172,6 +175,7 @@ export interface AgentDefinition {
   agentId: string;
   name: string;
   description?: string;
+  ownerIdentity?: GatewayRequestIdentity;
   systemPrompt: string;
   model?: string;
   allowedTools: string[];

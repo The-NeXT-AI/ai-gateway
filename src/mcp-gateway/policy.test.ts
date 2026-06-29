@@ -96,8 +96,12 @@ describe('mcp gateway policy', () => {
   });
 
   it('detects internal ip ranges', () => {
-    expect(isInternalIp('10.1.2.3', [])).toBe(true);
-    expect(isInternalIp('192.168.10.99', [])).toBe(true);
+    expect(isInternalIp('127.0.0.1', [])).toBe(true);
+    expect(isInternalIp('::1', [])).toBe(true);
+    expect(isInternalIp('10.1.2.3', [])).toBe(false);
+    expect(isInternalIp('192.168.10.99', [])).toBe(false);
+    expect(isInternalIp('10.1.2.3', ['10.0.0.0/8'])).toBe(true);
+    expect(isInternalIp('192.168.10.99', ['192.168.0.0/16'])).toBe(true);
     expect(isInternalIp('8.8.8.8', ['8.8.8.0/24'])).toBe(true);
     expect(isInternalIp('1.1.1.1', [])).toBe(false);
   });

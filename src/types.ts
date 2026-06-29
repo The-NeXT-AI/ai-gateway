@@ -60,6 +60,7 @@ export interface ProviderConfig {
   baseurl?: string;
   models: string[];
   openaiChatToolsFormat?: 'openai' | 'anthropic';
+  openaiChatStreamUsage?: 'include_usage' | 'disabled';
   extraHeaders: ModelScopedHeadersConfig;
   extraBody: ModelScopedBodyConfig;
   billing: ModelScopedBillingConfig;

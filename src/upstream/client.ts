@@ -205,7 +205,7 @@ export async function callUpstream(
             );
           }
           await cancelResponseBody(response);
-          await delay(resolveRetryDelayMs(retry, attempt));
+          await delay(resolveRetryDelayMs(retry, attempt), signal);
           continue;
         }
 
@@ -259,7 +259,7 @@ export async function callUpstream(
           throw error;
         }
 
-        await delay(resolveRetryDelayMs(retry, attempt));
+        await delay(resolveRetryDelayMs(retry, attempt), signal);
       } finally {
         signal?.removeEventListener('abort', onAbort);
         if (activeController === controller) {
@@ -276,7 +276,11 @@ export async function callUpstream(
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-export async function relayUpstreamResponse(reply: FastifyReply, response: Response) {
+export async function relayUpstreamResponse(
+  reply: FastifyReply,
+  response: Response,
+  abortSignal?: AbortSignal
+) {
   reply.code(response.status);
 
   response.headers.forEach((value, key) => {
@@ -292,6 +296,9 @@ export async function relayUpstreamResponse(reply: FastifyReply, response: Respo
   }
 
   const stream = Readable.fromWeb(response.body as unknown as ReadableStream<Uint8Array>);
+  bindAbortSignalToReadable(stream, abortSignal, () => {
+    void cancelResponseBody(response);
+  });
   return reply.send(stream);
 }
 
@@ -302,9 +309,12 @@ export function forceEventStreamHeaders(reply: FastifyReply): void {
   reply.header('x-accel-buffering', 'no');
 }
 
-export async function readUpstreamPayload(response: Response): Promise<unknown> {
+export async function readUpstreamPayload(
+  response: Response,
+  abortSignal?: AbortSignal
+): Promise<unknown> {
   const contentType = (response.headers.get('content-type') || '').toLowerCase();
-  const text = await response.text();
+  const text = await readUpstreamResponseText(response, abortSignal);
   if (!text) {
     return {};
   }
@@ -322,6 +332,131 @@ export async function readUpstreamPayload(response: Response): Promise<unknown> 
   } catch {
     return { raw: text };
   }
+}
+
+export function bindAbortSignalToReadable(
+  stream: Readable,
+  abortSignal?: AbortSignal,
+  onAbort?: () => void
+): () => void {
+  if (!abortSignal) {
+    return () => {};
+  }
+
+  let cleanedUp = false;
+  const cleanup = () => {
+    if (cleanedUp) {
+      return;
+    }
+    cleanedUp = true;
+    abortSignal.removeEventListener('abort', handleAbort);
+    stream.off('close', cleanup);
+    stream.off('end', cleanup);
+    stream.off('error', cleanup);
+  };
+
+  const handleAbort = () => {
+    if (cleanedUp) {
+      return;
+    }
+    try {
+      onAbort?.();
+    } finally {
+      stream.destroy(toAbortError(abortSignal));
+      cleanup();
+    }
+  };
+
+  if (abortSignal.aborted) {
+    handleAbort();
+    return cleanup;
+  }
+
+  abortSignal.addEventListener('abort', handleAbort, { once: true });
+  stream.once('close', cleanup);
+  stream.once('end', cleanup);
+  stream.once('error', cleanup);
+
+  return cleanup;
+}
+
+export function cancelResponseBodyOnAbort(
+  response: Response,
+  abortSignal?: AbortSignal
+): () => void {
+  if (!abortSignal || !response.body) {
+    return () => {};
+  }
+
+  const handleAbort = () => {
+    void cancelResponseBody(response, abortSignal.reason);
+  };
+
+  if (abortSignal.aborted) {
+    handleAbort();
+    return () => {};
+  }
+
+  abortSignal.addEventListener('abort', handleAbort, { once: true });
+  return () => {
+    abortSignal.removeEventListener('abort', handleAbort);
+  };
+}
+
+export async function readUpstreamResponseText(
+  response: Response,
+  abortSignal?: AbortSignal
+): Promise<string> {
+  if (!abortSignal) {
+    return await response.text();
+  }
+
+  if (abortSignal.aborted) {
+    throw toAbortError(abortSignal);
+  }
+
+  if (!response.body) {
+    return '';
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let aborted = false;
+
+  const handleAbort = () => {
+    aborted = true;
+    reader.cancel(abortSignal.reason).catch(() => undefined);
+  };
+
+  abortSignal.addEventListener('abort', handleAbort, { once: true });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        text += decoder.decode(value, { stream: true });
+      }
+    }
+    text += decoder.decode();
+  } finally {
+    abortSignal.removeEventListener('abort', handleAbort);
+    reader.releaseLock();
+  }
+
+  if (aborted || abortSignal.aborted) {
+    throw toAbortError(abortSignal);
+  }
+
+  return text;
+}
+
+function toAbortError(abortSignal: AbortSignal): Error {
+  return abortSignal.reason instanceof Error
+    ? abortSignal.reason
+    : new Error(abortSignal.reason ? String(abortSignal.reason) : 'Operation aborted.');
 }
 
 function buildUpstreamLogContext(logContext: UpstreamCallLogContext): Record<string, unknown> {
@@ -426,8 +561,30 @@ export function sanitizePayloadForLog(payload: unknown): unknown {
   }
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  if (signal.aborted) {
+    return Promise.reject(toAbortError(signal));
+  }
+
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener('abort', handleAbort);
+    };
+    const handleAbort = () => {
+      cleanup();
+      reject(toAbortError(signal));
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', handleAbort, { once: true });
+  });
 }
 
 function normalizeUpstreamRetryOptions(
@@ -482,9 +639,9 @@ function resolveRetryDelayMs(retry: NormalizedUpstreamRetryOptions, attempt: num
   return Math.trunc(cappedDelay + Math.random() * retry.jitterMs);
 }
 
-async function cancelResponseBody(response: Response): Promise<void> {
+async function cancelResponseBody(response: Response, reason?: unknown): Promise<void> {
   try {
-    await response.body?.cancel();
+    await response.body?.cancel(reason);
   } catch {
     // Ignore body cancellation failures before retrying the upstream request.
   }

@@ -724,14 +724,6 @@ function isLoopbackIp(ipValue: string | undefined): boolean {
 }
 
 function readClientIp(request: FastifyRequest): string {
-  const forwardedFor = readHeaderValue(request.headers, 'x-forwarded-for');
-  if (forwardedFor) {
-    const first = forwardedFor.split(',')[0]?.trim();
-    if (first) {
-      return first;
-    }
-  }
-
   return request.ip;
 }
 

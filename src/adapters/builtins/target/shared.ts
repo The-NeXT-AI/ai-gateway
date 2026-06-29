@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type {
   Result,
+  ProviderConfig,
   StandardResponse,
   StandardResponseFunctionCall,
   StandardResponseReasoning,
@@ -8,7 +9,38 @@ import type {
   StandardUsage
 } from '../../../types';
 import { err, ok } from '../../../types';
-import { asNumber, asString, extractTextFromPart, isObject } from '../../../utils';
+import { asBoolean, asNumber, asString, extractTextFromPart, isObject } from '../../../utils';
+
+export function applyOpenAIChatStreamUsageOption(
+  body: unknown,
+  targetProviderConfig?: ProviderConfig
+): unknown {
+  if (!shouldIncludeOpenAIChatStreamUsage(targetProviderConfig) || !isObject(body)) {
+    return body;
+  }
+
+  if (asBoolean(body.stream) !== true) {
+    return body;
+  }
+
+  const streamOptions = isObject(body.stream_options) ? body.stream_options : {};
+  return {
+    ...body,
+    stream_options: {
+      ...streamOptions,
+      include_usage: true
+    }
+  };
+}
+
+export function shouldIncludeOpenAIChatStreamUsage(
+  targetProviderConfig?: ProviderConfig
+): boolean {
+  return (
+    targetProviderConfig?.type === 'openai_chat_completions' &&
+    targetProviderConfig.openaiChatStreamUsage !== 'disabled'
+  );
+}
 
 export function parseOpenAIToStandardResponse(payload: unknown): Result<StandardResponse> {
   if (!isObject(payload)) {

@@ -77,6 +77,23 @@ export function registerMcpGatewayRoutes(fastify: FastifyInstance, runtime: McpG
     const query = isRecord(request.query) ? request.query : {};
     const redirectUri = readObjectParam(query.redirect_uri);
     const state = readObjectParam(query.state);
+    const authResult = runtime.authenticate(request);
+    if (!authResult.ok || !authResult.context) {
+      if ((authResult.statusCode || 401) === 401) {
+        reply.header(
+          'www-authenticate',
+          runtime.buildOAuthWwwAuthenticateHeader(
+            buildOauthRequestContext(request, runtime.endpointPath),
+            'invalid_token',
+            authResult.error || 'Unauthorized'
+          )
+        );
+      }
+      return reply.code(authResult.statusCode || 401).send({
+        error: 'access_denied',
+        error_description: authResult.error || 'Unauthorized'
+      });
+    }
 
     try {
       const redirect = runtime.buildOAuthAuthorizeRedirectUrl({
@@ -87,7 +104,8 @@ export function registerMcpGatewayRoutes(fastify: FastifyInstance, runtime: McpG
         scope: readObjectParam(query.scope),
         resource: readObjectParam(query.resource),
         codeChallenge: readObjectParam(query.code_challenge),
-        codeChallengeMethod: readObjectParam(query.code_challenge_method)
+        codeChallengeMethod: readObjectParam(query.code_challenge_method),
+        principalKey: authResult.context.principal.key
       });
       return reply.redirect(redirect, 302);
     } catch (error) {

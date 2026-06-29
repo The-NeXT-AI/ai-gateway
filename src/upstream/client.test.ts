@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { callUpstream, sanitizePayloadForLog } from './client';
+import {
+  callUpstream,
+  cancelResponseBodyOnAbort,
+  readUpstreamPayload,
+  sanitizePayloadForLog
+} from './client';
 
 describe('callUpstream', () => {
   it('aborts model upstream requests based on timeoutMs', async () => {
@@ -109,6 +114,47 @@ describe('callUpstream', () => {
     }
   });
 
+  it('stops retry backoff when the external signal aborts', async () => {
+    vi.useFakeTimers();
+    const originalFetch = global.fetch;
+    const controller = new AbortController();
+
+    try {
+      const fetchMock = vi.fn(async () => {
+        return new Response(JSON.stringify({ error: 'rate limited' }), { status: 429 });
+      });
+      global.fetch = fetchMock as typeof fetch;
+
+      const pending = callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        0,
+        controller.signal,
+        undefined,
+        {
+          enabled: true,
+          maxAttempts: 2,
+          baseDelayMs: 1000,
+          maxDelayMs: 1000,
+          retryStatusCodes: [429]
+        }
+      ).catch((error) => error);
+
+      await Promise.resolve();
+      await Promise.resolve();
+      controller.abort(new Error('client disconnected'));
+      const error = await pending;
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toBe('client disconnected');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      global.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
   it('does not retry connection errors when retry is disabled', async () => {
     const originalFetch = global.fetch;
 
@@ -136,6 +182,49 @@ describe('callUpstream', () => {
     } finally {
       global.fetch = originalFetch;
     }
+  });
+});
+
+describe('upstream response abort handling', () => {
+  it('aborts response body reads when the client abort signal fires', async () => {
+    const controller = new AbortController();
+    const body = new ReadableStream<Uint8Array>({
+      start(streamController) {
+        streamController.enqueue(new TextEncoder().encode('{"partial":'));
+      }
+    });
+    const response = new Response(body, {
+      headers: {
+        'content-type': 'application/json'
+      }
+    });
+
+    const pending = readUpstreamPayload(response, controller.signal).catch((error) => error);
+    await Promise.resolve();
+
+    controller.abort(new Error('client disconnected'));
+    const error = await pending;
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toBe('client disconnected');
+  });
+
+  it('cancels an upstream response body when the client abort signal fires', async () => {
+    const controller = new AbortController();
+    let cancelReason: unknown;
+    const body = new ReadableStream<Uint8Array>({
+      cancel(reason) {
+        cancelReason = reason;
+      }
+    });
+    const response = new Response(body);
+
+    cancelResponseBodyOnAbort(response, controller.signal);
+    const reason = new Error('client disconnected');
+    controller.abort(reason);
+    await Promise.resolve();
+
+    expect(cancelReason).toBe(reason);
   });
 });
 

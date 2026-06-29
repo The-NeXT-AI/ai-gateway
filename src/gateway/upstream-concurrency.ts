@@ -3,6 +3,8 @@ import type { GatewayConfig, Provider, ProviderConfig } from '../types';
 interface ProviderConcurrencyQueueItem {
   resolve: (result: ProviderConcurrencyAcquireResult) => void;
   timeout?: NodeJS.Timeout;
+  abortSignal?: AbortSignal;
+  abortHandler?: () => void;
   settled: boolean;
 }
 
@@ -15,8 +17,9 @@ export type ProviderConcurrencyAcquireResult =
   | { ok: true; release: () => void }
   | {
       ok: false;
-      status: 429;
+      status: 429 | 499;
       message: string;
+      aborted?: boolean;
       details: {
         provider: Provider;
         providerName?: string;
@@ -30,7 +33,8 @@ const providerConcurrencyStates = new Map<string, ProviderConcurrencyState>();
 export async function acquireProviderConcurrencySlot(
   config: GatewayConfig,
   provider: Provider,
-  providerConfig?: ProviderConfig
+  providerConfig?: ProviderConfig,
+  abortSignal?: AbortSignal
 ): Promise<ProviderConcurrencyAcquireResult> {
   const concurrency = config.upstreamConcurrency;
   if (!concurrency?.enabled) {
@@ -45,6 +49,10 @@ export async function acquireProviderConcurrencySlot(
   const key = providerConcurrencyKey(provider, providerConfig);
   const state = getProviderConcurrencyState(key);
 
+  if (abortSignal?.aborted) {
+    return buildProviderConcurrencyAbortResult(provider, providerConfig, maxInFlight, queueTimeoutMs);
+  }
+
   if (state.active < maxInFlight) {
     state.active += 1;
     return {
@@ -56,6 +64,7 @@ export async function acquireProviderConcurrencySlot(
   return await new Promise<ProviderConcurrencyAcquireResult>((resolve) => {
     const item: ProviderConcurrencyQueueItem = {
       resolve,
+      abortSignal,
       settled: false
     };
 
@@ -68,6 +77,12 @@ export async function acquireProviderConcurrencySlot(
       resolveProviderConcurrencyTimeout(item, state, provider, providerConfig, maxInFlight, queueTimeoutMs);
     }, queueTimeoutMs);
     item.timeout.unref?.();
+    if (abortSignal) {
+      item.abortHandler = () => {
+        resolveProviderConcurrencyAbort(item, state, provider, providerConfig, maxInFlight, queueTimeoutMs);
+      };
+      abortSignal.addEventListener('abort', item.abortHandler, { once: true });
+    }
     state.queue.push(item);
   });
 }
@@ -75,9 +90,7 @@ export async function acquireProviderConcurrencySlot(
 export function resetProviderConcurrencyForTests(): void {
   for (const state of providerConcurrencyStates.values()) {
     for (const item of state.queue) {
-      if (item.timeout) {
-        clearTimeout(item.timeout);
-      }
+      cleanupProviderConcurrencyQueueItem(item);
       if (!item.settled) {
         item.settled = true;
         item.resolve({
@@ -101,9 +114,7 @@ function releaseProviderConcurrencySlot(state: ProviderConcurrencyState): void {
   const next = shiftNextPendingQueueItem(state);
   if (next) {
     next.settled = true;
-    if (next.timeout) {
-      clearTimeout(next.timeout);
-    }
+    cleanupProviderConcurrencyQueueItem(next);
     next.resolve({
       ok: true,
       release: () => releaseProviderConcurrencySlot(state)
@@ -127,6 +138,7 @@ function resolveProviderConcurrencyTimeout(
   }
 
   item.settled = true;
+  cleanupProviderConcurrencyQueueItem(item);
   removeQueueItem(state, item);
   item.resolve({
     ok: false,
@@ -139,6 +151,55 @@ function resolveProviderConcurrencyTimeout(
       queueTimeoutMs
     }
   });
+}
+
+function resolveProviderConcurrencyAbort(
+  item: ProviderConcurrencyQueueItem,
+  state: ProviderConcurrencyState,
+  provider: Provider,
+  providerConfig: ProviderConfig | undefined,
+  maxInFlight: number,
+  queueTimeoutMs: number
+): void {
+  if (item.settled) {
+    return;
+  }
+
+  item.settled = true;
+  cleanupProviderConcurrencyQueueItem(item);
+  removeQueueItem(state, item);
+  item.resolve(buildProviderConcurrencyAbortResult(provider, providerConfig, maxInFlight, queueTimeoutMs));
+}
+
+function buildProviderConcurrencyAbortResult(
+  provider: Provider,
+  providerConfig: ProviderConfig | undefined,
+  maxInFlight: number,
+  queueTimeoutMs: number
+): Extract<ProviderConcurrencyAcquireResult, { ok: false }> {
+  return {
+    ok: false,
+    status: 499,
+    aborted: true,
+    message: 'Client connection closed before acquiring provider concurrency slot.',
+    details: {
+      provider,
+      providerName: providerConfig?.name,
+      maxInFlight,
+      queueTimeoutMs
+    }
+  };
+}
+
+function cleanupProviderConcurrencyQueueItem(item: ProviderConcurrencyQueueItem): void {
+  if (item.timeout) {
+    clearTimeout(item.timeout);
+    item.timeout = undefined;
+  }
+  if (item.abortSignal && item.abortHandler) {
+    item.abortSignal.removeEventListener('abort', item.abortHandler);
+    item.abortHandler = undefined;
+  }
 }
 
 function shiftNextPendingQueueItem(

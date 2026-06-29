@@ -636,6 +636,191 @@ describe('Agent Routes', () => {
       await testRuntime.close();
     });
 
+    it('应按gateway身份隔离agent访问', async () => {
+      const testFastify = Fastify({ logger: false });
+      const testRuntime = createAgentRuntime({
+        config: testConfig,
+        logger: testFastify.log
+      });
+      await testRuntime.initialize();
+      testFastify.addHook('preHandler', async (request) => {
+        const userId = typeof request.headers['x-test-user'] === 'string' ? request.headers['x-test-user'] : 'user-a';
+        request.gatewayIdentity = {
+          source: 'trusted_header',
+          billingSubjectKey: `tenant-a:${userId}`,
+          tenantId: 'tenant-a',
+          userId
+        };
+      });
+      registerAgentRoutes(testFastify, testRuntime);
+
+      try {
+        const createA = await testFastify.inject({
+          method: 'POST',
+          url: '/agent/agents',
+          headers: {
+            'x-test-user': 'user-a'
+          },
+          payload: {
+            name: 'agent-a',
+            allowedTools: []
+          }
+        });
+        const createB = await testFastify.inject({
+          method: 'POST',
+          url: '/agent/agents',
+          headers: {
+            'x-test-user': 'user-b'
+          },
+          payload: {
+            name: 'agent-b',
+            allowedTools: []
+          }
+        });
+        expect(createA.statusCode).toBe(201);
+        expect(createB.statusCode).toBe(201);
+        const agentA = JSON.parse(createA.body).agent;
+        const agentB = JSON.parse(createB.body).agent;
+
+        const listA = await testFastify.inject({
+          method: 'GET',
+          url: '/agent/agents',
+          headers: {
+            'x-test-user': 'user-a'
+          }
+        });
+        expect(listA.statusCode).toBe(200);
+        expect(JSON.parse(listA.body).agents.map((agent: { agentId: string }) => agent.agentId)).toEqual([
+          agentA.agentId
+        ]);
+
+        const getAFromB = await testFastify.inject({
+          method: 'GET',
+          url: `/agent/agents/${agentA.agentId}`,
+          headers: {
+            'x-test-user': 'user-b'
+          }
+        });
+        expect(getAFromB.statusCode).toBe(404);
+
+        const updateAFromB = await testFastify.inject({
+          method: 'PUT',
+          url: `/agent/agents/${agentA.agentId}`,
+          headers: {
+            'x-test-user': 'user-b'
+          },
+          payload: {
+            name: 'stolen-agent'
+          }
+        });
+        expect(updateAFromB.statusCode).toBe(404);
+
+        const getBFromB = await testFastify.inject({
+          method: 'GET',
+          url: `/agent/agents/${agentB.agentId}`,
+          headers: {
+            'x-test-user': 'user-b'
+          }
+        });
+        expect(getBFromB.statusCode).toBe(200);
+      } finally {
+        await testFastify.close();
+        await testRuntime.close();
+      }
+    });
+
+    it('应按gateway身份隔离session访问和事件写入', async () => {
+      const testFastify = Fastify({ logger: false });
+      const testRuntime = createAgentRuntime({
+        config: testConfig,
+        logger: testFastify.log
+      });
+      await testRuntime.initialize();
+      testFastify.addHook('preHandler', async (request) => {
+        const userId = typeof request.headers['x-test-user'] === 'string' ? request.headers['x-test-user'] : 'user-a';
+        request.gatewayIdentity = {
+          source: 'trusted_header',
+          billingSubjectKey: `tenant-a:${userId}`,
+          tenantId: 'tenant-a',
+          userId
+        };
+      });
+      registerAgentRoutes(testFastify, testRuntime);
+
+      try {
+        const createAgent = await testFastify.inject({
+          method: 'POST',
+          url: '/agent/agents',
+          headers: {
+            'x-test-user': 'user-a'
+          },
+          payload: {
+            name: 'agent-a',
+            allowedTools: []
+          }
+        });
+        expect(createAgent.statusCode).toBe(201);
+        const agentId = JSON.parse(createAgent.body).agent.agentId;
+
+        const createSession = await testFastify.inject({
+          method: 'POST',
+          url: '/agent/sessions',
+          headers: {
+            'x-test-user': 'user-a'
+          },
+          payload: {
+            agentId,
+            stream: false
+          }
+        });
+        expect(createSession.statusCode).toBe(201);
+        const sessionId = JSON.parse(createSession.body).sessionId;
+
+        const listFromB = await testFastify.inject({
+          method: 'GET',
+          url: '/agent/sessions',
+          headers: {
+            'x-test-user': 'user-b'
+          }
+        });
+        expect(listFromB.statusCode).toBe(200);
+        expect(JSON.parse(listFromB.body).sessions).toEqual([]);
+
+        const getFromB = await testFastify.inject({
+          method: 'GET',
+          url: `/agent/sessions/${sessionId}`,
+          headers: {
+            'x-test-user': 'user-b'
+          }
+        });
+        expect(getFromB.statusCode).toBe(404);
+
+        const inputFromB = await testFastify.inject({
+          method: 'POST',
+          url: `/agent/sessions/${sessionId}/input`,
+          headers: {
+            'x-test-user': 'user-b'
+          },
+          payload: {
+            text: 'cross tenant input'
+          }
+        });
+        expect(inputFromB.statusCode).toBe(404);
+
+        const getFromA = await testFastify.inject({
+          method: 'GET',
+          url: `/agent/sessions/${sessionId}`,
+          headers: {
+            'x-test-user': 'user-a'
+          }
+        });
+        expect(getFromA.statusCode).toBe(200);
+      } finally {
+        await testFastify.close();
+        await testRuntime.close();
+      }
+    });
+
     it('应该成功创建带prompt的session', async () => {
       const response = await fastify.inject({
         method: 'POST',
@@ -2253,6 +2438,14 @@ describe('Agent Routes', () => {
         listTools: async () => [],
         listAgents: () => [],
         listSessions: () => [],
+        getAgent: () => ({
+          agentId: 'agent-external-1',
+          name: 'external-agent',
+          systemPrompt: 'external',
+          allowedTools: [],
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-01T00:00:00.000Z'
+        }),
         createSession: () => ({
           ok: true,
           createdAt: '2026-01-01T00:00:00.000Z',

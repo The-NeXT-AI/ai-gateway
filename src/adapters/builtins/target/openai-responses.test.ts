@@ -115,6 +115,115 @@ describe('openAIResponsesTargetAdapter', () => {
     ]);
   });
 
+  it('keeps restored tool results adjacent to assistant tool_calls before user text', () => {
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: {
+        model: 'deepseek-chat',
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'call_weather',
+                name: 'get_weather',
+                input: {
+                  city: 'Shanghai'
+                }
+              },
+              {
+                type: 'tool_use',
+                id: 'call_time',
+                name: 'get_time',
+                input: {
+                  timezone: 'Asia/Shanghai'
+                }
+              }
+            ]
+          },
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              {
+                type: 'input_text',
+                text: 'continue'
+              },
+              {
+                type: 'tool_result',
+                tool_use_id: 'call_weather',
+                content: '{"temperature":22}',
+                result_format: 'function'
+              },
+              {
+                type: 'tool_result',
+                tool_use_id: 'call_time',
+                content: '{"local_time":"10:00"}',
+                result_format: 'function'
+              }
+            ]
+          }
+        ]
+      },
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        type: 'openai_chat_completions'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.messages).toEqual([
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_weather',
+            type: 'function',
+            function: {
+              name: 'get_weather',
+              arguments: '{"city":"Shanghai"}'
+            }
+          },
+          {
+            id: 'call_time',
+            type: 'function',
+            function: {
+              name: 'get_time',
+              arguments: '{"timezone":"Asia/Shanghai"}'
+            }
+          }
+        ]
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call_weather',
+        content: '{"temperature":22}'
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call_time',
+        content: '{"local_time":"10:00"}'
+      },
+      {
+        role: 'user',
+        content: 'continue'
+      }
+    ]);
+  });
+
   it('converts Responses reasoning input into OpenAI chat reasoning fields', () => {
     const parsed = parseOpenAIResponsesRequest({
       model: 'MiniMax-M2.7',
@@ -426,6 +535,77 @@ describe('openAIResponsesTargetAdapter', () => {
     const body = built.value.body as Record<string, unknown>;
     expect(parsed.value.reasoning_split).toBeUndefined();
     expect(body.reasoning_split).toBe(true);
+  });
+
+  it('requests usage in OpenAI chat/completions streams when targeting chat from Responses', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'glm-5',
+      input: 'hello',
+      stream: true
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        type: 'openai_chat_completions'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).stream_options).toEqual({
+      include_usage: true
+    });
+  });
+
+  it('can disable usage requests in OpenAI chat/completions streams for incompatible targets', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'legacy-chat',
+      input: 'hello',
+      stream: true
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        type: 'openai_chat_completions',
+        openaiChatStreamUsage: 'disabled'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).stream_options).toBeUndefined();
   });
 
   it('passes reasoning_split when targeting OpenAI chat/completions', () => {

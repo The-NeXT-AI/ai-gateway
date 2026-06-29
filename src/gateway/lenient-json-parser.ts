@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { spawn } from 'node:child_process';
-import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib';
+import type { Transform } from 'node:stream';
+import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
 import { cacheRawRequestBody } from '../raw-trace';
 
 const fallbackBodyLimit = 1_048_576;
@@ -12,6 +13,9 @@ type RouteOptionsCarrier = FastifyRequest & {
     bodyLimit?: number;
   };
 };
+type DecodeBodyResult =
+  | { ok: true; value: Buffer }
+  | { ok: false; error: Error & { statusCode: number; code: string } };
 
 export function registerLenientJsonParser(fastify: FastifyInstance): void {
   if (fastify.hasContentTypeParser('application/json')) {
@@ -144,7 +148,7 @@ function decodeBodyByContentEncoding(
   body: Buffer,
   contentEncodingHeader: string | string[] | undefined,
   limit: number
-): Promise<{ ok: true; value: Buffer } | { ok: false; error: Error & { statusCode: number; code: string } }> {
+): Promise<DecodeBodyResult> {
   const encodings = parseContentEncodings(contentEncodingHeader);
   if (encodings.length === 0) {
     return Promise.resolve({ ok: true, value: body });
@@ -157,7 +161,7 @@ async function decodeBodyByEncodings(
   body: Buffer,
   encodings: string[],
   limit: number
-): Promise<{ ok: true; value: Buffer } | { ok: false; error: Error & { statusCode: number; code: string } }> {
+): Promise<DecodeBodyResult> {
   let decoded = body;
 
   for (let index = encodings.length - 1; index >= 0; index -= 1) {
@@ -169,11 +173,23 @@ async function decodeBodyByEncodings(
 
     try {
       if (encoding === 'gzip' || encoding === 'x-gzip') {
-        decoded = gunzipSync(decoded);
+        const result = await decodeZlibWithLimit(decoded, limit, encoding, () => createGunzip());
+        if (!result.ok) {
+          return result;
+        }
+        decoded = result.value;
       } else if (encoding === 'deflate') {
-        decoded = inflateSync(decoded);
+        const result = await decodeZlibWithLimit(decoded, limit, encoding, () => createInflate());
+        if (!result.ok) {
+          return result;
+        }
+        decoded = result.value;
       } else if (encoding === 'br') {
-        decoded = brotliDecompressSync(decoded);
+        const result = await decodeZlibWithLimit(decoded, limit, encoding, () => createBrotliDecompress());
+        if (!result.ok) {
+          return result;
+        }
+        decoded = result.value;
       } else if (encoding === 'zstd' || encoding === 'x-zstd') {
         const zstdDecoded = await decodeZstdWithCli(decoded, limit);
         if (!zstdDecoded.ok) {
@@ -213,10 +229,81 @@ async function decodeBodyByEncodings(
   return { ok: true, value: decoded };
 }
 
+function decodeZlibWithLimit(
+  body: Buffer,
+  limit: number,
+  encoding: string,
+  createDecoder: () => Transform
+): Promise<DecodeBodyResult> {
+  return new Promise((resolve) => {
+    const decoder = createDecoder();
+    const outputChunks: Buffer[] = [];
+    let outputLength = 0;
+    let settled = false;
+
+    const finalize = (result: DecodeBodyResult) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      decoder.removeAllListeners();
+      resolve(result);
+    };
+
+    decoder.on('data', (chunk: Buffer | string) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      outputLength += buffer.length;
+      if (outputLength > limit) {
+        decoder.destroy();
+        finalize({
+          ok: false,
+          error: Object.assign(new Error('Request body is too large.'), {
+            statusCode: 413,
+            code: 'FST_ERR_CTP_BODY_TOO_LARGE'
+          })
+        });
+        return;
+      }
+
+      outputChunks.push(buffer);
+    });
+
+    decoder.on('error', () => {
+      finalize({
+        ok: false,
+        error: Object.assign(new Error(`Body could not be decompressed using content-encoding: ${encoding}`), {
+          statusCode: 400,
+          code: 'FST_ERR_CTP_INVALID_CONTENT_ENCODING'
+        })
+      });
+    });
+
+    decoder.on('end', () => {
+      finalize({
+        ok: true,
+        value: Buffer.concat(outputChunks, outputLength)
+      });
+    });
+
+    try {
+      decoder.end(body);
+    } catch {
+      finalize({
+        ok: false,
+        error: Object.assign(new Error(`Body could not be decompressed using content-encoding: ${encoding}`), {
+          statusCode: 400,
+          code: 'FST_ERR_CTP_INVALID_CONTENT_ENCODING'
+        })
+      });
+    }
+  });
+}
+
 function decodeZstdWithCli(
   body: Buffer,
   limit: number
-): Promise<{ ok: true; value: Buffer } | { ok: false; error: Error & { statusCode: number; code: string } }> {
+): Promise<DecodeBodyResult> {
   return new Promise((resolve) => {
     const child = spawn('zstd', ['-d', '--stdout', '--quiet'], {
       stdio: ['pipe', 'pipe', 'pipe']

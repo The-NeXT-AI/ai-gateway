@@ -66,6 +66,7 @@ export interface McpGatewayOAuthAuthorizeParams {
   resource?: string;
   codeChallenge?: string;
   codeChallengeMethod?: string;
+  principalKey?: string;
 }
 
 export interface McpGatewayOAuthTokenRequest {
@@ -410,7 +411,18 @@ export class McpGatewayRuntime {
     }
 
     const redirectUri = safeParseAbsoluteUrl(params.redirectUri, 'redirect_uri');
-    const principalKey = this.resolveOAuthPrincipalKey(params.clientId);
+    const requestedPrincipalKey = normalizeOptionalString(params.principalKey);
+    if (
+      requestedPrincipalKey &&
+      !this.options.config.principals.some((item) => item.key === requestedPrincipalKey)
+    ) {
+      throw new McpGatewayOAuthError(
+        'unauthorized_client',
+        'Requested OAuth principal is not configured.',
+        401
+      );
+    }
+    const principalKey = requestedPrincipalKey || this.resolveOAuthPrincipalKey(params.clientId);
     if (!principalKey) {
       throw new McpGatewayOAuthError(
         'unauthorized_client',
@@ -762,14 +774,6 @@ function readApiKeyHeader(headers: McpGatewayHeaderBag): string | undefined {
 }
 
 function readClientIp(headers: McpGatewayHeaderBag, fallbackIp?: string): string {
-  const forwardedFor = readHeader(headers['x-forwarded-for']);
-  if (forwardedFor) {
-    const first = forwardedFor.split(',')[0]?.trim();
-    if (first) {
-      return first;
-    }
-  }
-
   const normalizedFallback = fallbackIp?.trim();
   if (normalizedFallback) {
     return normalizedFallback;

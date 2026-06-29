@@ -128,6 +128,9 @@ interface ProviderJsonConfig {
   openaiChatToolsFormat?: unknown;
   chatToolsFormat?: unknown;
   toolsFormat?: unknown;
+  openaiChatStreamUsage?: unknown;
+  chatStreamUsage?: unknown;
+  streamUsage?: unknown;
   extraHeaders?: unknown;
   extraBody?: unknown;
   billing?: unknown;
@@ -3187,6 +3190,9 @@ function parseProvidersConfig(value: unknown): ProviderConfig[] {
           readString(item.chatToolsFormat) ||
           readString(item.toolsFormat)
       ),
+      openaiChatStreamUsage: parseOpenAIChatStreamUsageToken(
+        item.openaiChatStreamUsage ?? item.chatStreamUsage ?? item.streamUsage
+      ),
       extraHeaders: parseModelScopedHeaders(item.extraHeaders, models),
       extraBody: parseModelScopedBody(item.extraBody, models),
       billing: parseModelScopedBilling(item.billing, models),
@@ -3685,6 +3691,40 @@ function parseOpenAIChatToolsFormatToken(value: string | undefined): ProviderCon
     normalized === 'input_schema'
   ) {
     return 'anthropic';
+  }
+
+  return undefined;
+}
+
+function parseOpenAIChatStreamUsageToken(value: unknown): ProviderConfig['openaiChatStreamUsage'] {
+  if (typeof value === 'boolean') {
+    return value ? 'include_usage' : 'disabled';
+  }
+
+  const normalized = readString(value)?.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (
+    normalized === 'include_usage' ||
+    normalized === 'includeusage' ||
+    normalized === 'enabled' ||
+    normalized === 'enable' ||
+    normalized === 'true' ||
+    normalized === 'on'
+  ) {
+    return 'include_usage';
+  }
+
+  if (
+    normalized === 'disabled' ||
+    normalized === 'disable' ||
+    normalized === 'false' ||
+    normalized === 'off' ||
+    normalized === 'none'
+  ) {
+    return 'disabled';
   }
 
   return undefined;

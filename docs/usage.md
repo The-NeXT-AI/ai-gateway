@@ -230,13 +230,14 @@ docker compose up --build
 - 可通过 `GATEWAY_CONFIG_PATH` 指定 JSON 配置文件路径
 - 示例文件见 `gateway.config.example.json`
 - 推荐使用 `Providers` 数组配置供应商（数组顺序即默认 fallback 顺序）
-- `Providers` 单项字段：`name`、`type`、`apikey|apiKeyEnv`、`baseurl`、`models`、`extraHeaders`、`extraBody`、`billing`
+- `Providers` 单项字段：`name`、`type`、`apikey|apiKeyEnv`、`baseurl`、`models`、`openaiChatStreamUsage`、`extraHeaders`、`extraBody`、`billing`
 - `providerPlugins` 用于声明供应商插件（`key`、`provider|providerName`、`codexOauth`、`deepseekThinking`、`auth`、`request`、`response`）
 - `type` 同时用于声明 provider 类别和上游协议，支持：
   - OpenAI：`openai`（等价 `openai_responses`）、`openai_responses`、`openai_chat_completions`
   - Anthropic：`anthropic`（等价 `anthropic_messages`）、`anthropic_messages`
   - Gemini：`gemini`（等价 `gemini_generate_content`）、`gemini_generate_content`
 - `extraHeaders` / `extraBody` / `billing` 支持按模型配置（`default` + 指定模型名）
+- `openaiChatStreamUsage` 仅对 `openai_chat_completions` 生效，默认会在流式请求中添加 `stream_options.include_usage=true`；供应商不兼容时可设为 `false` 或 `disabled` 关闭。
 - `providerPlugins` 的 `auth/request/response` 支持声明式规则：`headers`、`query`、`bodySet`、`bodyMerge`、`bodyRemove`
 - `providerPlugins` 支持值引用：`{"from":"env.XXX"}`、`{"from":"request.headers.x-foo"}`、`{"from":"request.body.user.id"}`、`{"from":"upstreamPayload.data.id"}`、`{"from":"target.providerName"}`
 - `providerPlugins.codexOauth` 字段：`accessToken`、`refreshToken`、`tokenEndpoint`、`clientId`、`scope`、`refreshIfMissingAccessToken`、`forceRefresh`、`required`、`timeoutMs`、`authHeader`、`authScheme`

@@ -24,9 +24,12 @@ import type {
   VirtualModelProfileConfig
 } from '../types';
 import {
+  bindAbortSignalToReadable,
   callUpstream,
+  cancelResponseBodyOnAbort,
   forceEventStreamHeaders,
   readUpstreamPayload,
+  readUpstreamResponseText,
   relayUpstreamResponse,
   sanitizeHeadersForLog,
   sanitizePayloadForLog
@@ -55,6 +58,7 @@ import {
   addNamespaceFieldsToStandardResponse,
   isHostedWebSearchTool
 } from '../adapters/builtins/target/tools';
+import { applyOpenAIChatStreamUsageOption } from '../adapters/builtins/target/shared';
 import type { GatewayRuntime } from './runtime';
 import { applyHealthAwareRouting } from './health-routing';
 import { evaluateGatewayPolicy, type GatewayPolicyResult } from './policy';
@@ -70,6 +74,7 @@ import {
   recordGatewayStreamConversion,
   recordGatewayToolExecution
 } from './metrics';
+import { createClientDisconnectSignal } from './client-disconnect';
 import {
   enqueueRawTraceCapture,
   markRawTraceCaptureSubmitted,
@@ -121,6 +126,7 @@ interface ProviderPluginExecutionContext {
   model?: string;
   passthrough: boolean;
   streaming: boolean;
+  clientAbortSignal?: AbortSignal;
   forceCodexOauthRefreshOnce?: boolean;
   plugins: ProviderPlugin[];
 }
@@ -225,6 +231,7 @@ export async function handleGatewayRequest(
   config: GatewayConfig,
   runtime: GatewayRuntime
 ) {
+  const clientAbortSignal = createClientDisconnectSignal(request, reply);
   const sourceAdapter = runtime.sourceAdapters.get(source.adapterKey);
   if (!sourceAdapter) {
     return reply.code(500).send({
@@ -275,7 +282,8 @@ export async function handleGatewayRequest(
       targetProviders,
       adapterInput,
       isStreaming,
-      virtualModelResolution
+      virtualModelResolution,
+      clientAbortSignal
     );
   }
 
@@ -310,6 +318,10 @@ export async function handleGatewayRequest(
   };
 
   for (const target of targetProviders) {
+    if (clientAbortSignal.aborted) {
+      return;
+    }
+
     const targetProvider = target.provider;
     const targetProviderConfig = resolveProviderConfig(config, target);
     const providerPlugins = runtime.providerPlugins.resolve(targetProvider, targetProviderConfig?.name);
@@ -399,6 +411,7 @@ export async function handleGatewayRequest(
         model: passthroughModel,
         passthrough: true,
         streaming: isStreaming,
+        clientAbortSignal,
         plugins: providerPlugins
       };
 
@@ -418,6 +431,9 @@ export async function handleGatewayRequest(
         baseUpstreamRequest,
         config.upstreamTimeoutMs
       );
+      if (clientAbortSignal.aborted) {
+        return;
+      }
       if (!upstreamDispatchResult.ok) {
         const attempt: ProviderAttemptFailure = {
           provider: targetProvider,
@@ -461,7 +477,15 @@ export async function handleGatewayRequest(
       const currentAttemptSequence = upstreamAttemptSequence;
 
       if (!upstreamResponse.ok) {
-        const details = await safeReadUpstreamPayload(request, targetProvider, upstreamResponse);
+        const details = await safeReadUpstreamPayload(
+          request,
+          targetProvider,
+          upstreamResponse,
+          clientAbortSignal
+        );
+        if (clientAbortSignal.aborted) {
+          return;
+        }
         const attempt: ProviderAttemptFailure = {
           provider: targetProvider,
           providerName: targetProviderConfig?.name,
@@ -497,7 +521,15 @@ export async function handleGatewayRequest(
             config.billing.enabled ||
             config.rawTrace.enabled)
         ) {
-          const upstreamPayload = await safeReadUpstreamPayload(request, targetProvider, upstreamResponse.clone());
+          const upstreamPayload = await safeReadUpstreamPayload(
+            request,
+            targetProvider,
+            upstreamResponse.clone(),
+            clientAbortSignal
+          );
+          if (clientAbortSignal.aborted) {
+            return;
+          }
           let billingPayload = upstreamPayload;
 
           if (hasResponseTransformPlugin) {
@@ -570,7 +602,8 @@ export async function handleGatewayRequest(
             upstreamRequest,
             upstreamResponse,
             passthroughModel,
-            targetProviderConfig
+            targetProviderConfig,
+            clientAbortSignal
           );
         }
 
@@ -581,7 +614,7 @@ export async function handleGatewayRequest(
         if (shouldForceEventStreamHeaders(source, isStreaming)) {
           forceEventStreamHeaders(reply);
         }
-        return relayUpstreamResponse(reply, upstreamResponse);
+        return relayUpstreamResponse(reply, upstreamResponse, clientAbortSignal);
       } else {
         const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, upstreamResponse);
         void tryPublishStreamingBillingEventFromUpstreamResponse(
@@ -598,7 +631,8 @@ export async function handleGatewayRequest(
           upstreamResponse.clone(),
           passthroughModel,
           targetProviderConfig,
-          rawTraceStreamResponse
+          rawTraceStreamResponse,
+          clientAbortSignal
         );
       }
 
@@ -614,7 +648,7 @@ export async function handleGatewayRequest(
       if (shouldForceEventStreamHeaders(source, isStreaming)) {
         forceEventStreamHeaders(reply);
       }
-      return relayUpstreamResponse(reply, upstreamResponse);
+      return relayUpstreamResponse(reply, upstreamResponse, clientAbortSignal);
     }
 
     if (isStreaming) {
@@ -704,6 +738,7 @@ export async function handleGatewayRequest(
         model,
         passthrough: false,
         streaming: true,
+        clientAbortSignal,
         plugins: providerPlugins
       };
 
@@ -724,6 +759,9 @@ export async function handleGatewayRequest(
         config.upstreamTimeoutMs,
         standardRequest
       );
+      if (clientAbortSignal.aborted) {
+        return;
+      }
       if (!upstreamDispatchResult.ok) {
         const attempt: ProviderAttemptFailure = {
           provider: targetProvider,
@@ -767,7 +805,15 @@ export async function handleGatewayRequest(
       const currentAttemptSequence = upstreamAttemptSequence;
 
       if (!upstreamResponse.ok) {
-        const upstreamPayload = await safeReadUpstreamPayload(request, targetProvider, upstreamResponse);
+        const upstreamPayload = await safeReadUpstreamPayload(
+          request,
+          targetProvider,
+          upstreamResponse,
+          clientAbortSignal
+        );
+        if (clientAbortSignal.aborted) {
+          return;
+        }
         const attempt: ProviderAttemptFailure = {
           provider: targetProvider,
           providerName: targetProviderConfig?.name,
@@ -816,10 +862,17 @@ export async function handleGatewayRequest(
           upstreamResponse.clone(),
           model,
           targetProviderConfig,
-          rawTraceStreamResponse
+          rawTraceStreamResponse,
+          clientAbortSignal
         );
         attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length);
-        return relayConvertedStreamFromUpstreamResponse(reply, source, upstreamResponse, standardRequest);
+        return relayConvertedStreamFromUpstreamResponse(
+          reply,
+          source,
+          upstreamResponse,
+          standardRequest,
+          clientAbortSignal
+        );
       }
 
       recordGatewayStreamConversion({
@@ -830,8 +883,11 @@ export async function handleGatewayRequest(
       });
       const upstreamPayload =
         isEventStreamResponse(upstreamResponse) && targetProvider === 'openai'
-          ? await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse)
-          : await safeReadUpstreamPayload(request, targetProvider, upstreamResponse);
+          ? await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal)
+          : await safeReadUpstreamPayload(request, targetProvider, upstreamResponse, clientAbortSignal);
+      if (clientAbortSignal.aborted) {
+        return;
+      }
       const responsePluginResult = await applyProviderResponsePlugins(
         providerPluginContext,
         upstreamRequest,
@@ -1013,6 +1069,7 @@ export async function handleGatewayRequest(
       model,
       passthrough: false,
       streaming: false,
+      clientAbortSignal,
       plugins: providerPlugins
     };
 
@@ -1033,6 +1090,9 @@ export async function handleGatewayRequest(
       config.upstreamTimeoutMs,
       standardRequest
     );
+    if (clientAbortSignal.aborted) {
+      return;
+    }
     if (!upstreamDispatchResult.ok) {
       const attempt: ProviderAttemptFailure = {
         provider: targetProvider,
@@ -1077,8 +1137,11 @@ export async function handleGatewayRequest(
 
     const upstreamPayload =
       isEventStreamResponse(upstreamResponse) && targetProvider === 'openai'
-        ? await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse)
-        : await safeReadUpstreamPayload(request, targetProvider, upstreamResponse);
+        ? await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal)
+        : await safeReadUpstreamPayload(request, targetProvider, upstreamResponse, clientAbortSignal);
+    if (clientAbortSignal.aborted) {
+      return;
+    }
     if (!upstreamResponse.ok) {
       const attempt: ProviderAttemptFailure = {
         provider: targetProvider,
@@ -1237,6 +1300,10 @@ export async function handleGatewayRequest(
     );
 
     return reply.code(200).send(sourcePayload);
+  }
+
+  if (clientAbortSignal.aborted) {
+    return;
   }
 
   const fallbackFailure = buildFallbackErrorPayload(targetProviders, attempts);
@@ -1459,6 +1526,9 @@ async function runTransparentToolExecutionLoop(input: {
       input.config.upstreamTimeoutMs,
       workingRequest
     );
+    if (input.providerPluginContext.clientAbortSignal?.aborted) {
+      return { ok: false, upstreamAttemptSequence };
+    }
     if (!upstreamDispatchResult.ok) {
       const attempt: ProviderAttemptFailure = {
         provider: input.targetProvider,
@@ -1505,8 +1575,19 @@ async function runTransparentToolExecutionLoop(input: {
 
     const upstreamPayload =
       isEventStreamResponse(upstreamResponse) && input.targetProvider === 'openai'
-        ? await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse)
-        : await safeReadUpstreamPayload(input.request, input.targetProvider, upstreamResponse);
+        ? await collectOpenAINonStreamPayloadFromEventStream(
+            upstreamResponse,
+            input.providerPluginContext.clientAbortSignal
+          )
+        : await safeReadUpstreamPayload(
+            input.request,
+            input.targetProvider,
+            upstreamResponse,
+            input.providerPluginContext.clientAbortSignal
+          );
+    if (input.providerPluginContext.clientAbortSignal?.aborted) {
+      return { ok: false, upstreamAttemptSequence };
+    }
     lastUpstreamResponseBody = upstreamPayload;
     if (!upstreamResponse.ok) {
       const attempt: ProviderAttemptFailure = {
@@ -1659,7 +1740,8 @@ async function handleVirtualModelRequest(
     config: GatewayConfig;
   },
   isStreaming: boolean,
-  virtualModel: VirtualModelResolution
+  virtualModel: VirtualModelResolution,
+  clientAbortSignal?: AbortSignal
 ) {
   const virtualTargetModel = resolveVirtualRuntimeModelName(virtualModel);
   const standardRequestResult = sourceAdapter.toStandardRequest(adapterInput);
@@ -1760,6 +1842,10 @@ async function handleVirtualModelRequest(
   };
 
   for (const target of targetProviders) {
+    if (clientAbortSignal?.aborted) {
+      return;
+    }
+
     const targetProvider = target.provider;
     const targetProviderConfig = resolveProviderConfig(config, target);
     const targetProviderLabel = formatTargetProviderLabel(target);
@@ -1827,6 +1913,7 @@ async function handleVirtualModelRequest(
       model,
       passthrough: false,
       streaming: false,
+      clientAbortSignal,
       plugins: providerPlugins
     };
 
@@ -1882,6 +1969,9 @@ async function handleVirtualModelRequest(
         config.upstreamTimeoutMs,
         workingRequest
       );
+      if (clientAbortSignal?.aborted) {
+        return;
+      }
       if (!upstreamDispatchResult.ok) {
         loopExhausted = false;
         const attempt: ProviderAttemptFailure = {
@@ -1953,10 +2043,17 @@ async function handleVirtualModelRequest(
           upstreamResponse.clone(),
           model,
           targetProviderConfig,
-          rawTraceStreamResponse
+          rawTraceStreamResponse,
+          clientAbortSignal
         );
         attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length);
-        return relayConvertedStreamFromUpstreamResponse(reply, source, upstreamResponse, workingRequest);
+        return relayConvertedStreamFromUpstreamResponse(
+          reply,
+          source,
+          upstreamResponse,
+          workingRequest,
+          clientAbortSignal
+        );
       }
 
       if (
@@ -1998,8 +2095,16 @@ async function handleVirtualModelRequest(
 
       const upstreamPayload =
         isEventStreamResponse(upstreamResponse)
-          ? await collectVirtualModelEventStreamPayload(request, targetProvider, upstreamResponse)
-          : await safeReadUpstreamPayload(request, targetProvider, upstreamResponse);
+          ? await collectVirtualModelEventStreamPayload(
+              request,
+              targetProvider,
+              upstreamResponse,
+              clientAbortSignal
+            )
+          : await safeReadUpstreamPayload(request, targetProvider, upstreamResponse, clientAbortSignal);
+      if (clientAbortSignal?.aborted) {
+        return;
+      }
       if (!upstreamResponse.ok) {
         loopExhausted = false;
         const attempt: ProviderAttemptFailure = {
@@ -2196,6 +2301,10 @@ async function handleVirtualModelRequest(
         upstreamResponseBody: lastResponse
       });
     }
+  }
+
+  if (clientAbortSignal?.aborted) {
+    return;
   }
 
   const fallbackFailure = buildFallbackErrorPayload(targetProviders, attempts);
@@ -3277,7 +3386,11 @@ function sendOptimisticVirtualModelStream(input: {
   input.reply.header('connection', 'keep-alive');
   input.reply.header('x-accel-buffering', 'no');
 
-  return input.reply.send(Readable.from(runOptimisticVirtualModelStream(input)));
+  const stream = Readable.from(runOptimisticVirtualModelStream(input));
+  bindAbortSignalToReadable(stream, input.providerPluginContext.clientAbortSignal, () => {
+    input.upstreamResponse.body?.cancel(input.providerPluginContext.clientAbortSignal?.reason).catch(() => undefined);
+  });
+  return input.reply.send(stream);
 }
 
 async function* runOptimisticVirtualModelStream(input: {
@@ -3320,7 +3433,15 @@ async function* runOptimisticVirtualModelStream(input: {
   try {
     for (let turn = 0; turn < input.virtualModel.profile.execution.maxTurns; turn += 1) {
       const turnResult: { upstreamPayload?: Record<string, unknown> } = {};
-      yield* relayOptimisticOpenAIChatStreamTurn(upstreamResponse, relay, turnResult);
+      yield* relayOptimisticOpenAIChatStreamTurn(
+        upstreamResponse,
+        relay,
+        turnResult,
+        input.providerPluginContext.clientAbortSignal
+      );
+      if (input.providerPluginContext.clientAbortSignal?.aborted) {
+        return;
+      }
       const upstreamPayload = turnResult.upstreamPayload;
       if (!upstreamPayload) {
         yield* buildOptimisticVirtualModelStreamErrorFrames(input.source, 'Upstream stream did not produce a payload.');
@@ -3419,6 +3540,9 @@ async function* runOptimisticVirtualModelStream(input: {
         input.config.upstreamTimeoutMs,
         workingRequest
       );
+      if (input.providerPluginContext.clientAbortSignal?.aborted) {
+        return;
+      }
       if (!upstreamDispatchResult.ok) {
         yield* buildOptimisticVirtualModelStreamErrorFrames(input.source, upstreamDispatchResult.message);
         return;
@@ -4893,7 +5017,8 @@ async function tryAttachBillingHeadersFromUpstreamResponse(
   upstreamRequest: UpstreamRequest,
   upstreamResponse: Response,
   fallbackModel?: string,
-  targetProviderConfig?: ProviderConfig
+  targetProviderConfig?: ProviderConfig,
+  clientAbortSignal?: AbortSignal
 ) {
   if ((!config.billing.enabled && !config.rawTrace.enabled) || !upstreamResponse.ok) {
     return;
@@ -4901,8 +5026,15 @@ async function tryAttachBillingHeadersFromUpstreamResponse(
 
   let upstreamPayload: unknown;
   try {
-    upstreamPayload = await collectBillingPayloadFromUpstreamResponse(targetProvider, upstreamResponse.clone());
+    upstreamPayload = await collectBillingPayloadFromUpstreamResponse(
+      targetProvider,
+      upstreamResponse.clone(),
+      clientAbortSignal
+    );
   } catch (error) {
+    if (clientAbortSignal?.aborted) {
+      return;
+    }
     request.log.warn(
       {
         provider: targetProvider,
@@ -5070,7 +5202,8 @@ async function tryPublishStreamingBillingEventFromUpstreamResponse(
   upstreamResponse: Response,
   fallbackModel?: string,
   targetProviderConfig?: ProviderConfig,
-  rawTraceStreamResponse?: Response
+  rawTraceStreamResponse?: Response,
+  clientAbortSignal?: AbortSignal
 ) {
   if ((!config.billing.enabled && !config.rawTrace.enabled) || !upstreamResponse.ok) {
     return;
@@ -5080,11 +5213,19 @@ async function tryPublishStreamingBillingEventFromUpstreamResponse(
     request,
     config,
     rawTraceStreamResponse,
+    clientAbortSignal
   );
   let upstreamPayload: unknown;
   try {
-    upstreamPayload = await collectBillingPayloadFromUpstreamResponse(targetProvider, upstreamResponse);
+    upstreamPayload = await collectBillingPayloadFromUpstreamResponse(
+      targetProvider,
+      upstreamResponse,
+      clientAbortSignal
+    );
   } catch (error) {
+    if (clientAbortSignal?.aborted) {
+      return;
+    }
     const rawStreamCapture = await rawStreamCapturePromise;
     if (config.rawTrace.enabled) {
       publishRawTraceCaptureSafe(
@@ -5502,21 +5643,22 @@ function normalizeBillingDurationSeconds(value: number): number | undefined {
 
 async function collectBillingPayloadFromUpstreamResponse(
   targetProvider: Provider,
-  upstreamResponse: Response
+  upstreamResponse: Response,
+  clientAbortSignal?: AbortSignal
 ): Promise<unknown> {
   if (!isEventStreamResponse(upstreamResponse)) {
-    return await readUpstreamPayload(upstreamResponse);
+    return await readUpstreamPayload(upstreamResponse, clientAbortSignal);
   }
 
   if (targetProvider === 'openai') {
-    return await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse);
+    return await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal);
   }
 
   if (targetProvider === 'anthropic') {
-    return await collectAnthropicNonStreamPayloadFromEventStream(upstreamResponse);
+    return await collectAnthropicNonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal);
   }
 
-  return await readUpstreamPayload(upstreamResponse);
+  return await readUpstreamPayload(upstreamResponse, clientAbortSignal);
 }
 
 type UpstreamDispatchFailureStage =
@@ -5669,7 +5811,8 @@ async function callUpstreamWithFailureCapture(
   const slot = await acquireProviderConcurrencySlot(
     context.config,
     context.targetProvider,
-    context.targetProviderConfig
+    context.targetProviderConfig,
+    context.clientAbortSignal
   );
   if (!slot.ok) {
     return {
@@ -5688,7 +5831,7 @@ async function callUpstreamWithFailureCapture(
       upstreamRequest.headers,
       upstreamRequest.body,
       timeoutMs,
-      undefined,
+      context.clientAbortSignal,
       {
         logger: context.request.log,
         requestId: context.request.id,
@@ -5698,6 +5841,7 @@ async function callUpstreamWithFailureCapture(
       },
       context.config.upstreamRetry
     );
+    cancelResponseBodyOnAbort(response, context.clientAbortSignal);
     recordProviderHealthResponse(
       context.targetProviderConfig,
       response.status,
@@ -5714,15 +5858,17 @@ async function callUpstreamWithFailureCapture(
       value: response
     };
   } catch (error) {
-    recordProviderHealthFailure(
-      context.targetProviderConfig,
-      Date.now() - startedAt
-    );
-    recordProviderCircuitBreakerFailure(
-      context.config,
-      context.targetProvider,
-      context.targetProviderConfig
-    );
+    if (!context.clientAbortSignal?.aborted) {
+      recordProviderHealthFailure(
+        context.targetProviderConfig,
+        Date.now() - startedAt
+      );
+      recordProviderCircuitBreakerFailure(
+        context.config,
+        context.targetProvider,
+        context.targetProviderConfig
+      );
+    }
     return {
       ok: false,
       stage: 'upstream_connect',
@@ -5738,11 +5884,17 @@ async function callUpstreamWithFailureCapture(
 async function safeReadUpstreamPayload(
   request: FastifyRequest,
   provider: Provider,
-  upstreamResponse: Response
+  upstreamResponse: Response,
+  clientAbortSignal?: AbortSignal
 ): Promise<unknown> {
   try {
-    return await readUpstreamPayload(upstreamResponse);
+    return await readUpstreamPayload(upstreamResponse, clientAbortSignal);
   } catch (error) {
+    if (clientAbortSignal?.aborted) {
+      return {
+        read_error: error instanceof Error ? error.message : String(error)
+      };
+    }
     const details = error instanceof Error ? error.message : String(error);
     request.log.warn(
       {
@@ -5761,17 +5913,23 @@ async function safeReadUpstreamPayload(
 async function collectVirtualModelEventStreamPayload(
   request: FastifyRequest,
   provider: Provider,
-  upstreamResponse: Response
+  upstreamResponse: Response,
+  clientAbortSignal?: AbortSignal
 ): Promise<unknown> {
   try {
     if (provider === 'openai') {
-      return await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse);
+      return await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal);
     }
 
     if (provider === 'anthropic') {
-      return await collectAnthropicNonStreamPayloadFromEventStream(upstreamResponse);
+      return await collectAnthropicNonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal);
     }
   } catch (error) {
+    if (clientAbortSignal?.aborted) {
+      return {
+        read_error: error instanceof Error ? error.message : String(error)
+      };
+    }
     const details = error instanceof Error ? error.message : String(error);
     request.log.warn(
       {
@@ -5786,7 +5944,7 @@ async function collectVirtualModelEventStreamPayload(
     };
   }
 
-  return safeReadUpstreamPayload(request, provider, upstreamResponse);
+  return safeReadUpstreamPayload(request, provider, upstreamResponse, clientAbortSignal);
 }
 
 async function applyProviderRequestPlugins(
@@ -6068,7 +6226,7 @@ function applyProviderRequestOverrides(
     headers = credentialOverride.headers;
   }
 
-  let body = request.body;
+  let body = applyOpenAIChatStreamUsageOption(request.body, providerConfig);
   if (hasBodyOverride && isPlainObject(body)) {
     body = mergeJsonObjects(body, extraBody);
   }
@@ -6421,13 +6579,14 @@ async function collectRawTraceResponseStreamSafe(
   request: FastifyRequest,
   config: GatewayConfig,
   response?: Response,
+  clientAbortSignal?: AbortSignal
 ): Promise<RawTraceResponseStreamCapture | undefined> {
   if (!response || !config.rawTrace.enabled || config.rawTrace.mode === 'body_redacted') {
     return undefined;
   }
 
   try {
-    const content = await response.text();
+    const content = await readUpstreamResponseText(response, clientAbortSignal);
     if (!content) {
       return undefined;
     }
@@ -6436,6 +6595,9 @@ async function collectRawTraceResponseStreamSafe(
       contentType: response.headers.get('content-type') || 'text/event-stream; charset=utf-8',
     };
   } catch (error) {
+    if (clientAbortSignal?.aborted) {
+      return undefined;
+    }
     request.log.warn(
       {
         details: error instanceof Error ? error.message : String(error),

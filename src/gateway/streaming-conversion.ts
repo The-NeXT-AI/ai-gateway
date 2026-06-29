@@ -15,6 +15,7 @@ import {
 } from '../adapters/builtins/source/formatters';
 import { splitNamespacedToolCallName } from '../adapters/builtins/target/tools';
 import { parseSseChunks } from '../sse';
+import { bindAbortSignalToReadable } from '../upstream/client';
 import type {
   GatewaySourceContext,
   StandardRequest,
@@ -217,7 +218,8 @@ export function relayConvertedStreamFromUpstreamResponse(
   reply: FastifyReply,
   source: GatewaySourceContext,
   upstreamResponse: Response,
-  standardRequest?: StandardRequest
+  standardRequest?: StandardRequest,
+  abortSignal?: AbortSignal
 ) {
   reply.code(200);
   reply.header('content-type', 'text/event-stream; charset=utf-8');
@@ -229,23 +231,23 @@ export function relayConvertedStreamFromUpstreamResponse(
     return reply.send('');
   }
 
+  let stream: Readable;
   if (source.adapterKey === 'anthropic_messages') {
-    return reply.send(Readable.from(relayAnthropicMessagesFromOpenAIStream(upstreamResponse)));
+    stream = Readable.from(relayAnthropicMessagesFromOpenAIStream(upstreamResponse));
+  } else if (source.adapterKey === 'openai_responses') {
+    stream = Readable.from(relayOpenAIResponsesFromOpenAIStream(upstreamResponse, standardRequest?.tools));
+  } else if (source.adapterKey === 'gemini_stream') {
+    stream = Readable.from(relayGeminiStreamFromOpenAIStream(upstreamResponse));
+  } else if (source.adapterKey === 'openai_chat') {
+    stream = Readable.from(relayOpenAIChatFromUpstreamStream(upstreamResponse));
+  } else {
+    stream = Readable.fromWeb(upstreamResponse.body as unknown as ReadableStream<Uint8Array>);
   }
 
-  if (source.adapterKey === 'openai_responses') {
-    return reply.send(Readable.from(relayOpenAIResponsesFromOpenAIStream(upstreamResponse, standardRequest?.tools)));
-  }
-
-  if (source.adapterKey === 'gemini_stream') {
-    return reply.send(Readable.from(relayGeminiStreamFromOpenAIStream(upstreamResponse)));
-  }
-
-  if (source.adapterKey === 'openai_chat') {
-    return reply.send(Readable.from(relayOpenAIChatFromUpstreamStream(upstreamResponse)));
-  }
-
-  return reply.send(Readable.fromWeb(upstreamResponse.body as unknown as ReadableStream<Uint8Array>));
+  bindAbortSignalToReadable(stream, abortSignal, () => {
+    upstreamResponse.body?.cancel(abortSignal?.reason).catch(() => undefined);
+  });
+  return reply.send(stream);
 }
 
 export function canRelayOptimisticOpenAIChatStream(source: GatewaySourceContext): boolean {
@@ -304,11 +306,12 @@ export function createOptimisticOpenAIChatStreamRelay(
 export async function* relayOptimisticOpenAIChatStreamTurn(
   upstreamResponse: Response,
   relay: OptimisticOpenAIChatRelay,
-  result: OptimisticOpenAIChatStreamTurnResult
+  result: OptimisticOpenAIChatStreamTurnResult,
+  abortSignal?: AbortSignal
 ): AsyncGenerator<string> {
   const collectionState = createOpenAINonStreamCollectionState();
 
-  for await (const chunk of parseSseChunks(upstreamResponse)) {
+  for await (const chunk of parseSseChunks(upstreamResponse, abortSignal)) {
     const data = chunk.data.trim();
     if (!data || data === '[DONE]') {
       continue;
@@ -464,11 +467,12 @@ function stripOpenAIChatChunkToolCallsAndFinish(
 }
 
 export async function collectOpenAINonStreamPayloadFromEventStream(
-  upstreamResponse: Response
+  upstreamResponse: Response,
+  abortSignal?: AbortSignal
 ): Promise<Record<string, unknown>> {
   const state = createOpenAINonStreamCollectionState();
 
-  for await (const chunk of parseSseChunks(upstreamResponse)) {
+  for await (const chunk of parseSseChunks(upstreamResponse, abortSignal)) {
     const data = chunk.data.trim();
     if (!data || data === '[DONE]') {
       continue;
@@ -567,7 +571,8 @@ function buildOpenAINonStreamPayloadFromCollectionState(
 }
 
 export async function collectAnthropicNonStreamPayloadFromEventStream(
-  upstreamResponse: Response
+  upstreamResponse: Response,
+  abortSignal?: AbortSignal
 ): Promise<Record<string, unknown>> {
   const state: {
     id: string;
@@ -588,7 +593,7 @@ export async function collectAnthropicNonStreamPayloadFromEventStream(
     thinkingBlocks: new Map()
   };
 
-  for await (const chunk of parseSseChunks(upstreamResponse)) {
+  for await (const chunk of parseSseChunks(upstreamResponse, abortSignal)) {
     const data = chunk.data.trim();
     if (!data || data === '[DONE]') {
       continue;
@@ -2593,6 +2598,10 @@ function emitOpenAIResponsesFramesFromChatChunk(
   payload: Record<string, unknown>,
   tools?: unknown[]
 ): string[] {
+  if (state.finished) {
+    return [];
+  }
+
   const messageId = asString(payload.id);
   if (messageId && !state.started) {
     state.responseId = messageId;
@@ -2646,7 +2655,7 @@ function emitOpenAIResponsesFramesFromChatChunk(
 
   frames.push(...collectOpenAIChatToolCallsForOpenAIResponses(state, delta?.tool_calls, tools));
 
-  if (finishReason) {
+  if (state.finishReason && usage) {
     frames.push(...finalizeOpenAIResponsesRelay(state));
   }
 

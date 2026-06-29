@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
+import Fastify from 'fastify';
 import { describe, expect, it } from 'vitest';
 import type { McpGatewayConfig } from '../types';
 import { createMcpGatewayRuntime, McpGatewayOAuthError } from './runtime';
+import { registerMcpGatewayRoutes } from './routes';
 
 function createConfig(): McpGatewayConfig {
   return {
@@ -164,6 +166,114 @@ describe('mcp gateway oauth runtime', () => {
         refreshToken: initial.refresh_token
       })
     ).toThrowError(McpGatewayOAuthError);
+  });
+
+  it('requires gateway authentication before issuing authorization codes', async () => {
+    const runtime = createMcpGatewayRuntime({
+      config: createConfig(),
+      servers: []
+    });
+    const app = Fastify({ logger: false });
+    registerMcpGatewayRoutes(app, runtime);
+
+    await app.ready();
+    try {
+      const response = await app.inject({
+        method: 'GET',
+        url:
+          '/oauth/authorize?client_id=codex-client&redirect_uri=http%3A%2F%2F127.0.0.1%3A9903%2Fcallback&response_type=code'
+      });
+
+      expect(response.statusCode).toBe(401);
+      expect(response.headers['www-authenticate']).toContain('Bearer');
+      expect(JSON.parse(response.body)).toMatchObject({
+        error: 'access_denied'
+      });
+    } finally {
+      await app.close();
+      await runtime.close();
+    }
+  });
+
+  it('binds authorization codes to the authenticated principal instead of the default principal', async () => {
+    const config = createConfig();
+    config.principals = [
+      {
+        key: 'principal-a',
+        team: 'eng-a',
+        allowServers: ['*'],
+        allowTools: ['*'],
+        denyTools: []
+      },
+      {
+        key: 'principal-b',
+        team: 'eng-b',
+        allowServers: ['*'],
+        allowTools: ['*'],
+        denyTools: []
+      }
+    ];
+    config.oauth.defaultPrincipalKey = 'principal-b';
+
+    const runtime = createMcpGatewayRuntime({
+      config,
+      servers: []
+    });
+    const app = Fastify({ logger: false });
+    registerMcpGatewayRoutes(app, runtime);
+
+    await app.ready();
+    try {
+      const response = await app.inject({
+        method: 'GET',
+        url:
+          '/oauth/authorize?client_id=codex-client&redirect_uri=http%3A%2F%2F127.0.0.1%3A9904%2Fcallback&response_type=code',
+        headers: {
+          'x-api-key': 'principal-a'
+        }
+      });
+
+      expect(response.statusCode).toBe(302);
+      const location = response.headers.location;
+      expect(typeof location).toBe('string');
+      const code = parseCode(location as string);
+      const token = runtime.exchangeOAuthToken({
+        grantType: 'authorization_code',
+        clientId: 'codex-client',
+        code,
+        redirectUri: 'http://127.0.0.1:9904/callback'
+      });
+
+      const auth = runtime.authenticateSocket({
+        authorization: `Bearer ${token.access_token}`
+      });
+      expect(auth.ok).toBe(true);
+      expect(auth.context?.principal.key).toBe('principal-a');
+    } finally {
+      await app.close();
+      await runtime.close();
+    }
+  });
+
+  it('does not trust x-forwarded-for when resolving internal callers', () => {
+    const config = createConfig();
+    config.internalCidrs = ['10.0.0.0/8'];
+    const runtime = createMcpGatewayRuntime({
+      config,
+      servers: []
+    });
+
+    const auth = runtime.authenticateSocket(
+      {
+        'x-api-key': 'mcp-test-key',
+        'x-forwarded-for': '10.0.0.10'
+      },
+      '8.8.8.8'
+    );
+
+    expect(auth.ok).toBe(true);
+    expect(auth.context?.clientIp).toBe('8.8.8.8');
+    expect(auth.context?.isInternalCaller).toBe(false);
   });
 
   it('exposes codex-compatible oauth discovery paths', () => {

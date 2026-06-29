@@ -62,6 +62,47 @@ describe('gateway upstream concurrency', () => {
       second.release();
     }
   });
+
+  it('aborts queued requests when the client disconnect signal fires', async () => {
+    const config = parseGatewayConfigFromRaw({
+      upstreamConcurrency: {
+        enabled: true,
+        maxInFlightPerProvider: 1,
+        queueTimeoutMs: 1000
+      }
+    });
+    const provider = createProviderConfig('openai-main');
+    const first = await acquireProviderConcurrencySlot(config, 'openai', provider);
+    expect(first.ok).toBe(true);
+    if (!first.ok) {
+      return;
+    }
+
+    const controller = new AbortController();
+    const queued = acquireProviderConcurrencySlot(config, 'openai', provider, controller.signal);
+    controller.abort(new Error('client disconnected'));
+    const result = await queued;
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: 499,
+      aborted: true,
+      message: 'Client connection closed before acquiring provider concurrency slot.',
+      details: {
+        provider: 'openai',
+        providerName: 'openai-main',
+        maxInFlight: 1,
+        queueTimeoutMs: 1000
+      }
+    });
+
+    first.release();
+    const next = await acquireProviderConcurrencySlot(config, 'openai', provider);
+    expect(next.ok).toBe(true);
+    if (next.ok) {
+      next.release();
+    }
+  });
 });
 
 function createProviderConfig(name: string): ProviderConfig {

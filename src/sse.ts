@@ -5,47 +5,104 @@ export interface ParsedSseChunk {
   data: string;
 }
 
-export async function* parseSseChunks(response: Response): AsyncGenerator<ParsedSseChunk> {
+export async function* parseSseChunks(
+  response: Response,
+  abortSignal?: AbortSignal
+): AsyncGenerator<ParsedSseChunk> {
   if (!response.body) {
     return;
   }
 
   const stream = Readable.fromWeb(response.body as unknown as ReadableStream<Uint8Array>);
+  const cleanupAbort = bindAbortSignalToReadable(stream, abortSignal);
   const decoder = new TextDecoder();
   let buffer = '';
 
-  for await (const chunk of stream) {
-    const text =
-      typeof chunk === 'string'
-        ? `${decoder.decode()}${chunk}`
-        : decoder.decode(chunk, { stream: true });
+  try {
+    for await (const chunk of stream) {
+      const text =
+        typeof chunk === 'string'
+          ? `${decoder.decode()}${chunk}`
+          : decoder.decode(chunk, { stream: true });
 
-    if (!text) {
-      continue;
-    }
-
-    buffer += text.replace(/\r/g, '');
-
-    let separatorIndex = buffer.indexOf('\n\n');
-    while (separatorIndex >= 0) {
-      const block = buffer.slice(0, separatorIndex);
-      buffer = buffer.slice(separatorIndex + 2);
-
-      const parsed = parseSseBlock(block);
-      if (parsed) {
-        yield parsed;
+      if (!text) {
+        continue;
       }
 
-      separatorIndex = buffer.indexOf('\n\n');
+      buffer += text.replace(/\r/g, '');
+
+      let separatorIndex = buffer.indexOf('\n\n');
+      while (separatorIndex >= 0) {
+        const block = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + 2);
+
+        const parsed = parseSseBlock(block);
+        if (parsed) {
+          yield parsed;
+        }
+
+        separatorIndex = buffer.indexOf('\n\n');
+      }
+    }
+
+    buffer += decoder.decode().replace(/\r/g, '');
+
+    const trailing = parseSseBlock(buffer);
+    if (trailing) {
+      yield trailing;
+    }
+  } catch (error) {
+    if (!abortSignal?.aborted) {
+      throw error;
+    }
+  } finally {
+    cleanupAbort();
+    if (!stream.destroyed) {
+      stream.destroy();
     }
   }
+}
 
-  buffer += decoder.decode().replace(/\r/g, '');
-
-  const trailing = parseSseBlock(buffer);
-  if (trailing) {
-    yield trailing;
+function bindAbortSignalToReadable(stream: Readable, abortSignal?: AbortSignal): () => void {
+  if (!abortSignal) {
+    return () => {};
   }
+
+  let cleanedUp = false;
+  const cleanup = () => {
+    if (cleanedUp) {
+      return;
+    }
+    cleanedUp = true;
+    abortSignal.removeEventListener('abort', handleAbort);
+    stream.off('close', cleanup);
+    stream.off('end', cleanup);
+    stream.off('error', cleanup);
+  };
+
+  const handleAbort = () => {
+    if (cleanedUp) {
+      return;
+    }
+    const reason =
+      abortSignal.reason instanceof Error
+        ? abortSignal.reason
+        : new Error(abortSignal.reason ? String(abortSignal.reason) : 'Operation aborted.');
+    stream.destroy(reason);
+    cleanup();
+  };
+
+  if (abortSignal.aborted) {
+    handleAbort();
+    return cleanup;
+  }
+
+  abortSignal.addEventListener('abort', handleAbort, { once: true });
+  stream.once('close', cleanup);
+  stream.once('end', cleanup);
+  stream.once('error', cleanup);
+
+  return cleanup;
 }
 
 function parseSseBlock(block: string): ParsedSseChunk | null {

@@ -7,6 +7,7 @@ import type {
   SessionConfigUpdatedPayload,
   ToolResultPayload
 } from './types';
+import type { GatewayRequestIdentity } from '../types';
 import { createInitialGuards, normalizeGuards } from './guards';
 import { createInitialTaskState, normalizeTaskState } from './task-state';
 import { createTranscriptWindow, normalizeTranscriptWindow } from './transcript-window';
@@ -85,6 +86,7 @@ export class InMemoryAgentSessionStore {
           typeof state.agentId === 'string' && state.agentId.trim() ? state.agentId.trim() : UNASSIGNED_AGENT_ID;
         state.agentId =
           normalizedAgentId === LEGACY_DEFAULT_AGENT_ID ? UNASSIGNED_AGENT_ID : normalizedAgentId;
+        state.ownerIdentity = normalizeGatewayRequestIdentity(state.ownerIdentity);
         state.systemPrompt =
           typeof state.systemPrompt === 'string' && state.systemPrompt.trim()
             ? state.systemPrompt.trim()
@@ -272,6 +274,12 @@ export class InMemoryAgentSessionStore {
     envelope.state.updatedAt = timestamp;
   }
 
+  setSessionOwner(sessionId: string, ownerIdentity: GatewayRequestIdentity | undefined, timestamp: string): void {
+    const envelope = this.ensureEnvelope(sessionId);
+    envelope.state.ownerIdentity = cloneGatewayRequestIdentity(ownerIdentity);
+    envelope.state.updatedAt = timestamp;
+  }
+
   setPendingToolCall(sessionId: string, call: AgentPendingToolCall): void {
     const envelope = this.ensureEnvelope(sessionId);
     envelope.state.pendingToolCalls[call.toolCallId] = {
@@ -350,6 +358,7 @@ function cloneSessionState(state: AgentSessionState): AgentSessionState {
 
   return {
     ...state,
+    ownerIdentity: cloneGatewayRequestIdentity(state.ownerIdentity),
     allowedTools: [...state.allowedTools],
     memoryRefs: [...state.memoryRefs],
     messages: state.messages.map((message) => ({ ...message })),
@@ -361,6 +370,62 @@ function cloneSessionState(state: AgentSessionState): AgentSessionState {
     ),
     guards: normalizeGuards((state as Partial<AgentSessionState>).guards, state.memoryRefs)
   };
+}
+
+function cloneGatewayRequestIdentity(identity: GatewayRequestIdentity | undefined): GatewayRequestIdentity | undefined {
+  if (!identity?.billingSubjectKey || !identity.source) {
+    return undefined;
+  }
+
+  return {
+    source: identity.source,
+    billingSubjectKey: identity.billingSubjectKey,
+    userId: readOptionalString(identity.userId),
+    tenantId: readOptionalString(identity.tenantId),
+    subject: readOptionalString(identity.subject),
+    organizationId: readOptionalString(identity.organizationId),
+    plan: readOptionalString(identity.plan),
+    apiKeyId: readOptionalString(identity.apiKeyId)
+  };
+}
+
+function normalizeGatewayRequestIdentity(value: unknown): GatewayRequestIdentity | undefined {
+  if (!isObject(value)) {
+    return undefined;
+  }
+
+  const billingSubjectKey = readOptionalString(value.billingSubjectKey);
+  const source = value.source;
+  if (
+    !billingSubjectKey ||
+    (source !== 'trusted_header' && source !== 'http_introspection' && source !== 'static_api_key')
+  ) {
+    return undefined;
+  }
+
+  return cloneGatewayRequestIdentity({
+    source,
+    billingSubjectKey,
+    userId: readOptionalString(value.userId),
+    tenantId: readOptionalString(value.tenantId),
+    subject: readOptionalString(value.subject),
+    organizationId: readOptionalString(value.organizationId),
+    plan: readOptionalString(value.plan),
+    apiKeyId: readOptionalString(value.apiKeyId)
+  });
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readOptionalString(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  return trimmed || undefined;
 }
 
 function cloneArguments(args: Record<string, unknown>): Record<string, unknown> {

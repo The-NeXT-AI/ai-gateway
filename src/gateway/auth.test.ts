@@ -188,6 +188,29 @@ describe('gateway auth', () => {
     expect(result.statusCode).toBe(403);
   });
 
+  it('does not trust x-forwarded-for when enforcing trusted cidrs', async () => {
+    const request = createRequest(
+      {
+        'x-auth-user-id': 'user-1',
+        'x-forwarded-for': '10.0.0.10'
+      },
+      {
+        ip: '8.8.8.8'
+      }
+    );
+    const result = await authenticateGatewayRequest(request, {
+      ...baseConfig,
+      trustedCidrs: ['10.0.0.0/8']
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+
+    expect(result.statusCode).toBe(403);
+  });
+
   it('validates signature when enabled', async () => {
     process.env.AUTH_HEADER_SIGNING_SECRET = 'test-secret';
 

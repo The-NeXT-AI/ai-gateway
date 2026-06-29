@@ -14,16 +14,7 @@ export function isInternalIp(ipValue: string, cidrs: string[]): boolean {
   }
 
   if (normalized.includes(':')) {
-    const lower = normalized.toLowerCase();
-    if (lower.startsWith('fc') || lower.startsWith('fd')) {
-      return true;
-    }
-
-    return cidrs.some((cidr) => isIpv6InSimpleCidr(lower, cidr));
-  }
-
-  if (isPrivateIpv4(normalized)) {
-    return true;
+    return cidrs.some((cidr) => isIpv6InSimpleCidr(normalized.toLowerCase(), cidr));
   }
 
   return cidrs.some((cidr) => isIpv4InCidr(normalized, cidr));
@@ -59,28 +50,6 @@ function stripPort(value: string): string {
   }
 
   return value;
-}
-
-function isPrivateIpv4(ip: string): boolean {
-  const parts = ip.split('.');
-  if (parts.length !== 4) {
-    return false;
-  }
-
-  const octets = parts.map((part) => Number(part));
-  if (octets.some((item) => !Number.isInteger(item) || item < 0 || item > 255)) {
-    return false;
-  }
-
-  if (octets[0] === 10) {
-    return true;
-  }
-
-  if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) {
-    return true;
-  }
-
-  return octets[0] === 192 && octets[1] === 168;
 }
 
 function isIpv4InCidr(ip: string, cidr: string): boolean {

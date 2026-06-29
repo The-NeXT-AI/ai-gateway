@@ -176,6 +176,28 @@ describe('Gateway config providerPlugins', () => {
     expect(config.providers[0]?.openaiChatToolsFormat).toBe('anthropic');
   });
 
+  it('parses OpenAI chat stream usage compatibility config', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'usage-enabled',
+          type: 'openai_chat_completions',
+          openaiChatStreamUsage: 'include_usage',
+          models: ['glm-5.1']
+        },
+        {
+          name: 'usage-disabled',
+          type: 'openai_chat_completions',
+          openaiChatStreamUsage: false,
+          models: ['legacy-chat']
+        }
+      ]
+    });
+
+    expect(config.providers[0]?.openaiChatStreamUsage).toBe('include_usage');
+    expect(config.providers[1]?.openaiChatStreamUsage).toBe('disabled');
+  });
+
   it('parses static API key auth config from file and environment', () => {
     process.env.AUTH_MODE = 'static-api-key';
     process.env.AUTH_STATIC_API_KEYS = 'env-key-1,env-key-2';

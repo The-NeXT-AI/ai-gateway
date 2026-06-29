@@ -1,11 +1,11 @@
 import type { ServerResponse } from 'node:http';
 import type { FastifyInstance, FastifyReply, FastifyRequest, RouteShorthandOptions } from 'fastify';
 import { createGatewayAuthPreHandler } from '../gateway/auth';
-import type { GatewayAuthConfig } from '../types';
+import type { GatewayAuthConfig, GatewayRequestIdentity } from '../types';
 import { isObject, parseProvider } from '../utils';
 import { mergeGatewayRequestIdentityMetadata } from './request-identity';
 import type { EventDrivenAgentRuntime } from './runtime';
-import type { AgentEventRecord, AgentEventType } from './types';
+import type { AgentDefinition, AgentEventRecord, AgentEventType, AgentSessionState } from './types';
 
 const EXTERNAL_EVENT_TYPES: AgentEventType[] = [
   'SESSION_CONFIG_UPDATED',
@@ -52,8 +52,8 @@ export function registerAgentRoutes(
     };
   });
 
-  fastify.get('/agent/agents', agentRouteOptions, async () => {
-    const agents = runtime.listAgents();
+  fastify.get('/agent/agents', agentRouteOptions, async (request) => {
+    const agents = filterAccessibleAgents(request, runtime.listAgents());
     return {
       agents
     };
@@ -98,12 +98,14 @@ export function registerAgentRoutes(
         ? await runtime.createAgentWithAutoTools({
             name,
             description,
+            ownerIdentity: request.gatewayIdentity,
             systemPrompt,
             model
           })
         : runtime.createAgent({
             name,
             description,
+            ownerIdentity: request.gatewayIdentity,
             systemPrompt,
             model,
             allowedTools: tools
@@ -115,7 +117,7 @@ export function registerAgentRoutes(
   });
 
   fastify.get<{ Params: { agentId: string } }>('/agent/agents/:agentId', agentRouteOptions, async (request, reply) => {
-    const agent = runtime.getAgent(request.params.agentId);
+    const agent = getAccessibleAgent(request, runtime, request.params.agentId);
     if (!agent) {
       return reply.code(404).send({
         error: {
@@ -176,6 +178,14 @@ export function registerAgentRoutes(
     if (model !== undefined) updateInput.model = model;
     if (tools !== undefined) updateInput.allowedTools = tools;
 
+    if (!getAccessibleAgent(request, runtime, request.params.agentId)) {
+      return reply.code(404).send({
+        error: {
+          message: `Agent not found: ${request.params.agentId}`
+        }
+      });
+    }
+
     const agent = runtime.updateAgent(request.params.agentId, updateInput);
     if (!agent) {
       return reply.code(404).send({
@@ -195,8 +205,7 @@ export function registerAgentRoutes(
       return sendManagementDisabled(reply);
     }
 
-    const deleted = runtime.deleteAgent(request.params.agentId);
-    if (!deleted) {
+    if (!getAccessibleAgent(request, runtime, request.params.agentId)) {
       return reply.code(404).send({
         error: {
           message: `Agent not found: ${request.params.agentId}`
@@ -204,6 +213,7 @@ export function registerAgentRoutes(
       });
     }
 
+    runtime.deleteAgent(request.params.agentId);
     return reply.code(204).send();
   });
 
@@ -268,11 +278,20 @@ export function registerAgentRoutes(
       return sendBadRequest(reply, 'Field memoryRefs must be an array of strings.');
     }
 
+    if (agentId && !getAccessibleAgent(request, runtime, agentId)) {
+      return reply.code(404).send({
+        error: {
+          message: `Agent not found: ${agentId}`
+        }
+      });
+    }
+
     const result = runtime.createSession({
       agentId,
       sessionId,
       prompt,
       metadata: mergedMetadata,
+      ownerIdentity: request.gatewayIdentity,
       correlationId,
       systemPrompt,
       model,
@@ -335,14 +354,14 @@ export function registerAgentRoutes(
     return reply.code(201).send({
       sessionId: result.session.sessionId,
       agentId: result.session.agentId,
-      session: runtime.getSession(result.session.sessionId),
+      session: result.session,
       initialEvent: result.initialEvent,
       events: sortEventsByOffset(runtime.listEventsAfter(result.session.sessionId, 0, STREAM_BATCH_SIZE))
     });
   });
 
-  fastify.get('/agent/sessions', agentRouteOptions, async () => {
-    const sessions = runtime.listSessions();
+  fastify.get('/agent/sessions', agentRouteOptions, async (request) => {
+    const sessions = filterAccessibleSessions(request, runtime.listSessions());
     return {
       sessions
     };
@@ -357,7 +376,7 @@ export function registerAgentRoutes(
       }
 
       const sessionId = request.params.sessionId;
-      const session = runtime.getSession(sessionId);
+      const session = getAccessibleSession(request, runtime, sessionId);
       if (!session) {
         return reply.code(404).send({
           error: {
@@ -481,7 +500,7 @@ export function registerAgentRoutes(
       }
 
       return {
-        session: runtime.getSession(sessionId),
+        session: getAccessibleSession(request, runtime, sessionId),
         acceptedEvent,
         events: sortEventsByOffset(runtime.listEventsAfter(sessionId, normalizedFromOffset, STREAM_BATCH_SIZE))
       };
@@ -492,7 +511,7 @@ export function registerAgentRoutes(
     '/agent/sessions/:sessionId/stream',
     agentRouteOptions,
     async (request, reply) => {
-      if (!runtime.hasSession(request.params.sessionId)) {
+      if (!getAccessibleSession(request, runtime, request.params.sessionId)) {
         return reply.code(404).send({
           error: {
             message: `Session not found: ${request.params.sessionId}`
@@ -509,7 +528,7 @@ export function registerAgentRoutes(
   );
 
   fastify.get<{ Params: { sessionId: string } }>('/agent/sessions/:sessionId', agentRouteOptions, async (request, reply) => {
-    const session = runtime.getSession(request.params.sessionId);
+    const session = getAccessibleSession(request, runtime, request.params.sessionId);
     if (!session) {
       return reply.code(404).send({
         error: {
@@ -528,8 +547,7 @@ export function registerAgentRoutes(
       return sendManagementDisabled(reply);
     }
 
-    const deleted = runtime.deleteSession(request.params.sessionId);
-    if (!deleted) {
+    if (!getAccessibleSession(request, runtime, request.params.sessionId)) {
       return reply.code(404).send({
         error: {
           message: `Session not found: ${request.params.sessionId}`
@@ -537,13 +555,18 @@ export function registerAgentRoutes(
       });
     }
 
+    runtime.deleteSession(request.params.sessionId);
     return reply.code(204).send();
   });
 
   fastify.get<{ Params: { sessionId: string }; Querystring: { limit?: string; afterOffset?: string } }>(
     '/agent/sessions/:sessionId/events',
     agentRouteOptions,
-    async (request) => {
+    async (request, reply) => {
+      if (!getAccessibleSession(request, runtime, request.params.sessionId)) {
+        return sendSessionNotFound(reply, request.params.sessionId);
+      }
+
       const limit = parseLimit(request.query.limit);
       const afterOffset = parseOffset(request.query.afterOffset);
       const hasAfterOffset = request.query.afterOffset !== undefined;
@@ -563,7 +586,7 @@ export function registerAgentRoutes(
       if (!sessionManagementEnabled) {
         return sendManagementDisabled(reply);
       }
-      if (!runtime.hasSession(request.params.sessionId)) {
+      if (!getAccessibleSession(request, runtime, request.params.sessionId)) {
         return sendSessionNotFound(reply, request.params.sessionId);
       }
 
@@ -599,7 +622,7 @@ export function registerAgentRoutes(
       if (!sessionManagementEnabled) {
         return sendManagementDisabled(reply);
       }
-      if (!runtime.hasSession(request.params.sessionId)) {
+      if (!getAccessibleSession(request, runtime, request.params.sessionId)) {
         return sendSessionNotFound(reply, request.params.sessionId);
       }
 
@@ -649,7 +672,7 @@ export function registerAgentRoutes(
       if (!sessionManagementEnabled) {
         return sendManagementDisabled(reply);
       }
-      if (!runtime.hasSession(request.params.sessionId)) {
+      if (!getAccessibleSession(request, runtime, request.params.sessionId)) {
         return sendSessionNotFound(reply, request.params.sessionId);
       }
 
@@ -695,7 +718,7 @@ export function registerAgentRoutes(
       if (!sessionManagementEnabled) {
         return sendManagementDisabled(reply);
       }
-      if (!runtime.hasSession(request.params.sessionId)) {
+      if (!getAccessibleSession(request, runtime, request.params.sessionId)) {
         return sendSessionNotFound(reply, request.params.sessionId);
       }
 
@@ -736,6 +759,51 @@ export function registerAgentRoutes(
       });
     }
   );
+}
+
+function filterAccessibleAgents(request: FastifyRequest, agents: AgentDefinition[]): AgentDefinition[] {
+  return agents.filter((agent) => hasResourceAccess(agent.ownerIdentity, request.gatewayIdentity));
+}
+
+function getAccessibleAgent(
+  request: FastifyRequest,
+  runtime: EventDrivenAgentRuntime,
+  agentId: string
+): AgentDefinition | undefined {
+  const agent = runtime.getAgent(agentId);
+  if (!agent || !hasResourceAccess(agent.ownerIdentity, request.gatewayIdentity)) {
+    return undefined;
+  }
+
+  return agent;
+}
+
+function filterAccessibleSessions(request: FastifyRequest, sessions: AgentSessionState[]): AgentSessionState[] {
+  return sessions.filter((session) => hasResourceAccess(session.ownerIdentity, request.gatewayIdentity));
+}
+
+function getAccessibleSession(
+  request: FastifyRequest,
+  runtime: EventDrivenAgentRuntime,
+  sessionId: string
+): AgentSessionState | undefined {
+  const session = runtime.getSession(sessionId);
+  if (!session || !hasResourceAccess(session.ownerIdentity, request.gatewayIdentity)) {
+    return undefined;
+  }
+
+  return session;
+}
+
+function hasResourceAccess(
+  ownerIdentity: GatewayRequestIdentity | undefined,
+  requestIdentity: GatewayRequestIdentity | undefined
+): boolean {
+  if (!ownerIdentity?.billingSubjectKey) {
+    return true;
+  }
+
+  return ownerIdentity.billingSubjectKey === requestIdentity?.billingSubjectKey;
 }
 
 function startSessionEventStream(

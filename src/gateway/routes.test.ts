@@ -1239,6 +1239,9 @@ describe('gateway routes protocol conversion', () => {
       const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.stream).toBe(true);
+      expect(upstreamBody.stream_options).toEqual({
+        include_usage: true
+      });
 
       expect(response.body).toContain('"type":"response.created"');
       expect(response.body).toContain('"type":"response.output_text.delta","delta":"hello "');
@@ -1246,6 +1249,82 @@ describe('gateway routes protocol conversion', () => {
       expect(response.body).toContain('"type":"response.output_text.done","text":"hello world"');
       expect(response.body).toContain('"type":"response.completed"');
       expect(response.body).toContain('data: [DONE]');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('requests usage by default for passthrough chat/completions streams', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse(['data: [DONE]\n\n']);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }],
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.stream_options).toEqual({
+        include_usage: true
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('can disable usage requests for passthrough chat/completions streams', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse(['data: [DONE]\n\n']);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('openai-main', 'openai_chat_completions', ['legacy-chat']);
+    provider.openaiChatStreamUsage = 'disabled';
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, createConfig([provider]), createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'legacy-chat',
+          messages: [{ role: 'user', content: 'hello' }],
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.stream_options).toBeUndefined();
     } finally {
       await app.close();
     }
@@ -1554,7 +1633,7 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
-  it('completes Responses stream promptly when chat/completions usage arrives after finish', async () => {
+  it('includes chat/completions usage that arrives after finish in Responses completed event', async () => {
     const fetchMock = vi.fn(async () => {
       return createSseResponse([
         'data: {"id":"chatcmpl_stream_late_usage","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"hello"}}]}\n\n',
@@ -1595,9 +1674,9 @@ describe('gateway routes protocol conversion', () => {
       expect(completedLine).toBeDefined();
       const completed = JSON.parse(String(completedLine).slice('data: '.length));
       expect(completed.response.usage).toMatchObject({
-        input_tokens: 0,
-        output_tokens: 0,
-        total_tokens: 0
+        input_tokens: 4,
+        output_tokens: 1,
+        total_tokens: 5
       });
       expect(response.body).toContain('data: [DONE]');
     } finally {
@@ -3753,7 +3832,8 @@ describe('gateway routes protocol conversion', () => {
         url: '/v1/responses',
         headers: {
           'content-type': 'application/json',
-          'x-target-provider': 'openai-main'
+          'x-target-provider': 'openai-main',
+          'x-codex-refresh-token': 'rtk-from-request'
         },
         payload: {
           model: 'glm-5',
@@ -3768,6 +3848,125 @@ describe('gateway routes protocol conversion', () => {
       expect(String(fetchMock.mock.calls[2]?.[0])).toBe('https://chatgpt.com/backend-api/codex/responses');
       const secondHeaders = (fetchMock.mock.calls[2]?.[1]?.headers || {}) as Record<string, string>;
       expect(secondHeaders.authorization).toBe('Bearer atk-from-refresh');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not reuse cached codex oauth state across different request refresh tokens', async () => {
+    const encryptionKey = Buffer.from('0123456789abcdef0123456789abcdef', 'utf8');
+    updateDistributedCredentialEncryption({
+      key: encryptionKey.toString('base64'),
+      keyVersion: 'v1',
+      algorithm: 'aes-256-gcm'
+    });
+
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url) === 'https://auth.openai.com/oauth/token') {
+        const body = JSON.parse(String(init?.body || '{}')) as { refresh_token?: string };
+        const refreshToken = body.refresh_token || 'missing';
+        return new Response(
+          JSON.stringify({
+            access_token: `atk-for-${refreshToken}`,
+            refresh_token: `next-${refreshToken}`
+          }),
+          {
+            status: 200,
+            headers: {
+              'content-type': 'application/json'
+            }
+          }
+        );
+      }
+
+      const headers = (init?.headers || {}) as Record<string, string>;
+      return new Response(
+        JSON.stringify({
+          object: 'response',
+          output_text: 'memory-state-isolated',
+          authorization: headers.authorization
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_responses', ['glm-5'])],
+      [
+        {
+          key: 'openai-main-codex-oauth',
+          enabled: true,
+          providerName: 'openai-main',
+          codexOauth: {
+            enabled: true,
+            tokenEndpoint: 'https://auth.openai.com/oauth/token',
+            clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+            scope:
+              'openid profile email offline_access api.connectors.read api.connectors.invoke',
+            refreshToken: {
+              from: 'request.headers.x-codex-refresh-token'
+            },
+            refreshIfMissingAccessToken: true,
+            forceRefresh: false,
+            required: true,
+            timeoutMs: 3000,
+            authHeader: 'authorization',
+            authScheme: 'Bearer'
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const first = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main',
+          'x-codex-refresh-token': 'rtk-a'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'first'
+        }
+      });
+      expect(first.statusCode).toBe(200);
+
+      const second = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main',
+          'x-codex-refresh-token': 'rtk-b'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'second'
+        }
+      });
+      expect(second.statusCode).toBe(200);
+
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://auth.openai.com/oauth/token');
+      expect(String(fetchMock.mock.calls[1]?.[0])).toBe('https://chatgpt.com/backend-api/codex/responses');
+      expect(String(fetchMock.mock.calls[2]?.[0])).toBe('https://auth.openai.com/oauth/token');
+      expect(String(fetchMock.mock.calls[3]?.[0])).toBe('https://chatgpt.com/backend-api/codex/responses');
+      const firstHeaders = (fetchMock.mock.calls[1]?.[1]?.headers || {}) as Record<string, string>;
+      const secondHeaders = (fetchMock.mock.calls[3]?.[1]?.headers || {}) as Record<string, string>;
+      expect(firstHeaders.authorization).toBe('Bearer atk-for-rtk-a');
+      expect(secondHeaders.authorization).toBe('Bearer atk-for-rtk-b');
     } finally {
       await app.close();
     }

@@ -641,7 +641,7 @@ export async function collectAnthropicNonStreamPayloadFromEventStream(
           state.toolBlocks.set(blockIndex, {
             id: asString(block?.id) || `toolu_${randomUUID().replace(/-/g, '')}`,
             name,
-            inputJson: normalizeStreamToolArguments(block?.input)
+            inputJson: normalizeAnthropicToolStartInput(block?.input)
           });
           state.activeToolBlockIndex = blockIndex;
         }
@@ -2293,16 +2293,16 @@ function collectOpenAIChatToolCallsForGemini(state: GeminiRelayState, rawToolCal
     const toolIndex = indexValue !== undefined ? Math.max(0, Math.trunc(indexValue)) : position;
     const functionPayload = isObject(rawToolCall.function) ? rawToolCall.function : undefined;
     const name = asString(functionPayload?.name) || asString(rawToolCall.name);
-    const argumentsChunk = asString(functionPayload?.arguments) || asString(rawToolCall.arguments) || '';
+    const argumentsPatch = readOpenAIChatToolArgumentsPatch(functionPayload, rawToolCall);
 
     mergePendingGeminiToolCall(
       state,
       toolIndex,
       {
         name,
-        argumentsJson: argumentsChunk
+        argumentsJson: argumentsPatch?.value
       },
-      true
+      argumentsPatch?.append ?? true
     );
   }
 }
@@ -2895,7 +2895,8 @@ function collectOpenAIChatToolCallsForOpenAIResponses(
     const functionPayload = isObject(rawToolCall.function) ? rawToolCall.function : undefined;
     const id = asString(rawToolCall.id);
     const name = asString(functionPayload?.name) || asString(rawToolCall.name);
-    const argumentsChunk = asString(functionPayload?.arguments) || asString(rawToolCall.arguments) || '';
+    const argumentsPatch = readOpenAIChatToolArgumentsPatch(functionPayload, rawToolCall);
+    const argumentsChunk = argumentsPatch?.value || '';
     const splitName = name ? splitNamespacedToolCallName(name, tools) : undefined;
 
     const toolCall = mergePendingOpenAIResponsesToolCall(
@@ -2908,7 +2909,7 @@ function collectOpenAIChatToolCallsForOpenAIResponses(
         namespace: splitName?.namespace,
         argumentsJson: argumentsChunk
       },
-      true
+      argumentsPatch?.append ?? true
     );
 
     if (!toolCall.added) {
@@ -3506,7 +3507,8 @@ function collectOpenAIChatToolCalls(state: AnthropicRelayState, rawToolCalls: un
     const functionPayload = isObject(rawToolCall.function) ? rawToolCall.function : undefined;
     const id = asString(rawToolCall.id);
     const name = asString(functionPayload?.name) || asString(rawToolCall.name);
-    const argumentsChunk = asString(functionPayload?.arguments) || asString(rawToolCall.arguments) || '';
+    const argumentsPatch = readOpenAIChatToolArgumentsPatch(functionPayload, rawToolCall);
+    const argumentsChunk = argumentsPatch?.value || '';
 
     frames.push(...closeActiveAnthropicTextBlock(state));
     const toolCall = mergePendingAnthropicToolCall(
@@ -3517,7 +3519,7 @@ function collectOpenAIChatToolCalls(state: AnthropicRelayState, rawToolCalls: un
         name,
         argumentsJson: argumentsChunk
       },
-      true
+      argumentsPatch?.append ?? true
     );
     if (!toolCall.started) {
       frames.push(buildAnthropicToolUseStartFrame(toolCall));
@@ -4218,8 +4220,7 @@ function collectOpenAIStreamToolCalls(
     const id = asString(rawToolCall.id);
     const type = asString(rawToolCall.type);
     const name = asString(functionPayload?.name) || asString(rawToolCall.name);
-    const argumentsDelta =
-      asString(functionPayload?.arguments) || asString(rawToolCall.arguments) || '';
+    const argumentsPatch = readOpenAIChatToolArgumentsPatch(functionPayload, rawToolCall);
 
     if (id) {
       current.id = id;
@@ -4230,12 +4231,38 @@ function collectOpenAIStreamToolCalls(
     if (name) {
       current.name = name;
     }
-    if (argumentsDelta) {
-      current.argumentsJson += argumentsDelta;
+    if (argumentsPatch?.value) {
+      current.argumentsJson = argumentsPatch.append
+        ? current.argumentsJson + argumentsPatch.value
+        : argumentsPatch.value;
     }
 
     toolCalls.set(index, current);
   }
+}
+
+function readOpenAIChatToolArgumentsPatch(
+  functionPayload: Record<string, unknown> | undefined,
+  rawToolCall: Record<string, unknown>
+): { value: string; append: boolean } | undefined {
+  const hasFunctionArguments = Boolean(
+    functionPayload && Object.prototype.hasOwnProperty.call(functionPayload, 'arguments')
+  );
+  const hasTopLevelArguments = Object.prototype.hasOwnProperty.call(rawToolCall, 'arguments');
+  if (!hasFunctionArguments && !hasTopLevelArguments) {
+    return undefined;
+  }
+
+  const rawValue = hasFunctionArguments ? functionPayload?.arguments : rawToolCall.arguments;
+  const value = normalizeStreamToolArguments(rawValue);
+  if (!value) {
+    return undefined;
+  }
+
+  return {
+    value,
+    append: typeof rawValue === 'string'
+  };
 }
 
 function buildOpenAIStreamToolCalls(
@@ -4265,6 +4292,14 @@ function normalizeStreamToolArguments(value: unknown) {
   } catch {
     return String(value);
   }
+}
+
+function normalizeAnthropicToolStartInput(value: unknown) {
+  if (isObject(value) && Object.keys(value).length === 0) {
+    return '';
+  }
+
+  return normalizeStreamToolArguments(value);
 }
 
 function parseStreamToolArguments(value: string): unknown {

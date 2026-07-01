@@ -307,6 +307,42 @@ describe('resolveBillingResponseSnapshot', () => {
     });
   });
 
+  it('collects anthropic tool input deltas without prefixing empty start input', async () => {
+    const upstreamPayload = await collectAnthropicNonStreamPayloadFromEventStream(
+      createSseResponse([
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_tool_stream","type":"message","role":"assistant","model":"glm-5.2","content":[],"usage":{"input_tokens":10,"output_tokens":0}}}\n\n',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{}}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"command\\":\\"pwd\\"}"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":11}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      ])
+    );
+
+    expect(upstreamPayload).toMatchObject({
+      content: [
+        {
+          type: 'tool_use',
+          id: 'toolu_bash',
+          name: 'Bash',
+          input: {
+            command: 'pwd'
+          }
+        }
+      ]
+    });
+
+    const result = anthropicMessagesTargetAdapter.toStandardResponse(upstreamPayload);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.output[0]).toMatchObject({
+        type: 'function_call',
+        name: 'Bash',
+        arguments: '{"command":"pwd"}'
+      });
+    }
+  });
+
   it('preserves anthropic thinking blocks when collecting streaming payloads', async () => {
     const upstreamPayload = await collectAnthropicNonStreamPayloadFromEventStream(
       createSseResponse([

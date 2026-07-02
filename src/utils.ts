@@ -119,6 +119,10 @@ export function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+export function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return isObject(value) && !Array.isArray(value);
+}
+
 export function extractTextFromPart(part: unknown): string {
   if (typeof part === 'string') {
     return part.trim();

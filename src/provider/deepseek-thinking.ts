@@ -1,4 +1,5 @@
 import type { ProviderPlugin, ProviderPluginRequestInput } from '../types';
+import { isPlainRecord } from '../utils';
 
 type DeepSeekEffort = 'high' | 'max';
 type DeepSeekThinkingType = 'enabled' | 'disabled';
@@ -175,6 +176,3 @@ function readNestedValue(value: unknown, key: string): unknown {
   return isPlainRecord(value) ? value[key] : undefined;
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}

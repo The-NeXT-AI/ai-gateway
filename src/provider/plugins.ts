@@ -2,6 +2,7 @@ import { createDecipheriv, createHash } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
 import type { ProviderPluginRegistry } from '../adapters/registry';
 import { createDeepSeekThinkingProviderPlugin } from './deepseek-thinking';
+import { createOpenCodeProviderPlugin } from './opencode';
 import { err, ok } from '../types';
 import { readBearerToken } from '../utils';
 import type {
@@ -162,6 +163,10 @@ function buildConfiguredProviderPlugin(config: ProviderPluginConfig): ProviderPl
   const deepseekThinkingPlugin = config.deepseekThinking?.enabled
     ? createDeepSeekThinkingProviderPlugin()
     : undefined;
+  const openCodePlugin = config.opencode?.enabled ? createOpenCodeProviderPlugin() : undefined;
+  const transformPlugins: ProviderPlugin[] = [deepseekThinkingPlugin, openCodePlugin].filter(
+    (p): p is ProviderPlugin => p != null
+  );
 
   return {
     key,
@@ -217,7 +222,7 @@ function buildConfiguredProviderPlugin(config: ProviderPluginConfig): ProviderPl
             return ok(upstreamRequest);
           }
         : undefined,
-    transformRequest: config.request || deepseekThinkingPlugin
+    transformRequest: config.request || transformPlugins.length > 0
       ? async (input) => {
           let upstreamRequest = input.upstreamRequest;
           if (config.request) {
@@ -243,11 +248,18 @@ function buildConfiguredProviderPlugin(config: ProviderPluginConfig): ProviderPl
             upstreamRequest = mutationResult.value;
           }
 
-          if (deepseekThinkingPlugin?.transformRequest) {
-            return deepseekThinkingPlugin.transformRequest({
+          for (const plugin of transformPlugins) {
+            if (!plugin?.transformRequest) {
+              continue;
+            }
+            const pluginResult = await plugin.transformRequest({
               ...input,
               upstreamRequest
             });
+            if (!pluginResult.ok) {
+              return pluginResult;
+            }
+            upstreamRequest = pluginResult.value;
           }
 
           return ok(upstreamRequest);

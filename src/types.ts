@@ -1025,6 +1025,10 @@ export interface ProviderPluginDeepSeekThinkingConfig {
   enabled: boolean;
 }
 
+export interface ProviderPluginOpenCodeConfig {
+  enabled: boolean;
+}
+
 export interface ProviderPluginConfig {
   key: string;
   enabled: boolean;
@@ -1032,6 +1036,7 @@ export interface ProviderPluginConfig {
   providerName?: string;
   codexOauth?: ProviderPluginCodexOAuthConfig;
   deepseekThinking?: ProviderPluginDeepSeekThinkingConfig;
+  opencode?: ProviderPluginOpenCodeConfig;
   auth?: ProviderPluginMutationConfig;
   request?: ProviderPluginMutationConfig;
   response?: ProviderPluginResponseMutationConfig;

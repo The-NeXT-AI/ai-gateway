@@ -1,7 +1,7 @@
 import type { FastifyRequest } from 'fastify';
 import type { GatewayConfig, HeaderBag, Result } from '../../types';
 import { err, ok } from '../../types';
-import { asNumber, isObject, readBearerToken, readHeader } from '../../utils';
+import { asNumber, isObject, isPlainRecord, readBearerToken, readHeader } from '../../utils';
 
 const defaultAnthropicVersion = '2023-06-01';
 type OpenAIHeaderBuildConfig = Pick<GatewayConfig, 'openaiApiKey' | 'auth'> & {
@@ -234,10 +234,6 @@ function asTokenCount(value: unknown): number | undefined {
   }
 
   return Math.max(0, Math.trunc(numeric));
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return isObject(value) && !Array.isArray(value);
 }
 
 function normalizeServerToolUse(value: unknown): Record<string, number> | undefined {

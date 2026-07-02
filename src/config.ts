@@ -57,6 +57,7 @@ import type {
   ProviderPluginCodexOAuthConfig,
   ProviderPluginDeepSeekThinkingConfig,
   ProviderPluginMutationConfig,
+  ProviderPluginOpenCodeConfig,
   ProviderPluginResponseMutationConfig,
   ProviderType,
   ProviderConfig,
@@ -740,6 +741,7 @@ interface ProviderPluginJsonConfig {
   codexOauth?: unknown;
   deepseekThinking?: unknown;
   deepSeekThinking?: unknown;
+  opencode?: unknown;
   auth?: unknown;
   request?: unknown;
   response?: unknown;
@@ -3626,7 +3628,8 @@ function parseProviderPluginsConfig(value: unknown): ProviderPluginConfig[] {
     const deepseekThinking = parseProviderPluginDeepSeekThinking(
       item.deepseekThinking ?? item.deepSeekThinking
     );
-    if (!auth && !request && !response && !codexOauth && !deepseekThinking) {
+    const opencode = parseProviderPluginOpenCode(item.opencode);
+    if (!auth && !request && !response && !codexOauth && !deepseekThinking && !opencode) {
       continue;
     }
 
@@ -3641,6 +3644,7 @@ function parseProviderPluginsConfig(value: unknown): ProviderPluginConfig[] {
       providerName,
       codexOauth,
       deepseekThinking,
+      opencode,
       auth,
       request,
       response
@@ -3838,6 +3842,10 @@ function parseProviderPluginDeepSeekThinking(value: unknown): ProviderPluginDeep
   }
 
   return { enabled: true };
+}
+
+function parseProviderPluginOpenCode(value: unknown): ProviderPluginOpenCodeConfig | undefined {
+  return parseProviderPluginDeepSeekThinking(value);
 }
 
 function parseProviderPluginCodexOauth(value: unknown): ProviderPluginCodexOAuthConfig | undefined {

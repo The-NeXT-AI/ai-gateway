@@ -22,6 +22,7 @@ import {
 } from '../utils';
 import { applyHealthAwareRouting } from './health-routing';
 import { createClientDisconnectSignal } from './client-disconnect';
+import { evaluateApiKeyModelRestriction } from './auth';
 import { evaluateGatewayPolicy, type GatewayPolicyResult } from './policy';
 import { recordProviderHealthFailure, recordProviderHealthResponse } from './provider-health';
 import { evaluateGatewayPrecheck } from './precheck';
@@ -236,6 +237,17 @@ async function handleOpenAIJsonRequest(
         message: `Model is required. Provide model in body, x-target-model header, or defaultOpenAIModel for ${endpoint.displayName}.`,
         status: 400
       });
+      continue;
+    }
+
+    const apiKeyModelRestriction = evaluateApiKeyModelRestriction(request, model, {
+      provider: targetProvider,
+      providerConfig: targetProviderConfig
+    });
+    if (!apiKeyModelRestriction.ok) {
+      attempts.push(
+        buildApiKeyModelRestrictionAttempt(targetProvider, targetProviderConfig, apiKeyModelRestriction)
+      );
       continue;
     }
 
@@ -610,7 +622,11 @@ async function callOpenAIJsonUpstream(
         providerName: context.targetProviderConfig?.name,
         sourceAdapterKey: context.endpoint.sourceAdapterKey
       },
-      context.config.upstreamRetry
+      context.config.upstreamRetry,
+      {
+        method: upstreamRequest.method,
+        bodyEncoding: upstreamRequest.bodyEncoding
+      }
     );
     cancelResponseBodyOnAbort(response, context.clientAbortSignal);
     recordProviderHealthResponse(
@@ -905,12 +921,30 @@ function parseModelReference(
     };
   }
 
-  const provider = parseProvider(providerHint);
+  const provider = parseConfiguredModelReferenceProvider(providerHint, providerConfigs);
   if (provider) {
     return { raw, model, provider };
   }
 
   return { raw, model: raw };
+}
+
+function parseConfiguredModelReferenceProvider(
+  providerHint: string,
+  providerConfigs: ProviderConfig[]
+): Provider | undefined {
+  const provider = parseProvider(providerHint);
+  if (!provider) {
+    return undefined;
+  }
+
+  if (provider === 'openai' || provider === 'anthropic' || provider === 'gemini') {
+    return provider;
+  }
+
+  return providerConfigs.some((providerConfig) => providerFromProviderType(providerConfig.type) === provider)
+    ? provider
+    : undefined;
 }
 
 function dedupeProviderRoutes(routes: TargetProviderRoute[]): TargetProviderRoute[] {
@@ -1240,6 +1274,20 @@ function buildGatewayPolicyAttempt(
       code: result.code,
       ...result.details
     }
+  };
+}
+
+function buildApiKeyModelRestrictionAttempt(
+  provider: Provider,
+  providerConfig: ProviderConfig | undefined,
+  result: Extract<ReturnType<typeof evaluateApiKeyModelRestriction>, { ok: false }>
+): OpenAIJsonAttemptFailure {
+  return {
+    provider,
+    providerName: providerConfig?.name,
+    stage: 'api_key_model_restriction',
+    message: result.error,
+    status: result.statusCode
   };
 }
 

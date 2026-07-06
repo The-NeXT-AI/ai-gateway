@@ -12,6 +12,7 @@ interface GatewayHttpMetricValue extends GatewayHttpMetricKey {
   count: number;
   durationMsSum: number;
   durationMsMax: number;
+  durationBuckets: number[];
 }
 
 interface GatewayToolExecutionMetricKey {
@@ -36,6 +37,15 @@ interface GatewayStreamConversionMetricValue extends GatewayStreamConversionMetr
   count: number;
 }
 
+interface GatewayBillingDeliveryMetricKey {
+  outcome: string;
+  transport: string;
+}
+
+interface GatewayBillingDeliveryMetricValue extends GatewayBillingDeliveryMetricKey {
+  count: number;
+}
+
 export interface GatewayHttpMetricInput {
   method: string;
   route?: string;
@@ -57,10 +67,17 @@ export interface GatewayStreamConversionMetricInput {
   mode: 'passthrough' | 'live' | 'buffered';
 }
 
+export interface GatewayBillingDeliveryMetricInput {
+  outcome: 'delivered' | 'failed' | 'not_configured' | 'not_delivered';
+  transport?: string;
+}
+
 const httpMetrics = new Map<string, GatewayHttpMetricValue>();
 const toolExecutionMetrics = new Map<string, GatewayToolExecutionMetricValue>();
 const streamConversionMetrics = new Map<string, GatewayStreamConversionMetricValue>();
+const billingDeliveryMetrics = new Map<string, GatewayBillingDeliveryMetricValue>();
 const providerHealthStatuses: ProviderHealthStatus[] = ['healthy', 'degraded', 'unknown', 'down'];
+const httpDurationBucketsSeconds = [0.05, 0.1, 0.25, 0.5, 1, 3, 10, 30];
 
 export function recordGatewayHttpRequest(input: GatewayHttpMetricInput): void {
   const statusCode = normalizeStatusCode(input.statusCode);
@@ -76,12 +93,19 @@ export function recordGatewayHttpRequest(input: GatewayHttpMetricInput): void {
     ...key,
     count: 0,
     durationMsSum: 0,
-    durationMsMax: 0
+    durationMsMax: 0,
+    durationBuckets: new Array(httpDurationBucketsSeconds.length).fill(0)
   };
 
   metric.count += 1;
   metric.durationMsSum += durationMs;
   metric.durationMsMax = Math.max(metric.durationMsMax, durationMs);
+  const durationSeconds = durationMs / 1000;
+  for (let index = 0; index < httpDurationBucketsSeconds.length; index += 1) {
+    if (durationSeconds <= httpDurationBucketsSeconds[index]) {
+      metric.durationBuckets[index] += 1;
+    }
+  }
   httpMetrics.set(metricKey, metric);
 }
 
@@ -119,6 +143,21 @@ export function recordGatewayStreamConversion(input: GatewayStreamConversionMetr
   streamConversionMetrics.set(metricKey, metric);
 }
 
+export function recordGatewayBillingDelivery(input: GatewayBillingDeliveryMetricInput): void {
+  const key: GatewayBillingDeliveryMetricKey = {
+    outcome: normalizeLabel(input.outcome),
+    transport: normalizeLabel(input.transport || 'none')
+  };
+  const metricKey = serializeBillingDeliveryMetricKey(key);
+  const metric = billingDeliveryMetrics.get(metricKey) || {
+    ...key,
+    count: 0
+  };
+
+  metric.count += 1;
+  billingDeliveryMetrics.set(metricKey, metric);
+}
+
 export function renderGatewayMetrics(config: GatewayConfig): string {
   const lines: string[] = [];
 
@@ -154,6 +193,26 @@ export function renderGatewayMetrics(config: GatewayConfig): string {
     );
   }
 
+  lines.push('# HELP gateway_http_request_duration_seconds Gateway HTTP request duration in seconds.');
+  lines.push('# TYPE gateway_http_request_duration_seconds histogram');
+  for (const metric of sortedHttpMetrics()) {
+    const labels = httpMetricLabels(metric);
+    for (let index = 0; index < httpDurationBucketsSeconds.length; index += 1) {
+      lines.push(
+        `gateway_http_request_duration_seconds_bucket${formatLabels({ ...labels, le: String(httpDurationBucketsSeconds[index]) })} ${metric.durationBuckets[index]}`
+      );
+    }
+    lines.push(
+      `gateway_http_request_duration_seconds_bucket${formatLabels({ ...labels, le: '+Inf' })} ${metric.count}`
+    );
+    lines.push(
+      `gateway_http_request_duration_seconds_sum${formatLabels(labels)} ${formatMetricNumber(metric.durationMsSum / 1000)}`
+    );
+    lines.push(
+      `gateway_http_request_duration_seconds_count${formatLabels(labels)} ${metric.count}`
+    );
+  }
+
   lines.push('# HELP gateway_tool_executions_total Total transparent gateway tool executions.');
   lines.push('# TYPE gateway_tool_executions_total counter');
   for (const metric of sortedToolExecutionMetrics()) {
@@ -170,6 +229,14 @@ export function renderGatewayMetrics(config: GatewayConfig): string {
     );
   }
 
+  lines.push('# HELP gateway_billing_events_total Gateway billing event delivery attempts by outcome.');
+  lines.push('# TYPE gateway_billing_events_total counter');
+  for (const metric of sortedBillingDeliveryMetrics()) {
+    lines.push(
+      `gateway_billing_events_total${formatLabels(billingDeliveryMetricLabels(metric))} ${metric.count}`
+    );
+  }
+
   if (config.metrics.includeProviderHealth) {
     appendProviderHealthMetrics(lines, config.providers);
   }
@@ -181,6 +248,7 @@ export function resetGatewayMetricsForTests(): void {
   httpMetrics.clear();
   toolExecutionMetrics.clear();
   streamConversionMetrics.clear();
+  billingDeliveryMetrics.clear();
 }
 
 function appendProviderHealthMetrics(lines: string[], providers: ProviderConfig[]): void {
@@ -247,6 +315,14 @@ function sortedStreamConversionMetrics(): GatewayStreamConversionMetricValue[] {
   });
 }
 
+function sortedBillingDeliveryMetrics(): GatewayBillingDeliveryMetricValue[] {
+  return Array.from(billingDeliveryMetrics.values()).sort((left, right) => {
+    const leftKey = serializeBillingDeliveryMetricKey(left);
+    const rightKey = serializeBillingDeliveryMetricKey(right);
+    return leftKey.localeCompare(rightKey);
+  });
+}
+
 function httpMetricLabels(metric: GatewayHttpMetricValue): Record<string, string> {
   return {
     method: metric.method,
@@ -274,6 +350,13 @@ function streamConversionMetricLabels(metric: GatewayStreamConversionMetricValue
   };
 }
 
+function billingDeliveryMetricLabels(metric: GatewayBillingDeliveryMetricValue): Record<string, string> {
+  return {
+    outcome: metric.outcome,
+    transport: metric.transport
+  };
+}
+
 function serializeHttpMetricKey(key: GatewayHttpMetricKey): string {
   return `${key.method}\n${key.route}\n${key.statusCode}\n${key.statusClass}`;
 }
@@ -284,6 +367,10 @@ function serializeToolExecutionMetricKey(key: GatewayToolExecutionMetricKey): st
 
 function serializeStreamConversionMetricKey(key: GatewayStreamConversionMetricKey): string {
   return `${key.sourceAdapter}\n${key.targetProvider}\n${key.targetProviderName}\n${key.mode}`;
+}
+
+function serializeBillingDeliveryMetricKey(key: GatewayBillingDeliveryMetricKey): string {
+  return `${key.outcome}\n${key.transport}`;
 }
 
 function normalizeMethod(value: string): string {

@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer } from 'ws';
+import { parseGatewayConfigFromRaw } from '../config';
+import { renderGatewayMetrics, resetGatewayMetricsForTests } from '../gateway/metrics';
 import type { BillingQueueConfig, BillingWebhookConfig } from '../types';
 import {
   closeBillingPublisher,
@@ -20,6 +22,7 @@ describe('billing publisher', () => {
 
   afterEach(async () => {
     await closeBillingPublisher();
+    resetGatewayMetricsForTests();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     await Promise.all(webSocketServers.splice(0).map((server) => closeWebSocketServer(server)));
@@ -43,6 +46,9 @@ describe('billing publisher', () => {
         method: 'POST',
         body: expect.stringContaining('"eventId":"billing-event-1"')
       })
+    );
+    expect(renderGatewayMetricsForTest()).toContain(
+      'gateway_billing_events_total{outcome="delivered",transport="http"} 1'
     );
   });
 
@@ -87,6 +93,41 @@ describe('billing publisher', () => {
       eventId: 'billing-event-1',
       requestId: 'request-1'
     });
+  });
+
+  it('records failed billing delivery metrics when webhook delivery fails', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 'down' }), {
+        status: 503
+      })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    await initializeBillingPublisher(buildQueueConfig(false), {
+      ...buildWebhookConfig('http', 'https://billing.example/events'),
+      maxAttempts: 1
+    });
+
+    await expect(publishBillingEvent(buildEvent())).rejects.toThrow(
+      'HTTP event sink request failed with status 503'
+    );
+
+    expect(renderGatewayMetricsForTest()).toContain(
+      'gateway_billing_events_total{outcome="failed",transport="http"} 1'
+    );
+  });
+
+  it('records not configured billing delivery metrics when no publisher is active', async () => {
+    await initializeBillingPublisher(buildQueueConfig(false), {
+      ...buildWebhookConfig('http', ''),
+      enabled: false
+    });
+
+    const delivered = await publishBillingEvent(buildEvent());
+
+    expect(delivered).toBe(false);
+    expect(renderGatewayMetricsForTest()).toContain(
+      'gateway_billing_events_total{outcome="not_configured",transport="none"} 1'
+    );
   });
 });
 
@@ -178,6 +219,17 @@ function buildEvent(): BillingQueueEvent {
       }
     }
   };
+}
+
+function renderGatewayMetricsForTest(): string {
+  return renderGatewayMetrics(
+    parseGatewayConfigFromRaw({
+      metrics: {
+        enabled: true,
+        includeProviderHealth: false
+      }
+    })
+  );
 }
 
 async function startWebSocketSink(): Promise<{

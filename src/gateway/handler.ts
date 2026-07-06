@@ -89,6 +89,7 @@ import {
   readRawRequestBody,
 } from '../raw-trace';
 import { matchesAnyPattern } from '../shared/pattern';
+import { evaluateApiKeyModelRestriction } from './auth';
 
 interface ProviderAttemptFailure {
   provider: Provider;
@@ -339,7 +340,7 @@ export async function handleGatewayRequest(
     const targetProviderConfig = resolveProviderConfig(config, target);
     const providerPlugins = runtime.providerPlugins.resolve(targetProvider, targetProviderConfig?.name);
     const targetProviderLabel = formatTargetProviderLabel(target);
-    const targetAdapter = runtime.targetAdapters.get(targetProvider);
+    const targetAdapter = runtime.targetAdapters.get(targetProvider, targetProviderConfig);
     if (!targetAdapter) {
       attempts.push({
         provider: targetProvider,
@@ -390,6 +391,17 @@ export async function handleGatewayRequest(
       }
 
       const passthroughModel = passthroughModelResult.value;
+      const apiKeyModelRestriction = evaluateApiKeyModelRestriction(request, passthroughModel, {
+        provider: targetProvider,
+        providerConfig: targetProviderConfig
+      });
+      if (!apiKeyModelRestriction.ok) {
+        attempts.push(
+          buildApiKeyModelRestrictionAttempt(targetProvider, targetProviderConfig, apiKeyModelRestriction)
+        );
+        continue;
+      }
+
       const policyResult = evaluateGatewayPolicy({
         request,
         config,
@@ -695,6 +707,17 @@ export async function handleGatewayRequest(
           message: `Model is required. Provide model in body, x-target-model header, or default model env for ${targetProviderLabel}.`,
           status: 400
         });
+        continue;
+      }
+
+      const apiKeyModelRestriction = evaluateApiKeyModelRestriction(request, model, {
+        provider: targetProvider,
+        providerConfig: targetProviderConfig
+      });
+      if (!apiKeyModelRestriction.ok) {
+        attempts.push(
+          buildApiKeyModelRestrictionAttempt(targetProvider, targetProviderConfig, apiKeyModelRestriction)
+        );
         continue;
       }
 
@@ -1033,6 +1056,17 @@ export async function handleGatewayRequest(
       });
         continue;
       }
+
+    const apiKeyModelRestriction = evaluateApiKeyModelRestriction(request, model, {
+      provider: targetProvider,
+      providerConfig: targetProviderConfig
+    });
+    if (!apiKeyModelRestriction.ok) {
+      attempts.push(
+        buildApiKeyModelRestrictionAttempt(targetProvider, targetProviderConfig, apiKeyModelRestriction)
+      );
+      continue;
+    }
 
     const policyResult = evaluateGatewayPolicy({
       request,
@@ -1863,7 +1897,7 @@ async function handleVirtualModelRequest(
     const targetProvider = target.provider;
     const targetProviderConfig = resolveProviderConfig(config, target);
     const targetProviderLabel = formatTargetProviderLabel(target);
-    const targetAdapter = runtime.targetAdapters.get(targetProvider);
+    const targetAdapter = runtime.targetAdapters.get(targetProvider, targetProviderConfig);
     if (!targetAdapter) {
       attempts.push({
         provider: targetProvider,
@@ -1900,6 +1934,17 @@ async function handleVirtualModelRequest(
         message: `Model is required for virtual model profile ${virtualModel.profile.key} on target provider ${targetProviderLabel}.`,
         status: 400
       });
+      continue;
+    }
+
+    const apiKeyModelRestriction = evaluateApiKeyModelRestriction(request, model, {
+      provider: targetProvider,
+      providerConfig: targetProviderConfig
+    });
+    if (!apiKeyModelRestriction.ok) {
+      attempts.push(
+        buildApiKeyModelRestrictionAttempt(targetProvider, targetProviderConfig, apiKeyModelRestriction)
+      );
       continue;
     }
 
@@ -4808,7 +4853,7 @@ function parseModelReference(
     };
   }
 
-  const providerType = parseProvider(providerHint);
+  const providerType = parseConfiguredModelReferenceProvider(providerHint, providerConfigs);
   if (providerType) {
     return {
       raw,
@@ -4823,8 +4868,31 @@ function parseModelReference(
   };
 }
 
+function parseConfiguredModelReferenceProvider(
+  providerHint: string,
+  providerConfigs: ProviderConfig[]
+): Provider | undefined {
+  const provider = parseProvider(providerHint);
+  if (!provider) {
+    return undefined;
+  }
+
+  if (provider === 'openai' || provider === 'anthropic' || provider === 'gemini') {
+    return provider;
+  }
+
+  return providerConfigs.some((providerConfig) => providerFromProviderType(providerConfig.type) === provider)
+    ? provider
+    : undefined;
+}
+
 function formatAllowedProviderValues(providerConfigs: ProviderConfig[]): string {
-  const providerTypes: Provider[] = ['openai', 'anthropic', 'gemini'];
+  const providerTypes = dedupeProviders([
+    'openai',
+    'anthropic',
+    'gemini',
+    ...providerConfigs.map((providerConfig) => providerFromProviderType(providerConfig.type))
+  ]);
   const providerNames = dedupeProviderRoutes(
     providerConfigs.map((providerConfig) => ({
       provider: providerFromProviderType(providerConfig.type),
@@ -4835,6 +4903,16 @@ function formatAllowedProviderValues(providerConfigs: ProviderConfig[]): string 
     .filter((item): item is string => Boolean(item));
 
   return [...providerTypes, ...providerNames].join(', ');
+}
+
+function dedupeProviders(providers: Provider[]): Provider[] {
+  const deduped: Provider[] = [];
+  for (const provider of providers) {
+    if (!deduped.includes(provider)) {
+      deduped.push(provider);
+    }
+  }
+  return deduped;
 }
 
 function sendBadRequest(reply: FastifyReply, message: string) {
@@ -4909,6 +4987,20 @@ function buildGatewayPolicyAttempt(
       code: result.code,
       ...result.details
     }
+  };
+}
+
+function buildApiKeyModelRestrictionAttempt(
+  provider: Provider,
+  providerConfig: ProviderConfig | undefined,
+  result: Extract<ReturnType<typeof evaluateApiKeyModelRestriction>, { ok: false }>
+): ProviderAttemptFailure {
+  return {
+    provider,
+    providerName: providerConfig?.name,
+    stage: 'api_key_model_restriction',
+    message: result.error,
+    status: result.statusCode
   };
 }
 
@@ -5889,7 +5981,11 @@ async function callUpstreamWithFailureCapture(
         providerName: context.targetProviderConfig?.name,
         sourceAdapterKey: context.sourceAdapterKey
       },
-      context.config.upstreamRetry
+      context.config.upstreamRetry,
+      {
+        method: upstreamRequest.method,
+        bodyEncoding: upstreamRequest.bodyEncoding
+      }
     );
     cancelResponseBodyOnAbort(response, context.clientAbortSignal);
     recordProviderHealthResponse(
@@ -6437,6 +6533,10 @@ function overrideUpstreamBaseUrl(
   config: GatewayConfig
 ): string {
   const defaultBaseUrl = providerBaseUrlForType(provider, config);
+  if (!defaultBaseUrl) {
+    return url;
+  }
+
   if (url.startsWith(defaultBaseUrl)) {
     return `${overriddenBaseUrl}${url.slice(defaultBaseUrl.length)}`;
   }
@@ -6453,7 +6553,7 @@ function overrideUpstreamBaseUrl(
   }
 }
 
-function providerBaseUrlForType(provider: Provider, config: GatewayConfig): string {
+function providerBaseUrlForType(provider: Provider, config: GatewayConfig): string | undefined {
   if (provider === 'openai') {
     return config.openaiBaseUrl;
   }
@@ -6462,7 +6562,11 @@ function providerBaseUrlForType(provider: Provider, config: GatewayConfig): stri
     return config.anthropicBaseUrl;
   }
 
-  return config.geminiBaseUrl;
+  if (provider === 'gemini') {
+    return config.geminiBaseUrl;
+  }
+
+  return undefined;
 }
 
 function applyProviderCredentials(
@@ -6488,6 +6592,13 @@ function applyProviderCredentials(
         ...headers,
         'x-api-key': apiKey
       }
+    };
+  }
+
+  if (provider !== 'gemini') {
+    return {
+      url,
+      headers
     };
   }
 

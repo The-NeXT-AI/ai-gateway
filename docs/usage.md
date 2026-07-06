@@ -241,25 +241,27 @@ docker compose up --build
 - 示例文件见 `gateway.config.example.json`
 - 推荐使用 `Providers` 数组配置供应商（数组顺序即默认 fallback 顺序）
 - `Providers` 单项字段：`name`、`type`、`apikey|apiKeyEnv`、`baseurl`、`models`、`openaiChatStreamUsage`、`extraHeaders`、`extraBody`、`billing`
-- `providerPlugins` 用于声明供应商插件（`key`、`provider|providerName`、`codexOauth`、`deepseekThinking`、`auth`、`request`、`response`）
+- `plugins` 是统一插件入口；可声明 `providerHooks`，也可通过 `modulePath` 加载本地模块插件注册 `targetAdapters` / `sourceAdapters` / `providerHooks`，详见 [Gateway Plugins](plugins.md)
+- `providerPlugins` 仍兼容旧配置；新配置建议迁移到 `plugins[].providerHooks`
 - `type` 同时用于声明 provider 类别和上游协议，支持：
   - OpenAI：`openai`（等价 `openai_responses`）、`openai_responses`、`openai_chat_completions`
   - Anthropic：`anthropic`（等价 `anthropic_messages`）、`anthropic_messages`
   - Gemini：`gemini`（等价 `gemini_generate_content`）、`gemini_generate_content`
+  - 自定义协议：通过模块插件注册对应 `targetAdapters` 后，可使用形如 `acme_messages` 的自定义 provider type
 - `extraHeaders` / `extraBody` / `billing` 支持按模型配置（`default` + 指定模型名）
 - `openaiChatStreamUsage` 仅对 `openai_chat_completions` 生效，默认会在流式请求中添加 `stream_options.include_usage=true`；供应商不兼容时可设为 `false` 或 `disabled` 关闭。
-- `providerPlugins` 的 `auth/request/response` 支持声明式规则：`headers`、`query`、`bodySet`、`bodyMerge`、`bodyRemove`
-- `providerPlugins` 支持值引用：`{"from":"env.XXX"}`、`{"from":"request.headers.x-foo"}`、`{"from":"request.body.user.id"}`、`{"from":"upstreamPayload.data.id"}`、`{"from":"target.providerName"}`
-- `providerPlugins.codexOauth` 字段：`accessToken`、`refreshToken`、`tokenEndpoint`、`clientId`、`scope`、`refreshIfMissingAccessToken`、`forceRefresh`、`required`、`timeoutMs`、`authHeader`、`authScheme`
+- `plugins[].providerHooks` / `providerPlugins` 的 `auth/request/response` 支持声明式规则：`headers`、`query`、`bodySet`、`bodyMerge`、`bodyRemove`
+- `plugins[].providerHooks` / `providerPlugins` 支持值引用：`{"from":"env.XXX"}`、`{"from":"request.headers.x-foo"}`、`{"from":"request.body.user.id"}`、`{"from":"upstreamPayload.data.id"}`、`{"from":"target.providerName"}`
+- `plugins[].providerHooks.codexOauth` / `providerPlugins.codexOauth` 字段：`accessToken`、`refreshToken`、`tokenEndpoint`、`clientId`、`scope`、`refreshIfMissingAccessToken`、`forceRefresh`、`required`、`timeoutMs`、`authHeader`、`authScheme`
 - `virtualModelProfiles[].execution.streamMode` 默认为 `buffered`；设为 `optimistic` 时，OpenAI Chat Completions 上游 SSE 会边转发 reasoning/text，边拦截 internal tools，并在工具结果回填后继续同一个下游流。该模式仅在没有 client-visible tools 且无 response transform plugin 时启用，否则回退为 buffered。
-- `providerExternal` 用于通过 HTTP/WebSocket/gRPC/stdio 从外部服务动态加载 provider、providerPlugins 与 virtualModelProfiles。
+- `providerExternal` 用于通过 HTTP/WebSocket/gRPC/stdio 从外部服务动态加载 provider、plugins、providerPlugins 与 virtualModelProfiles。
 - `billing` 支持 `cacheReadPerMillionUsd` / `cacheWritePerMillionUsd` 与 `tiers`（阶梯计费）
 - `configExternal` 用于从外部服务动态获取完整 gateway 配置（`enabled`、`transport=http|websocket|grpc|stdio`、`endpoint`、`command`、`args`、`cwd`、`env`、`method`、`timeoutMs`、`intervalMs|intervalSeconds`、`apiKeyHeader`、`apiKey|apiKeyEnv`、`headers`）；外部返回体可为完整配置对象、`{"config": {...}}` 或 `{"gatewayConfig": {...}}`。gRPC 使用 JSON unary，默认 path 为 `/gateway.config.v1.ConfigService/GetConfig`。
 - `billingWebhook` 用于配置事件上报（`enabled`、`transport=http|websocket|grpc|stdio`、`endpoint`、`command`、`args`、`cwd`、`env`、`timeoutMs`、`maxAttempts`、`baseDelayMs`、`maxDelayMs`、`requireAck`、`headers`）；gRPC 使用 JSON unary，默认 path 为 `/gateway.events.v1.EventSink/Publish`。
 - `billingQueue` 为历史兼容字段；gateway 不会创建队列连接，开启后也只记录禁用日志。需要队列时请通过 `billingWebhook` 或外部协议适配服务实现。
 - `rawTrace` 用于捕获原始请求/上游链路包；gateway 只写本地 spool bundle，`rawTrace.sync` 通过 HTTP/WebSocket/gRPC/stdio 上报 manifest，支持失败重试，由外部服务负责持久化、索引和归档。
-- `auth` 用于配置客户侧鉴权（`enabled`、`mode`、`required`、`trustedCidrs`、`identityHeaders`、`signature`、`introspection`、`staticApiKeys`）
-- `precheck` 用于请求前治理（`rateLimit`、`quota`、`budget`、`estimation`），`precheck.storage.type` 仅使用进程内 `memory`。多实例全局限流/预算应由外部治理服务提供。
+- `auth` 用于配置客户侧鉴权（`enabled`、`mode`、`required`、`trustedCidrs`、`identityHeaders`、`signature`、`introspection`、`staticApiKeys`）。`http_introspection` 响应中的 API Key `restrictions` 支持 `ipWhitelist|allowedIps`、`allowedOrigins|allowedDomains`、`allowedModels|modelWhitelist`、`rateLimit|requestsPerMinute`、`rateLimitWindowSeconds`，gateway 会在请求前拒绝不匹配的 IP、来源、请求/路由模型，并按 API Key 执行请求数限流。
+- `precheck` 用于请求前治理（`rateLimit`、`quota`、`budget`、`estimation`）。`precheck.storage.type` 支持 `memory` 与 `redis`；生产多实例要使用 `redis` 才能让单用户/单 Key/单 IP 的限流、配额和预算在实例间共享计数。Redis 后端通过 Lua 原子检查并预留计数，Redis 不可用时请求会 fail-closed 返回 `precheck_store_unavailable`。
 - `providerHealthCheck` 用于配置定时 provider 探测（默认关闭）：`enabled`、`intervalMs|intervalSeconds`、`timeoutMs|timeoutSeconds`、`initialDelayMs|initialDelaySeconds`。
 - `metrics` 用于配置 Prometheus 指标导出（默认关闭）：`enabled`、`includeProviderHealth`；开启后可访问 `GET /metrics`。
 - `cors` 用于配置跨域响应头（默认开启）：`enabled`、`origins|origin`、`allowedHeaders`、`allowedMethods`、`allowCredentials`、`maxAgeSeconds|maxAge`。

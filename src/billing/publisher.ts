@@ -7,6 +7,7 @@ import type {
   Provider
 } from '../types';
 import { publishJsonEventToExternalSink } from '../external-event-sink';
+import { recordGatewayBillingDelivery } from '../gateway/metrics';
 import type { BillingResult } from './calculate';
 
 export interface BillingPublisherLogger {
@@ -151,6 +152,10 @@ export async function publishBillingEvent(event: BillingQueueEvent): Promise<boo
   }
 
   if (deliveries.length === 0) {
+    recordGatewayBillingDelivery({
+      outcome: 'not_configured',
+      transport: 'none'
+    });
     return false;
   }
 
@@ -168,6 +173,10 @@ export async function publishBillingEvent(event: BillingQueueEvent): Promise<boo
   }
 
   if (failures.length > 0) {
+    recordGatewayBillingDelivery({
+      outcome: 'failed',
+      transport: webhookConfig?.transport || 'unknown'
+    });
     logger?.warn(
       {
         details: failures
@@ -177,6 +186,10 @@ export async function publishBillingEvent(event: BillingQueueEvent): Promise<boo
   }
 
   if (delivered) {
+    recordGatewayBillingDelivery({
+      outcome: 'delivered',
+      transport: webhookConfig?.transport || 'unknown'
+    });
     return true;
   }
 
@@ -184,6 +197,10 @@ export async function publishBillingEvent(event: BillingQueueEvent): Promise<boo
     throw new Error(failures.join(' | '));
   }
 
+  recordGatewayBillingDelivery({
+    outcome: 'not_delivered',
+    transport: webhookConfig?.transport || 'unknown'
+  });
   return false;
 }
 

@@ -82,6 +82,7 @@ Response:
       "apikey": "secret"
     }
   ],
+  "plugins": [],
   "providerPlugins": [],
   "virtualModelProfiles": [],
   "credentialEncryption": {}
@@ -89,6 +90,7 @@ Response:
 ```
 
 The `providers` field may also be returned as `data.providers`. Optional fields are applied only when present.
+`plugins` is the preferred unified plugin field. `providerPlugins` remains supported for backward compatibility.
 
 Default gRPC path:
 

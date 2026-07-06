@@ -30,6 +30,8 @@ interface GeminiContentConversionState {
 
 export const geminiGenerateContentTargetAdapter: TargetAdapter = {
   provider: 'gemini',
+  providerTypes: ['gemini_generate_content', 'gemini_interactions'],
+  providerFallback: true,
   buildRequestFromStandard(input) {
     if (input.targetProviderConfig?.type === 'gemini_interactions') {
       return buildGeminiInteractionsRequestFromStandard(input);

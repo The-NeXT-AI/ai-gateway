@@ -18,12 +18,13 @@ import type {
 } from '../types';
 import { err, ok, type Result } from '../types';
 import { parseProvider, providerFromProviderType } from '../utils';
-import { authenticateGatewayRequest } from './auth';
+import { authenticateGatewayRequest, evaluateApiKeyModelRestriction } from './auth';
 import {
   parseGatewayCodexWsSourceAdapterKey,
   transformClientMessageToCodexRequest,
   type GatewayCodexWsSourceAdapterKey
 } from './codex-websocket-conversion';
+import { evaluateGatewayPrecheck } from './precheck';
 import type { GatewayRuntime } from './runtime';
 
 interface GatewaySocketContext {
@@ -31,6 +32,7 @@ interface GatewaySocketContext {
   requestUrl: string;
   request: FastifyRequest;
   sourceAdapterHint?: GatewayCodexWsSourceAdapterKey;
+  targetProviderConfig?: ProviderConfig;
 }
 
 const blockedForwardHeaderSet = new Set([
@@ -109,6 +111,10 @@ export function registerGatewayResponsesWebSocketRoute(
 
     websocketServer.handleUpgrade(request, socket, head, (ws) => {
       const pluginCompatibleRequest = createWebSocketPluginCompatibleRequest(request, requestUrl, fastify);
+      pluginCompatibleRequest.gatewayIdentity = authResult.ok ? authResult.identity : undefined;
+      pluginCompatibleRequest.gatewayApiKeyRestrictions = authResult.ok
+        ? authResult.apiKeyRestrictions
+        : undefined;
       socketContext.set(ws, {
         headers: request.headers,
         requestUrl: requestUrl.toString(),
@@ -133,6 +139,7 @@ export function registerGatewayResponsesWebSocketRoute(
     let upstreamSocket: WebSocket | undefined;
     try {
       const upstreamTarget = resolveResponsesWebSocketTarget(config, context);
+      context.targetProviderConfig = upstreamTarget.providerConfig;
       const upstreamUrl = buildResponsesUpstreamUrl(upstreamTarget.baseUrl, context.requestUrl);
       const upstreamHeaders = buildUpstreamHeaders(context.headers, {
         openaiApiKey: upstreamTarget.apiKey,
@@ -216,6 +223,7 @@ function bindSocketRelay(
   let pendingDownstreamBytes = 0;
   let pendingUpstreamToDownstreamSends = 0;
   let upstreamCloseForceTimer: NodeJS.Timeout | undefined;
+  let downstreamMessageQueue = Promise.resolve();
   let upstreamClosePending:
     | {
         code: number;
@@ -278,7 +286,21 @@ function bindSocketRelay(
   };
 
   downstreamSocket.on('message', (raw, isBinary) => {
-    const messageForUpstream = buildMessageForUpstream(
+    downstreamMessageQueue = downstreamMessageQueue
+      .then(() => handleDownstreamMessage(raw, isBinary))
+      .catch((error) => {
+        fastify.log.warn(
+          {
+            details: toErrorMessage(error)
+          },
+          'Gateway responses websocket downstream message handling failed.'
+        );
+        closePeer(downstreamSocket, 1011, 'Gateway websocket message handling failed.');
+      });
+  });
+
+  async function handleDownstreamMessage(raw: RawData, isBinary: boolean): Promise<void> {
+    const messageForUpstream = await buildMessageForUpstream(
       raw,
       isBinary,
       context,
@@ -314,7 +336,7 @@ function bindSocketRelay(
     }
 
     sendMessageToUpstream(messageForUpstream.payload, messageForUpstream.binary);
-  });
+  }
 
   upstreamSocket.on('message', (raw, isBinary) => {
     if (downstreamSocket.readyState !== WebSocket.OPEN) {
@@ -421,14 +443,14 @@ function normalizeResponseCompletedTextPayload(payload: string): string {
   return normalized === parsed ? payload : JSON.stringify(normalized);
 }
 
-function buildMessageForUpstream(
+async function buildMessageForUpstream(
   raw: RawData,
   isBinary: boolean,
   context: GatewaySocketContext,
   downstreamSocket: WebSocket,
   fastify: FastifyInstance,
   config: GatewayConfig
-): { payload: WebSocketPayload; binary: boolean } | undefined {
+): Promise<{ payload: WebSocketPayload; binary: boolean } | undefined> {
   if (isBinary) {
     return {
       payload: raw,
@@ -458,11 +480,88 @@ function buildMessageForUpstream(
     transformed.payload,
     config.openaiBaseUrl
   );
+  const guardResult = await evaluateWebSocketResponseCreateGuards(
+    context,
+    normalizedPayload,
+    config
+  );
+  if (!guardResult.ok) {
+    sendWebSocketErrorEvent(
+      downstreamSocket,
+      guardResult.statusCode,
+      guardResult.message
+    );
+    return undefined;
+  }
 
   return {
     payload: normalizedPayload,
     binary: false
   };
+}
+
+async function evaluateWebSocketResponseCreateGuards(
+  context: GatewaySocketContext,
+  payload: string,
+  config: GatewayConfig
+): Promise<{ ok: true } | { ok: false; statusCode: number; message: string }> {
+  const responseCreatePayload = parseResponseCreatePayload(payload);
+  if (!responseCreatePayload) {
+    return { ok: true };
+  }
+
+  const model = readStringField(responseCreatePayload.model);
+  const modelRestriction = evaluateApiKeyModelRestriction(context.request, model, {
+    provider: 'openai',
+    providerConfig: context.targetProviderConfig
+  });
+  if (!modelRestriction.ok) {
+    return {
+      ok: false,
+      statusCode: modelRestriction.statusCode,
+      message: modelRestriction.error
+    };
+  }
+
+  const precheck = await evaluateGatewayPrecheck({
+    request: context.request,
+    config,
+    targetProvider: 'openai',
+    targetProviderConfig: context.targetProviderConfig,
+    model,
+    requestBody: responseCreatePayload
+  });
+  if (!precheck.ok) {
+    return {
+      ok: false,
+      statusCode: precheck.statusCode,
+      message: precheck.message
+    };
+  }
+
+  return { ok: true };
+}
+
+function parseResponseCreatePayload(payload: string): Record<string, unknown> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return undefined;
+  }
+
+  return isRecord(parsed) && parsed.type === 'response.create'
+    ? parsed
+    : undefined;
+}
+
+function readStringField(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  return normalized || undefined;
 }
 
 function buildUpstreamHeaders(
@@ -844,6 +943,10 @@ function rawDataToUtf8String(rawData: RawData): string {
 }
 
 function sendInvalidRequestEvent(socket: WebSocket, message: string): void {
+  sendWebSocketErrorEvent(socket, 400, message);
+}
+
+function sendWebSocketErrorEvent(socket: WebSocket, status: number, message: string): void {
   if (socket.readyState !== WebSocket.OPEN) {
     return;
   }
@@ -851,9 +954,9 @@ function sendInvalidRequestEvent(socket: WebSocket, message: string): void {
   socket.send(
     JSON.stringify({
       type: 'error',
-      status: 400,
+      status,
       error: {
-        type: 'invalid_request_error',
+        type: status === 429 ? 'rate_limit_error' : 'invalid_request_error',
         message
       }
     })

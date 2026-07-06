@@ -379,6 +379,80 @@ describe('provider external source', () => {
       await app.close();
     }
   });
+
+  it('decrypts encrypted provider API keys from external provider payloads', async () => {
+    const encryptionKey = Buffer.from('abcdef0123456789abcdef0123456789', 'utf8');
+    const encryptedProviderKey = encryptCredentialForTest(
+      'openai-provider-key',
+      encryptionKey,
+      'v1'
+    );
+    const encryptedCredentialKey = encryptCredentialForTest(
+      'openai-credential-key',
+      encryptionKey,
+      'v1'
+    );
+    const config = parseGatewayConfigFromRaw({
+      Providers: [
+        {
+          name: 'openai-main',
+          type: 'openai_responses',
+          models: ['gpt-4.1-mini'],
+          apikey: 'old-openai-key'
+        }
+      ]
+    });
+    config.providerExternal = {
+      enabled: true,
+      transport: 'http',
+      endpoint: 'http://localhost:3001/gateway/providers',
+      timeoutMs: 5000,
+      apiKeyHeader: 'x-provider-external-key',
+      headers: {}
+    };
+
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          providers: [
+            {
+              name: 'openai-main',
+              type: 'openai_responses',
+              models: ['gpt-5.4'],
+              apikey: encryptedProviderKey,
+              credentials: [
+                {
+                  id: 'primary',
+                  apikey: encryptedCredentialKey,
+                  enabled: true
+                }
+              ]
+            }
+          ],
+          credentialEncryption: {
+            algorithm: 'aes-256-gcm',
+            keyVersion: 'v1',
+            key: encryptionKey.toString('base64')
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await hydrateProvidersFromExternalSource(config);
+
+    expect(config.providers[0]?.apikey).toBe('openai-provider-key');
+    expect(config.openaiApiKey).toBe('openai-provider-key');
+    expect(config.providers[0]?.credentials?.[0]?.apikey).toBe(
+      'openai-credential-key'
+    );
+  });
 });
 
 function encryptCredentialForTest(value: string, key: Buffer, keyVersion = 'v1'): string {

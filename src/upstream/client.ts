@@ -22,6 +22,11 @@ export interface UpstreamRetryOptions {
   retryStatusCodes?: number[];
 }
 
+export interface UpstreamRequestOptions {
+  method?: string;
+  bodyEncoding?: 'json' | 'text' | 'form' | 'bytes' | 'none';
+}
+
 interface NormalizedUpstreamRetryOptions {
   enabled: boolean;
   maxAttempts: number;
@@ -103,7 +108,8 @@ export async function callUpstream(
   timeoutMs: number,
   signal?: AbortSignal,
   logContext?: UpstreamCallLogContext,
-  retryOptions?: UpstreamRetryOptions
+  retryOptions?: UpstreamRetryOptions,
+  requestOptions?: UpstreamRequestOptions
 ): Promise<Response> {
   const retry = normalizeUpstreamRetryOptions(retryOptions);
   const shouldLog = Boolean(logContext?.logger);
@@ -159,10 +165,11 @@ export async function callUpstream(
       }
 
       try {
+        const method = normalizeUpstreamMethod(requestOptions?.method);
         const response = await fetch(url, {
-          method: 'POST',
+          method,
           headers,
-          body: JSON.stringify(body),
+          body: serializeUpstreamRequestBody(body, requestOptions?.bodyEncoding, method),
           signal: controller.signal
         });
 
@@ -307,6 +314,52 @@ export function forceEventStreamHeaders(reply: FastifyReply): void {
   reply.header('cache-control', 'no-cache, no-transform');
   reply.header('connection', 'keep-alive');
   reply.header('x-accel-buffering', 'no');
+}
+
+function normalizeUpstreamMethod(value: string | undefined): string {
+  const normalized = value?.trim().toUpperCase();
+  return normalized || 'POST';
+}
+
+function serializeUpstreamRequestBody(
+  body: unknown,
+  encoding: UpstreamRequestOptions['bodyEncoding'] = 'json',
+  method = 'POST'
+): RequestInit['body'] {
+  if (method === 'GET' || method === 'HEAD' || encoding === 'none') {
+    return undefined;
+  }
+
+  if (encoding === 'text') {
+    return typeof body === 'string' ? body : JSON.stringify(body ?? '');
+  }
+
+  if (encoding === 'form') {
+    if (typeof body === 'string') {
+      return body;
+    }
+
+    const params = new URLSearchParams();
+    if (isPlainObject(body)) {
+      for (const [key, value] of Object.entries(body)) {
+        if (value === undefined) {
+          continue;
+        }
+        params.set(key, typeof value === 'string' ? value : JSON.stringify(value));
+      }
+    }
+    return params;
+  }
+
+  if (encoding === 'bytes') {
+    return body as RequestInit['body'];
+  }
+
+  return JSON.stringify(body);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 export async function readUpstreamPayload(

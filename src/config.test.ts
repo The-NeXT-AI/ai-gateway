@@ -6,6 +6,13 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE;
     delete process.env.MCP_GATEWAY_WS_ENDPOINT;
     delete process.env.PRECHECK_STORAGE_TYPE;
+    delete process.env.PRECHECK_STORAGE_BACKEND;
+    delete process.env.PRECHECK_REDIS_URL;
+    delete process.env.PRECHECK_REDIS_KEY_PREFIX;
+    delete process.env.PRECHECK_REDIS_CONNECT_TIMEOUT_MS;
+    delete process.env.PRECHECK_REDIS_CONNECT_TIMEOUT_SECONDS;
+    delete process.env.PRECHECK_REDIS_COMMAND_TIMEOUT_MS;
+    delete process.env.PRECHECK_REDIS_COMMAND_TIMEOUT_SECONDS;
     delete process.env.GATEWAY_POLICY_ENABLED;
     delete process.env.GATEWAY_POLICY_ALLOW_PROVIDERS;
     delete process.env.GATEWAY_POLICY_DENY_MODELS;
@@ -210,6 +217,66 @@ describe('Gateway config providerPlugins', () => {
       'gemini_interactions',
       'gemini_interactions'
     ]);
+  });
+
+  it('parses unified gateway plugins and custom provider types', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'acme-main',
+          type: 'acme_messages',
+          baseUrl: 'https://api.acme.test',
+          models: ['acme-large']
+        }
+      ],
+      plugins: [
+        {
+          key: 'acme-inline',
+          match: {
+            provider: 'acme',
+            providerName: 'acme-main'
+          },
+          providerHooks: {
+            request: {
+              headers: {
+                'x-acme-feature': 'enabled'
+              },
+              bodySet: {
+                metadata: {
+                  gateway: 'next-ai'
+                }
+              }
+            },
+            response: {
+              bodySet: {
+                output_text: {
+                  from: 'upstreamPayload.result.text'
+                }
+              }
+            }
+          }
+        }
+      ]
+    });
+
+    expect(config.providers[0]).toMatchObject({
+      name: 'acme-main',
+      type: 'acme_messages',
+      baseurl: 'https://api.acme.test'
+    });
+    expect(config.defaultTargetProvider).toBe('acme');
+    expect(config.plugins?.[0]).toMatchObject({
+      key: 'acme-inline',
+      match: {
+        provider: 'acme',
+        providerName: 'acme-main'
+      }
+    });
+    expect(config.plugins?.[0]?.providerHooks[0]).toMatchObject({
+      key: 'acme-inline',
+      provider: 'acme',
+      providerName: 'acme-main'
+    });
   });
 
   it('keeps gateway scheduling disabled by default', () => {
@@ -1142,6 +1209,50 @@ describe('Gateway config providerPlugins', () => {
     });
     expect(config.precheck.storage).toMatchObject({
       type: 'memory'
+    });
+  });
+
+  it('parses Redis precheck storage from config and env overrides', () => {
+    const fromConfig = parseGatewayConfigFromRaw({
+      precheck: {
+        storage: {
+          type: 'redis',
+          url: 'redis://cache.local:6379/4',
+          keyPrefix: 'custom:precheck',
+          connectTimeoutSeconds: 2,
+          commandTimeoutMs: 1500
+        }
+      }
+    });
+
+    expect(fromConfig.precheck.storage).toEqual({
+      type: 'redis',
+      url: 'redis://cache.local:6379/4',
+      keyPrefix: 'custom:precheck',
+      connectTimeoutMs: 2000,
+      commandTimeoutMs: 1500
+    });
+
+    process.env.PRECHECK_STORAGE_TYPE = 'redis';
+    process.env.PRECHECK_REDIS_URL = 'rediss://secure-cache.local:6380/1';
+    process.env.PRECHECK_REDIS_KEY_PREFIX = 'env:precheck';
+    process.env.PRECHECK_REDIS_CONNECT_TIMEOUT_MS = '250';
+    process.env.PRECHECK_REDIS_COMMAND_TIMEOUT_SECONDS = '3';
+
+    const fromEnv = parseGatewayConfigFromRaw({
+      precheck: {
+        storage: {
+          type: 'memory'
+        }
+      }
+    });
+
+    expect(fromEnv.precheck.storage).toEqual({
+      type: 'redis',
+      url: 'rediss://secure-cache.local:6380/1',
+      keyPrefix: 'env:precheck',
+      connectTimeoutMs: 250,
+      commandTimeoutMs: 3000
     });
   });
 

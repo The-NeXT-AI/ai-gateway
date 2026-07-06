@@ -23,6 +23,8 @@ import {
 
 export const openAIResponsesTargetAdapter: TargetAdapter = {
   provider: 'openai',
+  providerTypes: ['openai_responses', 'openai_chat_completions'],
+  providerFallback: true,
   buildRequestFromStandard(input) {
     const headersResult = buildOpenAIHeaders(input.request.headers, {
       ...input.config,

@@ -105,7 +105,7 @@ export function syncProviderPluginsFromConfig(
   }
 
   const configuredNow = new Set<string>();
-  for (const pluginConfig of config.providerPlugins || []) {
+  for (const pluginConfig of collectConfiguredProviderPlugins(config)) {
     if (!pluginConfig.enabled) {
       continue;
     }
@@ -116,6 +116,31 @@ export function syncProviderPluginsFromConfig(
   }
 
   configuredPluginKeysStore.set(registry, configuredNow);
+}
+
+export function collectConfiguredProviderPlugins(config: GatewayConfig): ProviderPluginConfig[] {
+  const collected: ProviderPluginConfig[] = [...(config.providerPlugins || [])];
+  for (const gatewayPlugin of config.plugins || []) {
+    if (!gatewayPlugin.enabled) {
+      continue;
+    }
+
+    for (const hook of gatewayPlugin.providerHooks || []) {
+      if (!hook.enabled) {
+        continue;
+      }
+
+      collected.push({
+        ...hook,
+        key: `${gatewayPlugin.key}:${hook.key || 'provider-hook'}`,
+        enabled: true,
+        provider: hook.provider || gatewayPlugin.match?.provider,
+        providerName: hook.providerName || gatewayPlugin.match?.providerName
+      });
+    }
+  }
+
+  return collected;
 }
 
 export function updateDistributedCredentialEncryption(input?: {

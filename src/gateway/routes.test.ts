@@ -1126,6 +1126,172 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('does not fall back to the next provider when the status is not allowed for cross-provider fallback', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.startsWith('https://primary.example/v1/')) {
+        return new Response(JSON.stringify({ error: { message: 'bad request' } }), {
+          status: 400,
+          headers: {
+            'content-type': 'application/json'
+          }
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_backup_should_not_run',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'backup'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            total_tokens: 6
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const primary = createProviderConfig('openai-primary', 'openai_chat_completions', ['glm-5']);
+    primary.baseurl = 'https://primary.example/v1';
+    const backup = createProviderConfig('openai-backup', 'openai_chat_completions', ['glm-5']);
+    backup.baseurl = 'https://backup.example/v1';
+    const config = createConfig([primary, backup]);
+    config.scheduling.enabled = true;
+    config.scheduling.fallback = {
+      ...config.scheduling.fallback,
+      retryStatusCodes: [502],
+      crossProviderStatusCodes: [502]
+    };
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-providers': 'openai-primary,openai-backup'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.headers['x-gateway-fallback-used']).toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(response.body);
+      expect(body.error.attempts).toHaveLength(1);
+      expect(body.error.attempts[0]).toMatchObject({
+        provider_name: 'openai-primary',
+        stage: 'upstream_response',
+        status: 400
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('falls back to the next provider when the status is allowed for cross-provider fallback', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.startsWith('https://primary.example/v1/')) {
+        return new Response(JSON.stringify({ error: { message: 'bad gateway' } }), {
+          status: 502,
+          headers: {
+            'content-type': 'application/json'
+          }
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_backup',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'backup'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            total_tokens: 6
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const primary = createProviderConfig('openai-primary', 'openai_chat_completions', ['glm-5']);
+    primary.baseurl = 'https://primary.example/v1';
+    const backup = createProviderConfig('openai-backup', 'openai_chat_completions', ['glm-5']);
+    backup.baseurl = 'https://backup.example/v1';
+    const config = createConfig([primary, backup]);
+    config.scheduling.enabled = true;
+    config.scheduling.fallback = {
+      ...config.scheduling.fallback,
+      retryStatusCodes: [502],
+      crossProviderStatusCodes: [502]
+    };
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-providers': 'openai-primary,openai-backup'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['x-gateway-fallback-used']).toBe('true');
+      expect(response.headers['x-gateway-target-provider-name']).toBe('openai-backup');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('uses upstream cache usage to keep a short request on the same scheduled credential', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(

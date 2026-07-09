@@ -184,19 +184,46 @@ function collectAnthropicContentBlocks(response: StandardResponse): Array<Record
       continue;
     }
 
-    blocks.push({
+    if (item.thought_signature) {
+      attachAnthropicThinkingSignature(blocks, item.thought_signature);
+    }
+
+    const block: Record<string, unknown> = {
       type: 'tool_use',
       id: item.call_id || item.id,
       name: item.name,
       input: parseFunctionArguments(item.arguments)
-    });
+    };
+    blocks.push(block);
   }
 
   return blocks.length > 0 ? blocks : [{ type: 'text', text: '' }];
 }
 
+function attachAnthropicThinkingSignature(blocks: Array<Record<string, unknown>>, signature: string): void {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (block.type === 'thinking') {
+      block.signature = signature;
+      return;
+    }
+    if (block.type !== 'redacted_thinking') {
+      break;
+    }
+  }
+
+  blocks.push({
+    type: 'thinking',
+    thinking: '',
+    signature
+  });
+}
+
 function collectGeminiParts(response: StandardResponse): Array<Record<string, unknown>> {
   const parts: Array<Record<string, unknown>> = [];
+  let pendingThoughtSignature: string | undefined;
+  let pendingThoughtPart: Record<string, unknown> | undefined;
+
   for (const item of response.output) {
     if (item.type === 'message') {
       for (const content of item.content) {
@@ -212,14 +239,38 @@ function collectGeminiParts(response: StandardResponse): Array<Record<string, un
     }
 
     if (item.type === 'reasoning') {
+      const thoughtPart = formatGeminiThoughtPart(item);
+      if (thoughtPart) {
+        parts.push(thoughtPart);
+        pendingThoughtPart = thoughtPart;
+      }
+      pendingThoughtSignature = readReasoningThoughtSignature(item) || pendingThoughtSignature;
       continue;
     }
 
+    const functionCall: Record<string, unknown> = {
+      id: item.call_id || item.id,
+      name: item.name,
+      args: parseFunctionArguments(item.arguments)
+    };
+    const part: Record<string, unknown> = {
+      functionCall
+    };
+    const thoughtSignature = item.thought_signature || pendingThoughtSignature;
+    pendingThoughtSignature = undefined;
+    pendingThoughtPart = undefined;
+    if (thoughtSignature) {
+      part.thoughtSignature = thoughtSignature;
+    }
+    parts.push(part);
+  }
+
+  if (pendingThoughtSignature && pendingThoughtPart && pendingThoughtPart.thoughtSignature === undefined) {
+    pendingThoughtPart.thoughtSignature = pendingThoughtSignature;
+  } else if (pendingThoughtSignature) {
     parts.push({
-      functionCall: {
-        name: item.name,
-        args: parseFunctionArguments(item.arguments)
-      }
+      thought: true,
+      thoughtSignature: pendingThoughtSignature
     });
   }
 
@@ -308,6 +359,40 @@ function formatAnthropicThinkingBlocks(item: StandardResponseReasoning): Array<R
   }
 
   return blocks;
+}
+
+function formatGeminiThoughtPart(item: StandardResponseReasoning): Record<string, unknown> | undefined {
+  const text = collectGeminiReasoningText(item);
+  return text ? { text, thought: true } : undefined;
+}
+
+function collectGeminiReasoningText(item: StandardResponseReasoning): string {
+  const summary = item.summary.map((entry) => entry.text).filter(Boolean).join('\n').trim();
+  const text = collectReasoningText(item);
+  return [summary, text].filter(Boolean).join('\n').trim();
+}
+
+function readReasoningThoughtSignature(item: StandardResponseReasoning): string | undefined {
+  if (Array.isArray(item.reasoning_details)) {
+    for (const detail of item.reasoning_details) {
+      if (typeof detail !== 'object' || detail === null || Array.isArray(detail)) {
+        continue;
+      }
+
+      const record = detail as Record<string, unknown>;
+      const signature =
+        asOptionalString(record.signature) ||
+        asOptionalString(record.thoughtSignature) ||
+        asOptionalString(record.thought_signature) ||
+        asOptionalString(record.data) ||
+        asOptionalString(record.encrypted_content);
+      if (signature) {
+        return signature;
+      }
+    }
+  }
+
+  return item.encrypted_content;
 }
 
 function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Array<Record<string, unknown>> {

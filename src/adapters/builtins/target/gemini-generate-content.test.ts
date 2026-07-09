@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { StandardRequest } from '../../../types';
-import { formatAnthropicMessagesResponse } from '../source/formatters';
+import type { StandardRequest, StandardResponse } from '../../../types';
+import { formatAnthropicMessagesResponse, formatGeminiGenerateContentResponse } from '../source/formatters';
 import { parseAnthropicMessagesRequest, parseOpenAIResponsesRequest } from '../source/parsers';
 import { geminiGenerateContentTargetAdapter } from './gemini-generate-content';
 
@@ -232,7 +232,8 @@ describe('geminiGenerateContentTargetAdapter', () => {
           content: [
             {
               type: 'reasoning',
-              summary: 'Need weather data.'
+              summary: 'Need weather data.',
+              encrypted_content: 'interaction-thinking-signature'
             },
             {
               type: 'tool_use',
@@ -287,7 +288,8 @@ describe('geminiGenerateContentTargetAdapter', () => {
       },
       {
         type: 'thought',
-        summary: [{ type: 'text', text: 'Need weather data.' }]
+        summary: [{ type: 'text', text: 'Need weather data.' }],
+        signature: 'interaction-thinking-signature'
       },
       {
         type: 'function_call',
@@ -415,6 +417,131 @@ describe('geminiGenerateContentTargetAdapter', () => {
     expect(built.value.url).toBe('https://mock.local/v1beta/models/gemini-2.5-pro:generateContent?key=sk-test');
   });
 
+  it('maps request-level thinking controls into Gemini thinkingConfig', () => {
+    const anthropicParsed = parseAnthropicMessagesRequest({
+      model: 'gemini-2.5-pro',
+      max_tokens: 128,
+      thinking: {
+        type: 'enabled',
+        budget_tokens: 2048
+      },
+      messages: [
+        {
+          role: 'user',
+          content: 'Think before answering.'
+        }
+      ]
+    });
+
+    expect(anthropicParsed.ok).toBe(true);
+    if (!anthropicParsed.ok) {
+      return;
+    }
+
+    const anthropicBuilt = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-pro:generateContent'
+      } as never,
+      standardRequest: anthropicParsed.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(anthropicBuilt.ok).toBe(true);
+    if (!anthropicBuilt.ok) {
+      return;
+    }
+
+    expect((anthropicBuilt.value.body as Record<string, unknown>).generationConfig).toMatchObject({
+      maxOutputTokens: 128,
+      thinkingConfig: {
+        thinkingBudget: 2048,
+        includeThoughts: true
+      }
+    });
+
+    const openAIParsed = parseOpenAIResponsesRequest({
+      model: 'gemini-2.5-flash',
+      input: 'Think before answering.',
+      reasoning: {
+        effort: 'high'
+      }
+    });
+
+    expect(openAIParsed.ok).toBe(true);
+    if (!openAIParsed.ok) {
+      return;
+    }
+
+    const openAIBuilt = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-flash:generateContent'
+      } as never,
+      standardRequest: openAIParsed.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(openAIBuilt.ok).toBe(true);
+    if (!openAIBuilt.ok) {
+      return;
+    }
+
+    expect((openAIBuilt.value.body as Record<string, unknown>).generationConfig).toEqual({
+      thinkingConfig: {
+        includeThoughts: true
+      }
+    });
+
+    const disabledParsed = parseOpenAIResponsesRequest({
+      model: 'gemini-2.5-flash',
+      input: 'Answer directly.',
+      reasoning: {
+        effort: 'high'
+      },
+      thinking: {
+        type: 'disabled'
+      }
+    });
+
+    expect(disabledParsed.ok).toBe(true);
+    if (!disabledParsed.ok) {
+      return;
+    }
+
+    const disabledBuilt = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-flash:generateContent'
+      } as never,
+      standardRequest: disabledParsed.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(disabledBuilt.ok).toBe(true);
+    if (!disabledBuilt.ok) {
+      return;
+    }
+
+    expect((disabledBuilt.value.body as Record<string, unknown>).generationConfig).toEqual({
+      thinkingConfig: {
+        thinkingBudget: 0
+      }
+    });
+  });
+
   it('maps Anthropic thinking and tool calls into Gemini content parts', () => {
     const parsed = parseAnthropicMessagesRequest({
       model: 'gemini-2.5-pro',
@@ -451,6 +578,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
               type: 'tool_use',
               id: 'toolu_1',
               name: 'get_weather',
+              thought_signature: 'gemini-function-signature',
               input: {
                 city: 'Shanghai'
               }
@@ -507,7 +635,9 @@ describe('geminiGenerateContentTargetAdapter', () => {
             thought: true
           },
           {
+            thoughtSignature: 'gemini-function-signature',
             functionCall: {
+              id: 'toolu_1',
               name: 'get_weather',
               args: {
                 city: 'Shanghai'
@@ -521,6 +651,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
         parts: [
           {
             functionResponse: {
+              id: 'toolu_1',
               name: 'get_weather',
               response: {
                 content: 'Sunny, 28 C.'
@@ -549,6 +680,202 @@ describe('geminiGenerateContentTargetAdapter', () => {
         ]
       }
     ]);
+  });
+
+  it('maps encrypted reasoning-only history into Gemini thought signatures', () => {
+    const openAIParsed = parseOpenAIResponsesRequest({
+      model: 'gemini-2.5-pro',
+      input: [
+        {
+          type: 'reasoning',
+          encrypted_content: 'openai-encrypted-thinking'
+        },
+        {
+          type: 'function_call',
+          call_id: 'call_lookup',
+          name: 'lookup_value',
+          arguments: '{"key":"live"}'
+        }
+      ]
+    });
+
+    expect(openAIParsed.ok).toBe(true);
+    if (!openAIParsed.ok) {
+      return;
+    }
+
+    const openAIBuilt = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-pro:generateContent'
+      } as never,
+      standardRequest: openAIParsed.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(openAIBuilt.ok).toBe(true);
+    if (!openAIBuilt.ok) {
+      return;
+    }
+
+    expect((openAIBuilt.value.body as Record<string, unknown>).contents).toEqual([
+      {
+        role: 'model',
+        parts: [
+          {
+            thoughtSignature: 'openai-encrypted-thinking',
+            functionCall: {
+              id: 'call_lookup',
+              name: 'lookup_value',
+              args: {
+                key: 'live'
+              }
+            }
+          }
+        ]
+      }
+    ]);
+
+    const anthropicParsed = parseAnthropicMessagesRequest({
+      model: 'gemini-2.5-pro',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'redacted_thinking',
+              data: 'anthropic-redacted-thinking'
+            },
+            {
+              type: 'tool_use',
+              id: 'toolu_lookup',
+              name: 'lookup_value',
+              input: {
+                key: 'live'
+              }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(anthropicParsed.ok).toBe(true);
+    if (!anthropicParsed.ok) {
+      return;
+    }
+
+    const anthropicBuilt = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-pro:generateContent'
+      } as never,
+      standardRequest: anthropicParsed.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(anthropicBuilt.ok).toBe(true);
+    if (!anthropicBuilt.ok) {
+      return;
+    }
+
+    expect((anthropicBuilt.value.body as Record<string, unknown>).contents).toEqual([
+      {
+        role: 'model',
+        parts: [
+          {
+            thoughtSignature: 'anthropic-redacted-thinking',
+            functionCall: {
+              id: 'toolu_lookup',
+              name: 'lookup_value',
+              args: {
+                key: 'live'
+              }
+            }
+          }
+        ]
+      }
+    ]);
+  });
+
+  it('formats standard reasoning as Gemini thought parts', () => {
+    const response: StandardResponse = {
+      id: 'resp_reasoning',
+      object: 'response',
+      status: 'completed',
+      model: 'gemini-2.5-pro',
+      output_text: 'Visible answer.',
+      output: [
+        {
+          id: 'rs_1',
+          type: 'reasoning',
+          status: 'completed',
+          summary: [{ type: 'summary_text', text: 'Need a lookup.' }],
+          content: [{ type: 'reasoning_text', text: 'Call lookup before answering.' }],
+          encrypted_content: 'gemini-response-thinking-signature'
+        },
+        {
+          id: 'msg_1',
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text: 'Visible answer.', annotations: [] }]
+        },
+        {
+          id: 'call_lookup',
+          type: 'function_call',
+          call_id: 'call_lookup',
+          name: 'lookup_value',
+          arguments: '{"key":"live"}',
+          status: 'completed'
+        }
+      ],
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        total_tokens: 15
+      },
+      finish_reason: 'tool_use'
+    };
+
+    const payload = formatGeminiGenerateContentResponse(response);
+
+    expect(payload).toMatchObject({
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [
+              {
+                text: 'Need a lookup.\nCall lookup before answering.',
+                thought: true
+              },
+              {
+                text: 'Visible answer.'
+              },
+              {
+                thoughtSignature: 'gemini-response-thinking-signature',
+                functionCall: {
+                  id: 'call_lookup',
+                  name: 'lookup_value',
+                  args: {
+                    key: 'live'
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    });
   });
 
   it('parses Gemini Interaction responses into standard output, reasoning, tool calls, and usage', () => {
@@ -629,7 +956,9 @@ describe('geminiGenerateContentTargetAdapter', () => {
                 thought: true
               },
               {
+                thoughtSignature: 'gemini-function-signature',
                 functionCall: {
+                  id: 'toolu_sig',
                   name: 'get_weather',
                   args: {
                     city: 'Shanghai'
@@ -667,7 +996,10 @@ describe('geminiGenerateContentTargetAdapter', () => {
       }),
       expect.objectContaining({
         type: 'function_call',
+        id: 'toolu_sig',
+        call_id: 'toolu_sig',
         name: 'get_weather',
+        thought_signature: 'gemini-function-signature',
         arguments: '{"city":"Shanghai"}'
       })
     ]);
@@ -677,15 +1009,164 @@ describe('geminiGenerateContentTargetAdapter', () => {
     expect(anthropic.content).toEqual([
       {
         type: 'thinking',
-        thinking: 'Need to call the weather tool.'
+        thinking: 'Need to call the weather tool.',
+        signature: 'gemini-function-signature'
       },
       {
         type: 'tool_use',
-        id: expect.any(String),
+        id: 'toolu_sig',
         name: 'get_weather',
         input: {
           city: 'Shanghai'
         }
+      }
+    ]);
+  });
+
+  it('replays cached Gemini thought signatures when Anthropic follow-up omits the extension field', () => {
+    const request = {
+      headers: {
+        'x-api-key': 'profile-a'
+      },
+      url: '/v1beta/models/gemini-3.5-flash:generateContent'
+    } as never;
+    const config = {
+      geminiApiKey: 'sk-test',
+      geminiBaseUrl: 'https://mock.local',
+      geminiApiVersion: 'v1beta'
+    } as never;
+    const targetProviderConfig = {
+      name: 'google-main'
+    } as never;
+    const firstTurnRequest: StandardRequest = {
+      model: 'gemini-3.5-flash',
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Weather in Paris?' }] }]
+    };
+
+    const firstTurn = geminiGenerateContentTargetAdapter.toStandardResponse(
+      {
+        candidates: [
+          {
+            content: {
+              role: 'model',
+              parts: [
+                {
+                  thoughtSignature: 'cached-gemini-function-signature',
+                  functionCall: {
+                    id: 'cached_toolu_weather',
+                    name: 'get_weather',
+                    args: {
+                      city: 'Paris'
+                    }
+                  }
+                }
+              ]
+            },
+            finishReason: 'STOP'
+          }
+        ],
+        usageMetadata: {
+          promptTokenCount: 10,
+          candidatesTokenCount: 5,
+          totalTokenCount: 15
+        },
+        modelVersion: 'gemini-3.5-flash'
+      },
+      {
+        request,
+        standardRequest: firstTurnRequest,
+        config,
+        targetProviderConfig
+      }
+    );
+
+    expect(firstTurn.ok).toBe(true);
+    if (!firstTurn.ok) {
+      return;
+    }
+
+    const standardRequest: StandardRequest = {
+      model: 'gemini-3.5-flash',
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'Weather in Paris?' }]
+        },
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'cached_toolu_weather',
+              name: 'get_weather',
+              input: {
+                city: 'Paris'
+              }
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'cached_toolu_weather',
+              content: '18 C, partly cloudy'
+            }
+          ]
+        }
+      ]
+    };
+
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request,
+      standardRequest,
+      config,
+      targetProviderConfig
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.contents).toEqual([
+      {
+        role: 'user',
+        parts: [{ text: 'Weather in Paris?' }]
+      },
+      {
+        role: 'model',
+        parts: [
+          {
+            thoughtSignature: 'cached-gemini-function-signature',
+            functionCall: {
+              id: 'cached_toolu_weather',
+              name: 'get_weather',
+              args: {
+                city: 'Paris'
+              }
+            }
+          }
+        ]
+      },
+      {
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              id: 'cached_toolu_weather',
+              name: 'get_weather',
+              response: {
+                content: '18 C, partly cloudy'
+              }
+            }
+          }
+        ]
       }
     ]);
   });

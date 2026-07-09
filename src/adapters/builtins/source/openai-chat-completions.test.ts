@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { openAIChatCompletionsSourceAdapter } from './openai-chat-completions';
 
 describe('openAIChatCompletionsSourceAdapter', () => {
-  it('enables reasoning_split automatically for passthrough chat/completions requests', () => {
+  it('builds passthrough chat/completions requests without provider-specific fields', () => {
     const body = {
       model: 'MiniMax-M2.7',
       messages: [
@@ -37,9 +37,9 @@ describe('openAIChatCompletionsSourceAdapter', () => {
       url: 'https://mock.local/v1/chat/completions',
       body: {
         model: 'MiniMax-M2.7',
-        messages: body.messages,
-        reasoning_split: true
+        messages: body.messages
       }
     });
+    expect(built.value.body).not.toHaveProperty('reasoning_split');
   });
 });

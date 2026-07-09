@@ -1126,6 +1126,172 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('does not fall back to the next provider when the status is not allowed for cross-provider fallback', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.startsWith('https://primary.example/v1/')) {
+        return new Response(JSON.stringify({ error: { message: 'bad request' } }), {
+          status: 400,
+          headers: {
+            'content-type': 'application/json'
+          }
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_backup_should_not_run',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'backup'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            total_tokens: 6
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const primary = createProviderConfig('openai-primary', 'openai_chat_completions', ['glm-5']);
+    primary.baseurl = 'https://primary.example/v1';
+    const backup = createProviderConfig('openai-backup', 'openai_chat_completions', ['glm-5']);
+    backup.baseurl = 'https://backup.example/v1';
+    const config = createConfig([primary, backup]);
+    config.scheduling.enabled = true;
+    config.scheduling.fallback = {
+      ...config.scheduling.fallback,
+      retryStatusCodes: [502],
+      crossProviderStatusCodes: [502]
+    };
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-providers': 'openai-primary,openai-backup'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.headers['x-gateway-fallback-used']).toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(response.body);
+      expect(body.error.attempts).toHaveLength(1);
+      expect(body.error.attempts[0]).toMatchObject({
+        provider_name: 'openai-primary',
+        stage: 'upstream_response',
+        status: 400
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('falls back to the next provider when the status is allowed for cross-provider fallback', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.startsWith('https://primary.example/v1/')) {
+        return new Response(JSON.stringify({ error: { message: 'bad gateway' } }), {
+          status: 502,
+          headers: {
+            'content-type': 'application/json'
+          }
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_backup',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'backup'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            total_tokens: 6
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const primary = createProviderConfig('openai-primary', 'openai_chat_completions', ['glm-5']);
+    primary.baseurl = 'https://primary.example/v1';
+    const backup = createProviderConfig('openai-backup', 'openai_chat_completions', ['glm-5']);
+    backup.baseurl = 'https://backup.example/v1';
+    const config = createConfig([primary, backup]);
+    config.scheduling.enabled = true;
+    config.scheduling.fallback = {
+      ...config.scheduling.fallback,
+      retryStatusCodes: [502],
+      crossProviderStatusCodes: [502]
+    };
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-providers': 'openai-primary,openai-backup'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['x-gateway-fallback-used']).toBe('true');
+      expect(response.headers['x-gateway-target-provider-name']).toBe('openai-backup');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('uses upstream cache usage to keep a short request on the same scheduled credential', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(
@@ -1694,6 +1860,449 @@ describe('gateway routes protocol conversion', () => {
       const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.stream_options).toBeUndefined();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('adds reasoning_split only for Minimax passthrough chat/completions targets by default', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_minimax_reasoning_split',
+          object: 'chat.completion',
+          model: 'MiniMax-M2.7',
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: 'ok' },
+              finish_reason: 'stop'
+            }
+          ]
+        }),
+        { headers: { 'content-type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('Minimax', 'openai_chat_completions', ['MiniMax-M2.7']);
+    provider.baseurl = 'https://api.minimax.io/v1';
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, createConfig([provider]), createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'Minimax'
+        },
+        payload: {
+          model: 'MiniMax-M2.7',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.reasoning_split).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rewrites passthrough interleaved thinking history per OpenAI chat provider', async () => {
+    const cases = [
+      {
+        providerName: 'deepseek-main',
+        baseurl: 'https://api.deepseek.com',
+        expectedReasoningSplit: undefined,
+        expectedThinking: { type: 'enabled' },
+        expectedReasoningEffort: 'high',
+        preservesReasoningContent: true,
+        preservesReasoningDetails: true
+      },
+      {
+        providerName: 'zhipu-main',
+        baseurl: 'https://open.bigmodel.cn/api/paas/v4',
+        expectedReasoningSplit: undefined,
+        expectedThinking: { type: 'enabled' },
+        expectedReasoningEffort: 'medium',
+        preservesReasoningContent: false,
+        preservesReasoningDetails: false
+      },
+      {
+        providerName: 'xiaomi-mimo-main',
+        baseurl: 'https://api.xiaomimimo.com/v1',
+        expectedReasoningSplit: undefined,
+        expectedThinking: { type: 'enabled' },
+        expectedReasoningEffort: undefined,
+        preservesReasoningContent: true,
+        preservesReasoningDetails: false
+      },
+      {
+        providerName: 'minimax-main',
+        baseurl: 'https://api.minimax.io/v1',
+        expectedReasoningSplit: true,
+        expectedThinking: undefined,
+        expectedReasoningEffort: undefined,
+        preservesReasoningContent: true,
+        preservesReasoningDetails: true
+      }
+    ];
+
+    for (const testCase of cases) {
+      const fetchMock = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({
+            id: `chatcmpl_${testCase.providerName}`,
+            object: 'chat.completion',
+            model: 'interleaved-thinking-model',
+            choices: [
+              {
+                index: 0,
+                message: { role: 'assistant', content: 'ok' },
+                finish_reason: 'stop'
+              }
+            ]
+          }),
+          { headers: { 'content-type': 'application/json' } }
+        );
+      });
+      vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+      const provider = createProviderConfig(
+        testCase.providerName,
+        'openai_chat_completions',
+        ['interleaved-thinking-model']
+      );
+      provider.baseurl = testCase.baseurl;
+      const app = Fastify({ logger: false });
+      registerGatewayRoutes(app, createConfig([provider]), createGatewayRuntime());
+      await app.ready();
+
+      try {
+        const response = await app.inject({
+          method: 'POST',
+          url: '/v1/chat/completions',
+          headers: {
+            'content-type': 'application/json',
+            'x-target-provider': testCase.providerName
+          },
+          payload: {
+            model: 'interleaved-thinking-model',
+            messages: [
+              {
+                role: 'assistant',
+                content: '',
+                reasoning_content: 'Need to call the weather tool before answering.',
+                reasoning_details: [
+                  {
+                    type: 'reasoning.text',
+                    text: 'Need to call the weather tool before answering.'
+                  }
+                ],
+                tool_calls: [
+                  {
+                    id: 'call_weather',
+                    type: 'function',
+                    function: {
+                      name: 'get_weather',
+                      arguments: '{"city":"Shanghai"}'
+                    }
+                  }
+                ]
+              },
+              {
+                role: 'tool',
+                tool_call_id: 'call_weather',
+                content: '{"temperature":22}'
+              },
+              {
+                role: 'user',
+                content: 'continue'
+              }
+            ],
+            interleaved_thinking: true,
+            thinking: {
+              type: 'enabled'
+            },
+            output_config: {
+              effort: 'medium'
+            }
+          }
+        });
+
+        expect(response.statusCode).toBe(200);
+        const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+        const upstreamBody = JSON.parse(String(upstreamInit.body));
+        expect(upstreamBody.reasoning_split).toBe(testCase.expectedReasoningSplit);
+        expect(upstreamBody.interleaved_thinking).toBeUndefined();
+        expect(upstreamBody.interleavedThinking).toBeUndefined();
+        expect(upstreamBody.thinking).toEqual(testCase.expectedThinking);
+        expect(upstreamBody.reasoning_effort).toBe(testCase.expectedReasoningEffort);
+        expect(upstreamBody.output_config).toBeUndefined();
+        expect(upstreamBody.messages[0].tool_calls).toEqual([
+          {
+            id: 'call_weather',
+            type: 'function',
+            function: {
+              name: 'get_weather',
+              arguments: '{"city":"Shanghai"}'
+            }
+          }
+        ]);
+        expect(upstreamBody.messages[1]).toEqual({
+          role: 'tool',
+          tool_call_id: 'call_weather',
+          content: '{"temperature":22}'
+        });
+        expect(upstreamBody.messages[2]).toEqual({
+          role: 'user',
+          content: 'continue'
+        });
+
+        if (testCase.preservesReasoningContent) {
+          expect(upstreamBody.messages[0].reasoning_content).toBe(
+            'Need to call the weather tool before answering.'
+          );
+        } else {
+          expect(upstreamBody.messages[0].reasoning_content).toBeUndefined();
+        }
+
+        if (testCase.preservesReasoningDetails) {
+          expect(upstreamBody.messages[0].reasoning_details).toEqual([
+            {
+              type: 'reasoning.text',
+              text: 'Need to call the weather tool before answering.'
+            }
+          ]);
+        } else {
+          expect(upstreamBody.messages[0].reasoning_details).toBeUndefined();
+        }
+      } finally {
+        await app.close();
+      }
+    }
+  });
+
+  it('does not add reasoning_split for generic passthrough chat/completions targets by default', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_generic_reasoning_split',
+          object: 'chat.completion',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: 'ok' },
+              finish_reason: 'stop'
+            }
+          ]
+        }),
+        { headers: { 'content-type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.reasoning_split).toBeUndefined();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('normalizes passthrough interleaved_thinking aliases for generic chat/completions targets', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_generic_interleaved_alias',
+          object: 'chat.completion',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: 'ok' },
+              finish_reason: 'stop'
+            }
+          ]
+        }),
+        { headers: { 'content-type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }],
+          interleavedThinking: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.reasoning_split).toBe(true);
+      expect(upstreamBody.interleaved_thinking).toBeUndefined();
+      expect(upstreamBody.interleavedThinking).toBeUndefined();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('can strip reasoning_split for incompatible passthrough chat/completions targets', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_disabled_reasoning_split',
+          object: 'chat.completion',
+          model: 'legacy-chat',
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: 'ok' },
+              finish_reason: 'stop'
+            }
+          ]
+        }),
+        { headers: { 'content-type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('strict-chat', 'openai_chat_completions', ['legacy-chat']);
+    provider.openaiChatReasoningSplit = 'disabled';
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, createConfig([provider]), createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'strict-chat'
+        },
+        payload: {
+          model: 'legacy-chat',
+          messages: [
+            {
+              role: 'assistant',
+              content: 'visible',
+              reasoning_content: 'hidden',
+              reasoning_details: [{ type: 'reasoning.text', text: 'hidden' }]
+            },
+            { role: 'user', content: 'hello' }
+          ],
+          reasoning_split: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.reasoning_split).toBeUndefined();
+      expect(upstreamBody.messages[0].reasoning_content).toBeUndefined();
+      expect(upstreamBody.messages[0].reasoning_details).toBeUndefined();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('can strip thinking options for incompatible passthrough chat/completions targets', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_disabled_thinking_options',
+          object: 'chat.completion',
+          model: 'legacy-chat',
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: 'ok' },
+              finish_reason: 'stop'
+            }
+          ]
+        }),
+        { headers: { 'content-type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('strict-chat', 'openai_chat_completions', ['legacy-chat']);
+    provider.openaiChatThinkingOptions = 'disabled';
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, createConfig([provider]), createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'strict-chat'
+        },
+        payload: {
+          model: 'legacy-chat',
+          messages: [{ role: 'user', content: 'hello' }],
+          thinking: { type: 'enabled' },
+          output_config: { effort: 'high' },
+          reasoning_effort: 'high'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.thinking).toBeUndefined();
+      expect(upstreamBody.output_config).toBeUndefined();
+      expect(upstreamBody.reasoning_effort).toBeUndefined();
     } finally {
       await app.close();
     }
@@ -3482,6 +4091,285 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('emits Gemini generateContent thought signatures as streamed Anthropic thinking signatures', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [
+                  {
+                    thoughtSignature: 'gemini-function-signature',
+                    functionCall: {
+                      id: 'toolu_weather_stream',
+                      name: 'get_weather',
+                      args: {
+                        location: 'Paris'
+                      }
+                    }
+                  }
+                ]
+              },
+              finishReason: 'STOP'
+            }
+          ],
+          usageMetadata: {
+            promptTokenCount: 8,
+            candidatesTokenCount: 4,
+            totalTokenCount: 12
+          },
+          modelVersion: 'gemini-3.5-flash'
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_generate_content', ['gemini-3.5-flash'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'gemini-3.5-flash',
+          max_tokens: 128,
+          stream: true,
+          tools: [
+            {
+              name: 'get_weather',
+              description: 'Get the weather for a location',
+              input_schema: {
+                type: 'object',
+                properties: {
+                  location: { type: 'string' }
+                },
+                required: ['location']
+              }
+            }
+          ],
+          messages: [{ role: 'user', content: 'Weather in Paris?' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(response.body).toContain('"type":"thinking"');
+      expect(response.body).toContain('"type":"signature_delta","signature":"gemini-function-signature"');
+      expect(response.body).toContain('"type":"tool_use"');
+      expect(response.body).toContain('"id":"toolu_weather_stream"');
+      expect(response.body).not.toContain('"thought_signature":"gemini-function-signature"');
+      expect(response.body).toContain('"type":"input_json_delta","partial_json":"{\\"location\\":\\"Paris\\"}"');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('replays Gemini generateContent thought signatures on Anthropic tool-result follow-ups', async () => {
+    let upstreamCalls = 0;
+    const fetchMock = vi.fn(async () => {
+      upstreamCalls += 1;
+      if (upstreamCalls === 1) {
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [
+                    {
+                      thoughtSignature: 'gemini-function-signature',
+                      functionCall: {
+                        id: 'toolu_weather_followup',
+                        name: 'get_weather',
+                        args: {
+                          location: 'Paris'
+                        }
+                      }
+                    }
+                  ]
+                },
+                finishReason: 'STOP'
+              }
+            ],
+            usageMetadata: {
+              promptTokenCount: 8,
+              candidatesTokenCount: 4,
+              totalTokenCount: 12
+            },
+            modelVersion: 'gemini-3.5-flash'
+          }),
+          {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ text: '18 C, partly cloudy.' }]
+              },
+              finishReason: 'STOP'
+            }
+          ],
+          usageMetadata: {
+            promptTokenCount: 16,
+            candidatesTokenCount: 5,
+            totalTokenCount: 21
+          },
+          modelVersion: 'gemini-3.5-flash'
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_generate_content', ['gemini-3.5-flash'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const headers = {
+        'content-type': 'application/json',
+        'x-target-provider': 'google-main',
+        'anthropic-version': '2023-06-01',
+        'x-api-key': 'test-key'
+      };
+      const firstResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers,
+        payload: {
+          model: 'gemini-3.5-flash',
+          max_tokens: 128,
+          tools: [
+            {
+              name: 'get_weather',
+              description: 'Get the weather for a location',
+              input_schema: {
+                type: 'object',
+                properties: {
+                  location: { type: 'string' }
+                },
+                required: ['location']
+              }
+            }
+          ],
+          messages: [{ role: 'user', content: 'Weather in Paris?' }]
+        }
+      });
+
+      expect(firstResponse.statusCode).toBe(200);
+      expect(firstResponse.body).toContain('"type":"thinking"');
+      expect(firstResponse.body).toContain('"signature":"gemini-function-signature"');
+      expect(firstResponse.body).not.toContain('"thought_signature":"gemini-function-signature"');
+
+      const secondResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          ...headers,
+          'x-api-key': 'different-test-key'
+        },
+        payload: {
+          model: 'gemini-3.5-flash',
+          max_tokens: 128,
+          tools: [
+            {
+              name: 'get_weather',
+              description: 'Get the weather for a location',
+              input_schema: {
+                type: 'object',
+                properties: {
+                  location: { type: 'string' }
+                },
+                required: ['location']
+              }
+            }
+          ],
+          messages: [
+            { role: 'user', content: 'Weather in Paris?' },
+            {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'thinking',
+                  thinking: '',
+                  signature: 'gemini-function-signature'
+                },
+                {
+                  type: 'tool_use',
+                  id: 'toolu_weather_followup',
+                  name: 'get_weather',
+                  input: {
+                    location: 'Paris'
+                  }
+                }
+              ]
+            },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'toolu_weather_followup',
+                  content: '18 C, partly cloudy'
+                }
+              ]
+            }
+          ]
+        }
+      });
+
+      expect(secondResponse.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const [, secondUpstreamInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+      const secondUpstreamBody = JSON.parse(String(secondUpstreamInit.body));
+      expect(secondUpstreamBody.contents[1].parts[0]).toEqual({
+        thoughtSignature: 'gemini-function-signature',
+        functionCall: {
+          id: 'toolu_weather_followup',
+          name: 'get_weather',
+          args: {
+            location: 'Paris'
+          }
+        }
+      });
+      expect(secondUpstreamBody.contents[2].parts[0].functionResponse.id).toBe('toolu_weather_followup');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('streams Gemini Interactions thought summary deltas as Anthropic thinking blocks', async () => {
     const fetchMock = vi.fn(async () => {
       return createSseResponse([
@@ -4571,7 +5459,7 @@ describe('gateway routes protocol conversion', () => {
       const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.reasoning_effort).toBeUndefined();
-      expect(upstreamBody.output_config).toEqual({ effort: 'medium' });
+      expect(upstreamBody.output_config).toBeUndefined();
     } finally {
       await app.close();
     }

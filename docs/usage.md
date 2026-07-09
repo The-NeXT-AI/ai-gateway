@@ -240,7 +240,7 @@ docker compose up --build
 - 可通过 `GATEWAY_CONFIG_PATH` 指定 JSON 配置文件路径
 - 示例文件见 `gateway.config.example.json`
 - 推荐使用 `Providers` 数组配置供应商（数组顺序即默认 fallback 顺序）
-- `Providers` 单项字段：`name`、`type`、`apikey|apiKeyEnv`、`baseurl`、`models`、`openaiChatStreamUsage`、`extraHeaders`、`extraBody`、`billing`
+- `Providers` 单项字段：`name`、`type`、`apikey|apiKeyEnv`、`baseurl`、`models`、`openaiChatStreamUsage`、`openaiChatReasoningSplit`、`openaiChatThinkingOptions`、`extraHeaders`、`extraBody`、`billing`
 - `plugins` 是统一插件入口；可声明 `providerHooks`，也可通过 `modulePath` 加载本地模块插件注册 `targetAdapters` / `sourceAdapters` / `providerHooks`，详见 [Gateway Plugins](plugins.md)
 - `providerPlugins` 仍兼容旧配置；新配置建议迁移到 `plugins[].providerHooks`
 - `type` 同时用于声明 provider 类别和上游协议，支持：
@@ -250,6 +250,11 @@ docker compose up --build
   - 自定义协议：通过模块插件注册对应 `targetAdapters` 后，可使用形如 `acme_messages` 的自定义 provider type
 - `extraHeaders` / `extraBody` / `billing` 支持按模型配置（`default` + 指定模型名）
 - `openaiChatStreamUsage` 仅对 `openai_chat_completions` 生效，默认会在流式请求中添加 `stream_options.include_usage=true`；供应商不兼容时可设为 `false` 或 `disabled` 关闭。
+- `openaiChatReasoningSplit` 仅对 `openai_chat_completions` 生效，用于控制非官方兼容字段 `reasoning_split` 以及 message 级 `reasoning_content` / `reasoning_details`：默认 `auto` 只会对 Minimax、DeepSeek 等已知需要该字段的 provider/model 自动添加或保留；可设为 `true` / `enabled` 强制添加，或 `false` / `disabled` 强制移除。
+- `openaiChatThinkingOptions` 仅对 `openai_chat_completions` 生效，用于控制非官方兼容字段 `thinking` / `output_config`：默认 `auto` 只会对 Zhipu/BigModel 等已知需要该字段的 provider/model 自动添加；可设为 `true` / `enabled` 强制添加，或 `false` / `disabled` 强制移除。
+- `providerPlugins` 的 `auth/request/response` 支持声明式规则：`headers`、`query`、`bodySet`、`bodyMerge`、`bodyRemove`
+- `providerPlugins` 支持值引用：`{"from":"env.XXX"}`、`{"from":"request.headers.x-foo"}`、`{"from":"request.body.user.id"}`、`{"from":"upstreamPayload.data.id"}`、`{"from":"target.providerName"}`
+- `providerPlugins.codexOauth` 字段：`accessToken`、`refreshToken`、`tokenEndpoint`、`clientId`、`scope`、`refreshIfMissingAccessToken`、`forceRefresh`、`required`、`timeoutMs`、`authHeader`、`authScheme`
 - `plugins[].providerHooks` / `providerPlugins` 的 `auth/request/response` 支持声明式规则：`headers`、`query`、`bodySet`、`bodyMerge`、`bodyRemove`
 - `plugins[].providerHooks` / `providerPlugins` 支持值引用：`{"from":"env.XXX"}`、`{"from":"request.headers.x-foo"}`、`{"from":"request.body.user.id"}`、`{"from":"upstreamPayload.data.id"}`、`{"from":"target.providerName"}`
 - `plugins[].providerHooks.codexOauth` / `providerPlugins.codexOauth` 字段：`accessToken`、`refreshToken`、`tokenEndpoint`、`clientId`、`scope`、`refreshIfMissingAccessToken`、`forceRefresh`、`required`、`timeoutMs`、`authHeader`、`authScheme`

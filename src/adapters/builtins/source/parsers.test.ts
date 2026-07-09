@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   parseAnthropicMessagesRequest,
+  parseGeminiGenerateContentRequest,
   parseOpenAIChatCompletionsRequest,
   parseOpenAIResponsesRequest
 } from './parsers';
@@ -248,6 +249,7 @@ describe('parseAnthropicMessagesRequest', () => {
               type: 'tool_use',
               id: 'toolu_weather',
               name: 'get_weather',
+              thought_signature: 'gemini-function-signature',
               input: {
                 city: 'Shanghai'
               }
@@ -294,6 +296,7 @@ describe('parseAnthropicMessagesRequest', () => {
             type: 'tool_use',
             id: 'toolu_weather',
             name: 'get_weather',
+            thought_signature: 'gemini-function-signature',
             input: {
               city: 'Shanghai'
             }
@@ -312,6 +315,37 @@ describe('parseAnthropicMessagesRequest', () => {
         ]
       }
     ]);
+  });
+
+  it('keeps top-level thinking controls for protocol conversion', () => {
+    const result = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 128,
+      thinking: {
+        type: 'enabled'
+      },
+      output_config: {
+        effort: 'medium'
+      },
+      messages: [
+        {
+          role: 'user',
+          content: 'hello'
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value.thinking).toEqual({
+      type: 'enabled'
+    });
+    expect(result.value.output_config).toEqual({
+      effort: 'medium'
+    });
   });
 });
 
@@ -383,6 +417,28 @@ describe('parseOpenAIChatCompletionsRequest', () => {
         ]
       }
     ]);
+  });
+
+  it('keeps OpenAI-compatible reasoning_effort as standard reasoning effort', () => {
+    const result = parseOpenAIChatCompletionsRequest({
+      model: 'glm-5.2',
+      reasoning_effort: 'high',
+      messages: [
+        {
+          role: 'user',
+          content: 'hello'
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value.reasoning).toEqual({
+      effort: 'high'
+    });
   });
 
   it('parses tools, assistant tool_calls, and tool role messages into standard input', () => {
@@ -486,6 +542,118 @@ describe('parseOpenAIChatCompletionsRequest', () => {
             type: 'tool_result',
             tool_use_id: 'call_weather',
             content: '{"temperature":22}'
+          }
+        ]
+      }
+    ]);
+  });
+});
+
+describe('parseGeminiGenerateContentRequest', () => {
+  it('keeps thinking config and maps thought parts into standard reasoning content', () => {
+    const result = parseGeminiGenerateContentRequest(
+      {
+        generationConfig: {
+          thinkingConfig: {
+            thinkingBudget: 1024
+          }
+        },
+        contents: [
+          {
+            role: 'model',
+            parts: [
+              {
+                text: 'gemini interleaved thinking',
+                thought: true,
+                thoughtSignature: 'gemini-thought-signature'
+              },
+              {
+                functionCall: {
+                  id: 'call_lookup',
+                  name: 'lookup_value',
+                  args: {
+                    key: 'live'
+                  }
+                }
+              }
+            ]
+          },
+          {
+            role: 'user',
+            parts: [
+              {
+                functionResponse: {
+                  id: 'call_lookup',
+                  name: 'lookup_value',
+                  response: {
+                    content: '{"value":"live-ok"}'
+                  }
+                }
+              },
+              {
+                text: 'continue'
+              }
+            ]
+          }
+        ]
+      },
+      'gemini-test'
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value.thinking).toEqual({
+      type: 'enabled'
+    });
+    expect(result.value.input).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [
+          {
+            type: 'reasoning',
+            text: 'gemini interleaved thinking',
+            encrypted_content: 'gemini-thought-signature',
+            reasoning_details: [
+              {
+                type: 'reasoning.text',
+                text: 'gemini interleaved thinking',
+                format: 'google-generate-content-v1',
+                index: 0
+              },
+              {
+                type: 'reasoning.encrypted',
+                data: 'gemini-thought-signature',
+                format: 'google-generate-content-v1',
+                index: 0
+              }
+            ]
+          },
+          {
+            type: 'tool_use',
+            id: 'call_lookup',
+            name: 'lookup_value',
+            input: {
+              key: 'live'
+            }
+          }
+        ]
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'call_lookup',
+            content: '{"value":"live-ok"}'
+          },
+          {
+            type: 'input_text',
+            text: 'continue'
           }
         ]
       }

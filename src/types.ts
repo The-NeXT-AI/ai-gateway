@@ -93,6 +93,8 @@ export interface ProviderConfig {
   models: string[];
   openaiChatToolsFormat?: 'openai' | 'anthropic';
   openaiChatStreamUsage?: 'include_usage' | 'disabled';
+  openaiChatReasoningSplit?: 'auto' | 'enabled' | 'disabled';
+  openaiChatThinkingOptions?: 'auto' | 'enabled' | 'disabled';
   extraHeaders: ModelScopedHeadersConfig;
   extraBody: ModelScopedBodyConfig;
   billing: ModelScopedBillingConfig;
@@ -833,6 +835,7 @@ export interface StandardResponseFunctionCall {
   name: string;
   namespace?: string;
   arguments: string;
+  thought_signature?: string;
   status: 'completed';
 }
 
@@ -897,6 +900,7 @@ export type StandardRequestInputContent =
       id: string;
       name: string;
       input: unknown;
+      thought_signature?: string;
     }
   | {
       type: 'tool_result';
@@ -1016,13 +1020,20 @@ export interface TargetAdapterRequestInput {
   targetProviderConfig?: ProviderConfig;
 }
 
+export interface TargetAdapterResponseInput {
+  request: FastifyRequest;
+  standardRequest: StandardRequest;
+  config: GatewayConfig;
+  targetProviderConfig?: ProviderConfig;
+}
+
 export interface TargetAdapter {
   key?: string;
   provider: Provider;
   providerTypes?: ProviderType[];
   providerFallback?: boolean;
   buildRequestFromStandard(input: TargetAdapterRequestInput): Result<UpstreamRequest>;
-  toStandardResponse(payload: unknown): Result<StandardResponse>;
+  toStandardResponse(payload: unknown, input?: TargetAdapterResponseInput): Result<StandardResponse>;
 }
 
 export interface ProviderPluginContext {

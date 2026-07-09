@@ -42,7 +42,7 @@ export function parseOpenAIResponsesRequest(body: Record<string, unknown>): Resu
     tools: readTools(body.tools),
     tool_choice: readToolChoice(body.tool_choice),
     reasoning_split: readReasoningSplitOption(body),
-    reasoning: readOptionalRequestOption(body.reasoning),
+    reasoning: readReasoningOption(body),
     thinking: readOptionalRequestOption(body.thinking),
     output_config: readOptionalRequestOption(body.output_config)
   });
@@ -103,7 +103,7 @@ export function parseOpenAIChatCompletionsRequest(body: Record<string, unknown>)
     tools: readTools(body.tools),
     tool_choice: readToolChoice(body.tool_choice),
     reasoning_split: readReasoningSplitOption(body),
-    reasoning: readOptionalRequestOption(body.reasoning),
+    reasoning: readReasoningOption(body),
     thinking: readOptionalRequestOption(body.thinking),
     output_config: readOptionalRequestOption(body.output_config)
   });
@@ -147,7 +147,11 @@ export function parseAnthropicMessagesRequest(body: Record<string, unknown>): Re
     stop: asStop(body.stop_sequences),
     stream: asBoolean(body.stream),
     tools: readTools(body.tools),
-    tool_choice: readToolChoice(body.tool_choice)
+    tool_choice: readToolChoice(body.tool_choice),
+    reasoning_split: readReasoningSplitOption(body),
+    reasoning: readReasoningOption(body),
+    thinking: readOptionalRequestOption(body.thinking),
+    output_config: readOptionalRequestOption(body.output_config)
   });
 }
 
@@ -193,6 +197,7 @@ export function parseGeminiGenerateContentRequest(
       : undefined;
   const tools = readGeminiTools(body.tools) || readTools(body.tools);
   const toolChoice = readGeminiToolChoice(toolConfig) ?? readToolChoice(body.tool_choice);
+  const thinking = readGeminiThinkingOption(generationConfig?.thinkingConfig ?? generationConfig?.thinking_config);
 
   return ok({
     model: modelFromPath || asString(body.model),
@@ -204,7 +209,8 @@ export function parseGeminiGenerateContentRequest(
     stop: asStop(generationConfig?.stopSequences),
     stream: asBoolean(body.stream),
     tools,
-    tool_choice: toolChoice
+    tool_choice: toolChoice,
+    thinking
   });
 }
 
@@ -1257,12 +1263,17 @@ function extractAnthropicMessageContent(
         continue;
       }
 
-      normalized.push({
+      const toolUse: StandardRequestInputContent = {
         type: 'tool_use',
         id,
         name,
         input: block.input ?? {}
-      });
+      };
+      const thoughtSignature = readThoughtSignature(block);
+      if (thoughtSignature) {
+        toolUse.thought_signature = thoughtSignature;
+      }
+      normalized.push(toolUse);
       continue;
     }
 
@@ -1306,26 +1317,31 @@ function normalizeAnthropicThinkingBlock(
   const blockType = asString(block.type);
   if (blockType === 'thinking') {
     const thinking = asString(block.thinking) || asString(block.text);
-    if (!thinking) {
+    const signature = asString(block.signature);
+    if (!thinking && !signature) {
       return null;
     }
 
     const detail: Record<string, unknown> = {
       type: 'reasoning.text',
-      text: thinking,
       format: 'anthropic-claude-v1',
       index
     };
-    const signature = asString(block.signature);
+    if (thinking) {
+      detail.text = thinking;
+    }
     if (signature) {
       detail.signature = signature;
     }
 
-    return {
+    const reasoning: StandardRequestInputContent = {
       type: 'reasoning',
-      text: thinking,
       reasoning_details: [detail]
     };
+    if (thinking) {
+      reasoning.text = thinking;
+    }
+    return reasoning;
   }
 
   if (blockType === 'redacted_thinking') {
@@ -1446,12 +1462,17 @@ function extractGeminiMessageContent(
         asString(functionCall.call_id) ||
         asString(functionCall.callId) ||
         `gemini_tool_${messageIndex}_${partIndex}`;
-      normalized.push({
+      const toolUse: StandardRequestInputContent = {
         type: 'tool_use',
         id,
         name,
         input: normalizeGeminiFunctionCallArguments(functionCall.args ?? functionCall.arguments)
-      });
+      };
+      const thoughtSignature = readGeminiThoughtSignature(part, functionCall);
+      if (thoughtSignature) {
+        toolUse.thought_signature = thoughtSignature;
+      }
+      normalized.push(toolUse);
       trackGeminiToolUseId(state, name, id);
       continue;
     }
@@ -1493,6 +1514,12 @@ function extractGeminiMessageContent(
       continue;
     }
 
+    const thought = normalizeGeminiThoughtPart(part, role, partIndex);
+    if (thought) {
+      normalized.push(thought);
+      continue;
+    }
+
     const text = extractTextFromPart(part);
     if (text) {
       normalized.push({
@@ -1503,6 +1530,57 @@ function extractGeminiMessageContent(
   }
 
   return normalized;
+}
+
+function normalizeGeminiThoughtPart(
+  part: Record<string, unknown>,
+  role: 'user' | 'assistant',
+  index: number
+): StandardRequestInputContent | null {
+  if (role !== 'assistant' || asBoolean(part.thought) !== true) {
+    return null;
+  }
+
+  const text = asString(part.text) || asString(part.thoughtText) || asString(part.thought_text);
+  const thoughtSignature = readThoughtSignature(part);
+  if (!text && !thoughtSignature) {
+    return null;
+  }
+
+  const reasoning: StandardRequestInputContent = {
+    type: 'reasoning',
+    reasoning_details: [
+      ...(text
+        ? [
+            {
+              type: 'reasoning.text',
+              text,
+              format: 'google-generate-content-v1',
+              index
+            }
+          ]
+        : []),
+      ...(thoughtSignature
+        ? [
+            {
+              type: 'reasoning.encrypted',
+              data: thoughtSignature,
+              format: 'google-generate-content-v1',
+              index
+            }
+          ]
+        : [])
+    ]
+  };
+
+  if (text) {
+    reasoning.text = text;
+  }
+  if (thoughtSignature) {
+    reasoning.encrypted_content = thoughtSignature;
+  }
+
+  return reasoning;
 }
 
 function readGeminiFunctionCall(part: Record<string, unknown>): Record<string, unknown> | undefined {
@@ -1527,6 +1605,33 @@ function readGeminiFunctionResponse(part: Record<string, unknown>): Record<strin
   }
 
   return undefined;
+}
+
+function readGeminiThoughtSignature(
+  part: Record<string, unknown>,
+  functionCall?: Record<string, unknown>
+): string | undefined {
+  return (
+    readThoughtSignature(part) ||
+    (functionCall ? readThoughtSignature(functionCall) : undefined)
+  );
+}
+
+function readGeminiThinkingOption(value: unknown): Record<string, string> | undefined {
+  if (!isObject(value)) {
+    return undefined;
+  }
+
+  const budget = asNumber(value.thinkingBudget) ?? asNumber(value.thinking_budget);
+  if (budget === 0 || asBoolean(value.enabled) === false) {
+    return { type: 'disabled' };
+  }
+
+  return { type: 'enabled' };
+}
+
+function readThoughtSignature(value: Record<string, unknown>): string | undefined {
+  return asString(value.thoughtSignature) || asString(value.thought_signature);
 }
 
 function normalizeGeminiFunctionCallArguments(value: unknown): unknown {
@@ -1808,6 +1913,23 @@ function readReasoningSplitOption(body: Record<string, unknown>): boolean | unde
 
 function readOptionalRequestOption(value: unknown): unknown | undefined {
   return value === undefined ? undefined : value;
+}
+
+function readReasoningOption(body: Record<string, unknown>): unknown {
+  const reasoning = readOptionalRequestOption(body.reasoning);
+  const effort = asString(body.reasoning_effort);
+  if (effort === undefined) {
+    return reasoning;
+  }
+
+  if (isObject(reasoning) && !Object.prototype.hasOwnProperty.call(reasoning, 'effort')) {
+    return {
+      ...reasoning,
+      effort
+    };
+  }
+
+  return reasoning ?? { effort };
 }
 
 function readRecordOption(value: unknown): Record<string, unknown> | undefined {

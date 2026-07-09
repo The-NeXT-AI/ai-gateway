@@ -60,7 +60,10 @@ import {
   addNamespaceFieldsToStandardResponse,
   isHostedWebSearchTool
 } from '../adapters/builtins/target/tools';
-import { applyOpenAIChatStreamUsageOption } from '../adapters/builtins/target/shared';
+import {
+  applyOpenAIChatStreamUsageOption,
+  rewriteOpenAIChatCompatibleRequest
+} from '../adapters/builtins/target/shared';
 import type { GatewayRuntime } from './runtime';
 import { applyHealthAwareRouting } from './health-routing';
 import { evaluateGatewayPolicy, type GatewayPolicyResult } from './policy';
@@ -331,7 +334,7 @@ export async function handleGatewayRequest(
     return result;
   };
 
-  for (const target of targetProviders) {
+  for (const [targetIndex, target] of targetProviders.entries()) {
     if (clientAbortSignal.aborted) {
       return;
     }
@@ -494,6 +497,9 @@ export async function handleGatewayRequest(
             targetProviderConfig,
           );
         }
+        if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+          break;
+        }
         continue;
       }
 
@@ -534,6 +540,9 @@ export async function handleGatewayRequest(
           attempts,
           targetProviderConfig,
         );
+        if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+          break;
+        }
         continue;
       }
 
@@ -587,6 +596,9 @@ export async function handleGatewayRequest(
                 attempts,
                 targetProviderConfig,
               );
+              if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+                break;
+              }
               continue;
             }
 
@@ -833,6 +845,9 @@ export async function handleGatewayRequest(
             targetProviderConfig,
           );
         }
+        if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+          break;
+        }
         continue;
       }
 
@@ -873,6 +888,9 @@ export async function handleGatewayRequest(
           attempts,
           targetProviderConfig,
         );
+        if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+          break;
+        }
         continue;
       }
 
@@ -957,6 +975,9 @@ export async function handleGatewayRequest(
           attempts,
           targetProviderConfig,
         );
+        if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+          break;
+        }
         continue;
       }
 
@@ -966,7 +987,12 @@ export async function handleGatewayRequest(
         targetProvider,
         transformedPayload
       );
-      const standardResponseResult = targetAdapter.toStandardResponse(standardPayload);
+      const standardResponseResult = targetAdapter.toStandardResponse(standardPayload, {
+        request,
+        standardRequest,
+        config,
+        targetProviderConfig
+      });
       if (!standardResponseResult.ok) {
         const attempt: ProviderAttemptFailure = {
           provider: targetProvider,
@@ -991,6 +1017,9 @@ export async function handleGatewayRequest(
           attempts,
           targetProviderConfig,
         );
+        if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+          break;
+        }
         continue;
       }
 
@@ -1178,6 +1207,9 @@ export async function handleGatewayRequest(
           targetProviderConfig,
         );
       }
+      if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+        break;
+      }
       continue;
     }
 
@@ -1219,6 +1251,9 @@ export async function handleGatewayRequest(
         attempts,
         targetProviderConfig,
       );
+      if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+        break;
+      }
       continue;
     }
 
@@ -1252,6 +1287,9 @@ export async function handleGatewayRequest(
         attempts,
         targetProviderConfig,
       );
+      if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+        break;
+      }
       continue;
     }
 
@@ -1261,7 +1299,12 @@ export async function handleGatewayRequest(
       targetProvider,
       transformedPayload
     );
-    const standardResponseResult = targetAdapter.toStandardResponse(standardPayload);
+    const standardResponseResult = targetAdapter.toStandardResponse(standardPayload, {
+      request,
+      standardRequest,
+      config,
+      targetProviderConfig
+    });
     if (!standardResponseResult.ok) {
       const attempt: ProviderAttemptFailure = {
         provider: targetProvider,
@@ -1286,6 +1329,9 @@ export async function handleGatewayRequest(
         attempts,
         targetProviderConfig,
       );
+      if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+        break;
+      }
       continue;
     }
 
@@ -1313,6 +1359,9 @@ export async function handleGatewayRequest(
     });
     upstreamAttemptSequence = transparentToolExecutionResult.upstreamAttemptSequence;
     if (!transparentToolExecutionResult.ok) {
+      if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempts[attempts.length - 1])) {
+        break;
+      }
       continue;
     }
 
@@ -1704,7 +1753,12 @@ async function runTransparentToolExecutionLoop(input: {
       input.targetProvider,
       transformedPayload
     );
-    const standardResponseResult = input.targetAdapter.toStandardResponse(standardPayload);
+    const standardResponseResult = input.targetAdapter.toStandardResponse(standardPayload, {
+      request: input.request,
+      standardRequest: workingRequest,
+      config: input.config,
+      targetProviderConfig: input.targetProviderConfig
+    });
     if (!standardResponseResult.ok) {
       const attempt: ProviderAttemptFailure = {
         provider: input.targetProvider,
@@ -1889,7 +1943,7 @@ async function handleVirtualModelRequest(
     return result;
   };
 
-  for (const target of targetProviders) {
+  for (const [targetIndex, target] of targetProviders.entries()) {
     if (clientAbortSignal?.aborted) {
       return;
     }
@@ -2233,7 +2287,12 @@ async function handleVirtualModelRequest(
         targetProvider,
         transformedPayload
       );
-      const standardResponseResult = targetAdapter.toStandardResponse(standardPayload);
+      const standardResponseResult = targetAdapter.toStandardResponse(standardPayload, {
+        request,
+        standardRequest: workingRequest,
+        config,
+        targetProviderConfig
+      });
       if (!standardResponseResult.ok) {
         loopExhausted = false;
         const attempt: ProviderAttemptFailure = {
@@ -2360,6 +2419,9 @@ async function handleVirtualModelRequest(
         upstreamRequest: lastUpstreamRequest,
         upstreamResponseBody: lastResponse
       });
+    }
+    if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempts[attempts.length - 1])) {
+      break;
     }
   }
 
@@ -3514,7 +3576,12 @@ async function* runOptimisticVirtualModelStream(input: {
         input.targetProvider,
         upstreamPayload
       );
-      const standardResponseResult = input.targetAdapter.toStandardResponse(standardPayload);
+      const standardResponseResult = input.targetAdapter.toStandardResponse(standardPayload, {
+        request: input.request,
+        standardRequest: workingRequest,
+        config: input.config,
+        targetProviderConfig: input.targetProviderConfig
+      });
       if (!standardResponseResult.ok) {
         yield* buildOptimisticVirtualModelStreamErrorFrames(input.source, standardResponseResult.error);
         return;
@@ -5004,6 +5071,57 @@ function buildApiKeyModelRestrictionAttempt(
   };
 }
 
+function shouldTryNextTargetAfterFailure(
+  config: GatewayConfig,
+  targets: TargetProviderRoute[],
+  currentIndex: number,
+  attempt: ProviderAttemptFailure | undefined
+): boolean {
+  const nextTarget = targets[currentIndex + 1];
+  if (!nextTarget) {
+    return false;
+  }
+
+  const scheduling = config.scheduling;
+  if (!scheduling?.enabled) {
+    return true;
+  }
+
+  if (scheduling.fallback.mode === 'off') {
+    return false;
+  }
+
+  const status = attempt?.status;
+  if (typeof status !== 'number') {
+    return false;
+  }
+
+  const currentTarget = targets[currentIndex];
+  const statusCodes = haveSameFallbackProvider(config, currentTarget, nextTarget)
+    ? scheduling.fallback.retryStatusCodes
+    : scheduling.fallback.crossProviderStatusCodes;
+
+  return statusCodes.includes(status);
+}
+
+function haveSameFallbackProvider(
+  config: GatewayConfig,
+  left: TargetProviderRoute | undefined,
+  right: TargetProviderRoute
+): boolean {
+  if (!left) {
+    return false;
+  }
+
+  return fallbackProviderKey(config, left) === fallbackProviderKey(config, right);
+}
+
+function fallbackProviderKey(config: GatewayConfig, target: TargetProviderRoute): string {
+  const providerConfig = resolveProviderConfig(config, target);
+  const providerName = providerConfig?.credentialSourceProviderName || providerConfig?.name;
+  return providerName ? `name:${providerName}` : `type:${target.provider}`;
+}
+
 function buildFallbackErrorPayload(
   providers: TargetProviderRoute[],
   attempts: ProviderAttemptFailure[],
@@ -6448,6 +6566,7 @@ function applyProviderRequestOverrides(
   if (hasBodyOverride && isPlainObject(body)) {
     body = mergeJsonObjects(body, extraBody);
   }
+  body = rewriteOpenAIChatCompatibleRequest(body, providerConfig);
 
   return {
     url,

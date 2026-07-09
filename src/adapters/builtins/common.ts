@@ -73,6 +73,11 @@ export function buildAnthropicHeaders(
     mapped['anthropic-beta'] = beta;
   }
 
+  const userAgent = readHeader(headers['user-agent']);
+  if (userAgent) {
+    mapped['user-agent'] = userAgent;
+  }
+
   return ok(mapped);
 }
 

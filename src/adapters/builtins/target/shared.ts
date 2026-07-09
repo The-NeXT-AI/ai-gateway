@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type {
   Result,
   ProviderConfig,
+  StandardRequest,
   StandardResponse,
   StandardResponseFunctionCall,
   StandardResponseReasoning,
@@ -10,6 +11,250 @@ import type {
 } from '../../../types';
 import { err, ok } from '../../../types';
 import { asBoolean, asNumber, asString, extractTextFromPart, isObject } from '../../../utils';
+import { resolveOpenAIChatProviderThinkingAdapter } from './openai-chat-compat';
+
+interface OpenAIChatCompatibleRewriteOptions {
+  generatedReasoningMessageFields?: boolean;
+  standardRequest?: StandardRequest;
+}
+
+export function rewriteOpenAIChatCompatibleRequest(
+  body: unknown,
+  targetProviderConfig?: ProviderConfig,
+  options: OpenAIChatCompatibleRewriteOptions = {}
+): unknown {
+  if (!isObject(body) || targetProviderConfig?.type !== 'openai_chat_completions') {
+    return body;
+  }
+
+  let nextBody: Record<string, unknown> = { ...body };
+  const model = options.standardRequest?.model || asString(nextBody.model);
+  const adapter = resolveOpenAIChatProviderThinkingAdapter(targetProviderConfig, model);
+
+  if (adapter) {
+    adapter.rewriteRequest({
+      body: nextBody,
+      standardRequest: options.standardRequest,
+      providerConfig: targetProviderConfig,
+      model
+    });
+  } else {
+    nextBody = rewriteGenericOpenAIChatCompatibleRequest(nextBody, targetProviderConfig, options);
+  }
+
+  if (shouldStripOpenAIChatThinkingOptions(targetProviderConfig)) {
+    nextBody = omitOpenAIChatThinkingOptionsFields(nextBody);
+  }
+
+  if (shouldStripOpenAIChatReasoningSplit(targetProviderConfig)) {
+    nextBody = omitOpenAIChatReasoningSplitFields(nextBody);
+  }
+
+  return nextBody;
+}
+
+function rewriteGenericOpenAIChatCompatibleRequest(
+  body: Record<string, unknown>,
+  targetProviderConfig: ProviderConfig,
+  options: OpenAIChatCompatibleRewriteOptions
+): Record<string, unknown> {
+  let nextBody = body;
+  const reasoningSplitMode = targetProviderConfig.openaiChatReasoningSplit ?? 'auto';
+  const thinkingOptionsMode = targetProviderConfig.openaiChatThinkingOptions ?? 'auto';
+  const requestedReasoningSplit = Boolean(
+    options.standardRequest?.reasoning_split ?? readOpenAIChatReasoningSplitOption(nextBody)
+  );
+
+  if (reasoningSplitMode === 'enabled' || requestedReasoningSplit) {
+    nextBody = {
+      ...nextBody,
+      reasoning_split: true
+    };
+    nextBody = omitOpenAIChatReasoningSplitAliases(nextBody);
+  } else if (options.generatedReasoningMessageFields) {
+    nextBody = omitOpenAIChatMessageReasoningFieldsFromBody(nextBody);
+  } else {
+    nextBody = omitOpenAIChatReasoningSplitAliases(nextBody);
+  }
+
+  if (thinkingOptionsMode === 'enabled' && options.standardRequest) {
+    nextBody = applyGenericOpenAIChatThinkingOptions(nextBody, options.standardRequest);
+  }
+
+  return nextBody;
+}
+
+function shouldStripOpenAIChatReasoningSplit(targetProviderConfig?: ProviderConfig): boolean {
+  return (
+    targetProviderConfig?.type === 'openai_chat_completions' &&
+    targetProviderConfig.openaiChatReasoningSplit === 'disabled'
+  );
+}
+
+function shouldStripOpenAIChatThinkingOptions(targetProviderConfig?: ProviderConfig): boolean {
+  return (
+    targetProviderConfig?.type === 'openai_chat_completions' &&
+    targetProviderConfig.openaiChatThinkingOptions === 'disabled'
+  );
+}
+
+function omitOpenAIChatReasoningSplitFields(body: Record<string, unknown>): Record<string, unknown> {
+  const strippedMessages = omitOpenAIChatMessageReasoningFields(body.messages);
+  if (
+    !Object.prototype.hasOwnProperty.call(body, 'reasoning_split') &&
+    !Object.prototype.hasOwnProperty.call(body, 'interleaved_thinking') &&
+    !Object.prototype.hasOwnProperty.call(body, 'interleavedThinking') &&
+    strippedMessages === body.messages
+  ) {
+    return body;
+  }
+
+  const rest = { ...body };
+  delete rest.reasoning_split;
+  delete rest.interleaved_thinking;
+  delete rest.interleavedThinking;
+  if (strippedMessages !== body.messages) {
+    rest.messages = strippedMessages;
+  }
+  return rest;
+}
+
+function readOpenAIChatReasoningSplitOption(body: Record<string, unknown>): boolean | undefined {
+  return (
+    asBoolean(body.reasoning_split) ??
+    asBoolean(body.interleaved_thinking) ??
+    asBoolean(body.interleavedThinking)
+  );
+}
+
+function omitOpenAIChatReasoningSplitAliases(body: Record<string, unknown>): Record<string, unknown> {
+  if (
+    !Object.prototype.hasOwnProperty.call(body, 'interleaved_thinking') &&
+    !Object.prototype.hasOwnProperty.call(body, 'interleavedThinking')
+  ) {
+    return body;
+  }
+
+  const rest = { ...body };
+  delete rest.interleaved_thinking;
+  delete rest.interleavedThinking;
+  return rest;
+}
+
+function omitOpenAIChatMessageReasoningFieldsFromBody(
+  body: Record<string, unknown>
+): Record<string, unknown> {
+  const strippedMessages = omitOpenAIChatMessageReasoningFields(body.messages);
+  if (strippedMessages === body.messages) {
+    return body;
+  }
+
+  return {
+    ...body,
+    messages: strippedMessages
+  };
+}
+
+function omitOpenAIChatMessageReasoningFields(messages: unknown): unknown {
+  if (!Array.isArray(messages)) {
+    return messages;
+  }
+
+  let changed = false;
+  const nextMessages = messages.map((message) => {
+    if (
+      !isObject(message) ||
+      (
+        !Object.prototype.hasOwnProperty.call(message, 'reasoning_content') &&
+        !Object.prototype.hasOwnProperty.call(message, 'reasoning_details') &&
+        !Object.prototype.hasOwnProperty.call(message, 'reasoning') &&
+        !Object.prototype.hasOwnProperty.call(message, 'thinking')
+      )
+    ) {
+      return message;
+    }
+
+    changed = true;
+    const nextMessage = { ...message };
+    delete nextMessage.reasoning_content;
+    delete nextMessage.reasoning_details;
+    delete nextMessage.reasoning;
+    delete nextMessage.thinking;
+    return nextMessage;
+  });
+
+  return changed ? nextMessages.filter((message) => !isEmptyOpenAIChatAssistantMessage(message)) : messages;
+}
+
+function isEmptyOpenAIChatAssistantMessage(message: unknown): boolean {
+  if (!isObject(message) || message.role !== 'assistant') {
+    return false;
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(message, 'tool_calls') ||
+    Object.prototype.hasOwnProperty.call(message, 'function_call')
+  ) {
+    return false;
+  }
+
+  const content = message.content;
+  return content === undefined || content === '' || (Array.isArray(content) && content.length === 0);
+}
+
+function omitOpenAIChatThinkingOptionsFields(body: Record<string, unknown>): Record<string, unknown> {
+  if (
+    !Object.prototype.hasOwnProperty.call(body, 'thinking') &&
+    !Object.prototype.hasOwnProperty.call(body, 'output_config') &&
+    !Object.prototype.hasOwnProperty.call(body, 'reasoning_effort')
+  ) {
+    return body;
+  }
+
+  const rest = { ...body };
+  delete rest.thinking;
+  delete rest.output_config;
+  delete rest.reasoning_effort;
+  return rest;
+}
+
+function applyGenericOpenAIChatThinkingOptions(
+  body: Record<string, unknown>,
+  standardRequest: StandardRequest
+): Record<string, unknown> {
+  let nextBody = body;
+  const thinking = standardRequest.thinking ?? thinkingFromResponsesReasoning(standardRequest.reasoning);
+  if (thinking !== undefined) {
+    nextBody = {
+      ...nextBody,
+      thinking
+    };
+  }
+
+  const outputConfig =
+    standardRequest.output_config ?? outputConfigFromResponsesReasoning(standardRequest.reasoning);
+  if (outputConfig !== undefined) {
+    nextBody = {
+      ...nextBody,
+      output_config: outputConfig
+    };
+  }
+
+  return nextBody;
+}
+
+function thinkingFromResponsesReasoning(reasoning: unknown): Record<string, string> | undefined {
+  return readResponsesReasoningEffort(reasoning) ? { type: 'enabled' } : undefined;
+}
+
+function outputConfigFromResponsesReasoning(reasoning: unknown): Record<string, string> | undefined {
+  const effort = readResponsesReasoningEffort(reasoning);
+  return effort ? { effort } : undefined;
+}
+
+function readResponsesReasoningEffort(reasoning: unknown): string | undefined {
+  return isObject(reasoning) ? asString(reasoning.effort) : undefined;
+}
 
 export function applyOpenAIChatStreamUsageOption(
   body: unknown,
@@ -970,17 +1215,32 @@ function extractGeminiFunctionCalls(parts: unknown[]): StandardResponseFunctionC
     }
 
     const id = asString(functionCall.id) || `gemini_call_${randomUUID().replace(/-/g, '')}`;
+    const thoughtSignature = readGeminiThoughtSignature(part, functionCall);
     toolCalls.push({
       id,
       type: 'function_call',
       call_id: id,
       name,
       arguments: normalizeFunctionCallArguments(functionCall.args ?? functionCall.arguments),
+      ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
       status: 'completed'
     });
   }
 
   return toolCalls;
+}
+
+function readGeminiThoughtSignature(
+  part: Record<string, unknown>,
+  functionCall?: Record<string, unknown>
+): string | undefined {
+  return (
+    asString(part.thoughtSignature) ||
+    asString(part.thought_signature) ||
+    (functionCall
+      ? asString(functionCall.thoughtSignature) || asString(functionCall.thought_signature)
+      : undefined)
+  );
 }
 
 function extractGeminiReasoningItems(parts: unknown[]): StandardResponseReasoning[] {

@@ -9,7 +9,11 @@ import type {
 import { ok } from '../../../types';
 import { asString, collectStandardInputMessages, isObject } from '../../../utils';
 import { buildOpenAIHeaders } from '../common';
-import { applyOpenAIChatStreamUsageOption, parseOpenAIToStandardResponse } from './shared';
+import {
+  applyOpenAIChatStreamUsageOption,
+  parseOpenAIToStandardResponse,
+  rewriteOpenAIChatCompatibleRequest
+} from './shared';
 import {
   isAnthropicWebSearchTool,
   isOpenAIWebSearchTool,
@@ -37,7 +41,8 @@ export const openAIResponsesTargetAdapter: TargetAdapter = {
       const messages = standardInputToOpenAIChatMessages(
         input.standardRequest.input,
         input.standardRequest.instructions,
-        input.standardRequest.tools
+        input.standardRequest.tools,
+        true
       );
       const body: Record<string, unknown> = {
         model: input.standardRequest.model,
@@ -67,13 +72,19 @@ export const openAIResponsesTargetAdapter: TargetAdapter = {
       if (input.standardRequest.stream === true) {
         body.stream = true;
       }
-      body.reasoning_split = true;
-      applyOpenAIChatReasoningOptions(body, input.standardRequest);
+      const rewrittenBody = rewriteOpenAIChatCompatibleRequest(
+        body,
+        input.targetProviderConfig,
+        {
+          generatedReasoningMessageFields: true,
+          standardRequest: input.standardRequest
+        }
+      );
 
       return ok({
         url: `${input.config.openaiBaseUrl}/chat/completions`,
         headers: headersResult.value,
-        body: applyOpenAIChatStreamUsageOption(body, input.targetProviderConfig)
+        body: applyOpenAIChatStreamUsageOption(rewrittenBody, input.targetProviderConfig)
       });
     }
 
@@ -133,19 +144,6 @@ function resolveOpenAITargetProtocol(providerConfig: ProviderConfig | undefined)
   return 'openai_responses';
 }
 
-function applyOpenAIChatReasoningOptions(body: Record<string, unknown>, standardRequest: StandardRequest): void {
-  const thinking = standardRequest.thinking ?? thinkingFromResponsesReasoning(standardRequest.reasoning);
-  if (thinking !== undefined) {
-    body.thinking = thinking;
-  }
-
-  const outputConfig =
-    standardRequest.output_config ?? outputConfigFromResponsesReasoning(standardRequest.reasoning);
-  if (outputConfig !== undefined) {
-    body.output_config = outputConfig;
-  }
-}
-
 function applyOpenAIResponsesReasoningOptions(body: Record<string, unknown>, standardRequest: StandardRequest): void {
   if (standardRequest.reasoning !== undefined) {
     body.reasoning = standardRequest.reasoning;
@@ -158,23 +156,11 @@ function applyOpenAIResponsesReasoningOptions(body: Record<string, unknown>, sta
   }
 }
 
-function thinkingFromResponsesReasoning(reasoning: unknown): Record<string, string> | undefined {
-  return readResponsesReasoningEffort(reasoning) ? { type: 'enabled' } : undefined;
-}
-
-function outputConfigFromResponsesReasoning(reasoning: unknown): Record<string, string> | undefined {
-  const effort = readResponsesReasoningEffort(reasoning);
-  return effort ? { effort } : undefined;
-}
-
-function readResponsesReasoningEffort(reasoning: unknown): string | undefined {
-  return isObject(reasoning) ? asString(reasoning.effort) : undefined;
-}
-
 function standardInputToOpenAIChatMessages(
   input: string | StandardRequestInputMessage[],
   instructions?: string,
-  tools?: unknown[]
+  tools?: unknown[],
+  includeReasoningFields = false
 ): Array<Record<string, unknown>> {
   const messages: Array<Record<string, unknown>> = [];
   if (instructions) {
@@ -188,7 +174,7 @@ function standardInputToOpenAIChatMessages(
     const text = extractStandardInputTextContent(message.content);
     if (message.role === 'assistant') {
       const toolCalls = collectAssistantToolCalls(message.content, tools);
-      const reasoning = collectAssistantReasoning(message.content);
+      const reasoning = includeReasoningFields ? collectAssistantReasoning(message.content) : undefined;
       if (!text && toolCalls.length === 0 && !reasoning) {
         continue;
       }

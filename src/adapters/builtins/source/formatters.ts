@@ -184,12 +184,16 @@ function collectAnthropicContentBlocks(response: StandardResponse): Array<Record
       continue;
     }
 
-    blocks.push({
+    const block: Record<string, unknown> = {
       type: 'tool_use',
       id: item.call_id || item.id,
       name: item.name,
       input: parseFunctionArguments(item.arguments)
-    });
+    };
+    if (item.thought_signature) {
+      block.thought_signature = item.thought_signature;
+    }
+    blocks.push(block);
   }
 
   return blocks.length > 0 ? blocks : [{ type: 'text', text: '' }];
@@ -215,12 +219,18 @@ function collectGeminiParts(response: StandardResponse): Array<Record<string, un
       continue;
     }
 
-    parts.push({
-      functionCall: {
-        name: item.name,
-        args: parseFunctionArguments(item.arguments)
-      }
-    });
+    const functionCall: Record<string, unknown> = {
+      id: item.call_id || item.id,
+      name: item.name,
+      args: parseFunctionArguments(item.arguments)
+    };
+    const part: Record<string, unknown> = {
+      functionCall
+    };
+    if (item.thought_signature) {
+      part.thoughtSignature = item.thought_signature;
+    }
+    parts.push(part);
   }
 
   return parts;

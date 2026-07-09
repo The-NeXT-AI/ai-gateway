@@ -137,6 +137,13 @@ interface ProviderJsonConfig {
   openaiChatStreamUsage?: unknown;
   chatStreamUsage?: unknown;
   streamUsage?: unknown;
+  openaiChatReasoningSplit?: unknown;
+  chatReasoningSplit?: unknown;
+  reasoningSplit?: unknown;
+  openaiChatThinkingOptions?: unknown;
+  openaiChatReasoningOptions?: unknown;
+  chatThinkingOptions?: unknown;
+  thinkingOptions?: unknown;
   extraHeaders?: unknown;
   extraBody?: unknown;
   billing?: unknown;
@@ -3488,6 +3495,15 @@ function parseProvidersConfig(value: unknown): ProviderConfig[] {
       openaiChatStreamUsage: parseOpenAIChatStreamUsageToken(
         item.openaiChatStreamUsage ?? item.chatStreamUsage ?? item.streamUsage
       ),
+      openaiChatReasoningSplit: parseOpenAIChatReasoningSplitToken(
+        item.openaiChatReasoningSplit ?? item.chatReasoningSplit ?? item.reasoningSplit
+      ),
+      openaiChatThinkingOptions: parseOpenAIChatThinkingOptionsToken(
+        item.openaiChatThinkingOptions ??
+          item.openaiChatReasoningOptions ??
+          item.chatThinkingOptions ??
+          item.thinkingOptions
+      ),
       extraHeaders: parseModelScopedHeaders(item.extraHeaders, models),
       extraBody: parseModelScopedBody(item.extraBody, models),
       billing: parseModelScopedBilling(item.billing, models),
@@ -4116,6 +4132,52 @@ function parseOpenAIChatStreamUsageToken(value: unknown): ProviderConfig['openai
     normalized === 'on'
   ) {
     return 'include_usage';
+  }
+
+  if (
+    normalized === 'disabled' ||
+    normalized === 'disable' ||
+    normalized === 'false' ||
+    normalized === 'off' ||
+    normalized === 'none'
+  ) {
+    return 'disabled';
+  }
+
+  return undefined;
+}
+
+function parseOpenAIChatReasoningSplitToken(value: unknown): ProviderConfig['openaiChatReasoningSplit'] {
+  return parseOpenAIChatCompatibilityModeToken(value);
+}
+
+function parseOpenAIChatThinkingOptionsToken(value: unknown): ProviderConfig['openaiChatThinkingOptions'] {
+  return parseOpenAIChatCompatibilityModeToken(value);
+}
+
+function parseOpenAIChatCompatibilityModeToken(value: unknown): 'auto' | 'enabled' | 'disabled' | undefined {
+  if (typeof value === 'boolean') {
+    return value ? 'enabled' : 'disabled';
+  }
+
+  const normalized = readString(value)?.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (normalized === 'auto' || normalized === 'automatic' || normalized === 'default') {
+    return 'auto';
+  }
+
+  if (
+    normalized === 'enabled' ||
+    normalized === 'enable' ||
+    normalized === 'true' ||
+    normalized === 'on' ||
+    normalized === 'include' ||
+    normalized.startsWith('include_')
+  ) {
+    return 'enabled';
   }
 
   if (

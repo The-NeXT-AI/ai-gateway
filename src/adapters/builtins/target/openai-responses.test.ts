@@ -184,6 +184,9 @@ describe('openAIResponsesTargetAdapter', () => {
     }
 
     const body = built.value.body as Record<string, unknown>;
+    expect(body.reasoning_split).toBeUndefined();
+    expect(body.thinking).toBeUndefined();
+    expect(body.output_config).toBeUndefined();
     expect(body.messages).toEqual([
       {
         role: 'assistant',
@@ -277,7 +280,8 @@ describe('openAIResponsesTargetAdapter', () => {
         openaiBaseUrl: 'https://mock.local/v1'
       } as never,
       targetProviderConfig: {
-        type: 'openai_chat_completions'
+        type: 'openai_chat_completions',
+        openaiChatReasoningSplit: 'enabled'
       } as never
     });
 
@@ -301,6 +305,83 @@ describe('openAIResponsesTargetAdapter', () => {
           }
         ]
       },
+      {
+        role: 'assistant',
+        content: 'previous answer'
+      },
+      {
+        role: 'user',
+        content: 'next turn'
+      }
+    ]);
+  });
+
+  it('does not send Responses reasoning input as OpenAI chat message fields to generic targets by default', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'strict-chat',
+      input: [
+        {
+          type: 'reasoning',
+          id: 'rs_123',
+          status: 'completed',
+          content: [
+            {
+              type: 'reasoning_text',
+              text: 'previous reasoning'
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'output_text',
+              text: 'previous answer'
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: 'next turn'
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        name: 'strict-chat',
+        models: ['strict-chat'],
+        type: 'openai_chat_completions'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.messages).toEqual([
       {
         role: 'assistant',
         content: 'previous answer'
@@ -342,7 +423,8 @@ describe('openAIResponsesTargetAdapter', () => {
         openaiBaseUrl: 'https://mock.local/v1'
       } as never,
       targetProviderConfig: {
-        type: 'openai_chat_completions'
+        type: 'openai_chat_completions',
+        openaiChatThinkingOptions: 'enabled'
       } as never
     });
 
@@ -384,7 +466,8 @@ describe('openAIResponsesTargetAdapter', () => {
         openaiBaseUrl: 'https://mock.local/v1'
       } as never,
       targetProviderConfig: {
-        type: 'openai_chat_completions'
+        type: 'openai_chat_completions',
+        openaiChatThinkingOptions: 'enabled'
       } as never
     });
 
@@ -400,6 +483,234 @@ describe('openAIResponsesTargetAdapter', () => {
     expect(body.output_config).toEqual({
       effort: 'max'
     });
+  });
+
+  it('does not pass OpenAI chat thinking options to generic targets by default', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'strict-chat',
+      reasoning: {
+        effort: 'max'
+      },
+      thinking: {
+        type: 'enabled'
+      },
+      output_config: {
+        effort: 'low'
+      },
+      input: 'hello'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        name: 'strict-chat',
+        models: ['strict-chat'],
+        type: 'openai_chat_completions'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.thinking).toBeUndefined();
+    expect(body.output_config).toBeUndefined();
+  });
+
+  it('passes OpenAI chat thinking options automatically for Zhipu targets', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'glm-5.2',
+      reasoning: {
+        effort: 'high'
+      },
+      input: 'hello'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        name: 'Zhipu AI (China) - Coding Plan',
+        models: ['glm-5.2'],
+        type: 'openai_chat_completions',
+        baseurl: 'https://open.bigmodel.cn/api/paas/v4'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.thinking).toEqual({
+      type: 'enabled'
+    });
+    expect(body.reasoning_effort).toBe('high');
+    expect(body.output_config).toBeUndefined();
+  });
+
+  it('passes OpenAI chat thinking options automatically for Zhipu domains', () => {
+    for (const baseurl of [
+      'https://api.z.ai/api/paas/v4',
+      'https://open.bigmodel.cn/api/paas/v4',
+      'https://api.zhipuai.cn/api/paas/v4'
+    ]) {
+      const parsed = parseOpenAIResponsesRequest({
+        model: 'glm-5.2',
+        reasoning: {
+          effort: 'high'
+        },
+        input: 'hello'
+      });
+
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) {
+        return;
+      }
+
+      const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+        request: {
+          headers: {}
+        } as never,
+        standardRequest: parsed.value,
+        config: {
+          openaiApiKey: 'sk-test',
+          openaiBaseUrl: 'https://mock.local/v1'
+        } as never,
+        targetProviderConfig: {
+          name: 'generic-openai-compatible',
+          models: ['glm-5.2'],
+          type: 'openai_chat_completions',
+          baseurl
+        } as never
+      });
+
+      expect(built.ok).toBe(true);
+      if (!built.ok) {
+        return;
+      }
+
+      const body = built.value.body as Record<string, unknown>;
+      expect(body.thinking).toEqual({
+        type: 'enabled'
+      });
+      expect(body.reasoning_effort).toBe('high');
+      expect(body.output_config).toBeUndefined();
+      expect(body.reasoning_split).toBeUndefined();
+    }
+  });
+
+  it('does not match OpenAI chat thinking options on lookalike Zhipu hosts', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'glm-5.2',
+      reasoning: {
+        effort: 'high'
+      },
+      input: 'hello'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        name: 'generic-openai-compatible',
+        models: ['glm-5.2'],
+        type: 'openai_chat_completions',
+        baseurl: 'https://api.z.ai.evil.test/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.thinking).toBeUndefined();
+    expect(body.output_config).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it('passes DeepSeek thinking options as reasoning_effort for DeepSeek domains', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'v4-pro',
+      reasoning: {
+        effort: 'xhigh'
+      },
+      input: 'hello'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        name: 'generic-openai-compatible',
+        models: ['v4-pro'],
+        type: 'openai_chat_completions',
+        baseurl: 'https://api.deepseek.com'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.thinking).toEqual({
+      type: 'enabled'
+    });
+    expect(body.reasoning_effort).toBe('max');
+    expect(body.output_config).toBeUndefined();
+    expect(body.reasoning_split).toBeUndefined();
   });
 
   it('keeps Responses reasoning on assistant tool call messages when targeting OpenAI chat', () => {
@@ -456,7 +767,8 @@ describe('openAIResponsesTargetAdapter', () => {
         openaiBaseUrl: 'https://mock.local/v1'
       } as never,
       targetProviderConfig: {
-        type: 'openai_chat_completions'
+        type: 'openai_chat_completions',
+        baseurl: 'https://api.deepseek.com'
       } as never
     });
 
@@ -466,6 +778,8 @@ describe('openAIResponsesTargetAdapter', () => {
     }
 
     const body = built.value.body as Record<string, unknown>;
+    expect(body.reasoning_split).toBeUndefined();
+    expect(body.thinking).toBeUndefined();
     expect(body.messages).toEqual([
       {
         role: 'assistant',
@@ -502,7 +816,140 @@ describe('openAIResponsesTargetAdapter', () => {
     ]);
   });
 
-  it('enables reasoning_split automatically when targeting OpenAI chat/completions', () => {
+  it('keeps Responses reasoning for DeepSeek OpenAI chat domains', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'v4-pro',
+      input: [
+        {
+          type: 'reasoning',
+          id: 'rs_123',
+          status: 'completed',
+          content: [
+            {
+              type: 'reasoning_text',
+              text: 'need a tool'
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: 'continue'
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        name: 'generic-openai-compatible',
+        models: ['v4-pro'],
+        type: 'openai_chat_completions',
+        baseurl: 'https://api.deepseek.com'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.messages).toEqual([
+      {
+        role: 'assistant',
+        reasoning_content: 'need a tool',
+        reasoning_details: [
+          {
+            type: 'reasoning.text',
+            text: 'need a tool',
+            format: 'openai-responses-v1',
+            index: 0
+          }
+        ],
+        content: ''
+      },
+      {
+        role: 'user',
+        content: 'continue'
+      }
+    ]);
+  });
+
+  it('keeps interleaved thinking on DeepSeek tool-call history', () => {
+    const body = buildInterleavedThinkingOpenAIChatBody({
+      name: 'generic-openai-compatible',
+      models: ['v4-pro'],
+      type: 'openai_chat_completions',
+      baseurl: 'https://api.deepseek.com'
+    });
+
+    expect(body.reasoning_split).toBeUndefined();
+    expect(body.thinking).toEqual({
+      type: 'enabled'
+    });
+    expect(body.reasoning_effort).toBe('high');
+    expect(body.output_config).toBeUndefined();
+    expect(body.messages).toEqual(expectedInterleavedThinkingToolMessages(true));
+  });
+
+  it('keeps interleaved thinking on Xiaomi MiMo tool-call history', () => {
+    for (const baseurl of [
+      'https://api.xiaomimimo.com/v1',
+      'https://token-plan-cn.xiaomimimo.com/v1'
+    ]) {
+      const body = buildInterleavedThinkingOpenAIChatBody({
+        name: 'generic-openai-compatible',
+        models: ['mimo-v2.5-pro'],
+        type: 'openai_chat_completions',
+        baseurl
+      });
+
+      expect(body.reasoning_split).toBeUndefined();
+      expect(body.thinking).toEqual({
+        type: 'enabled'
+      });
+      expect(body.reasoning_effort).toBeUndefined();
+      expect(body.output_config).toBeUndefined();
+      expect(body.messages).toEqual(expectedXiaomiMimoInterleavedThinkingToolMessages());
+    }
+  });
+
+  it('strips interleaved thinking message fields for Zhipu while keeping tool-call history valid', () => {
+    const body = buildInterleavedThinkingOpenAIChatBody({
+      name: 'generic-openai-compatible',
+      models: ['glm-5.2'],
+      type: 'openai_chat_completions',
+      baseurl: 'https://open.bigmodel.cn/api/paas/v4'
+    });
+
+    expect(body.reasoning_split).toBeUndefined();
+    expect(body.thinking).toEqual({
+      type: 'enabled'
+    });
+    expect(body.reasoning_effort).toBe('medium');
+    expect(body.output_config).toBeUndefined();
+    expect(body.messages).toEqual(expectedInterleavedThinkingToolMessages(false));
+  });
+
+  it('enables reasoning_split automatically for Minimax OpenAI chat/completions targets', () => {
     const parsed = parseOpenAIResponsesRequest({
       model: 'MiniMax-M2.7',
       input: 'hello'
@@ -523,7 +970,10 @@ describe('openAIResponsesTargetAdapter', () => {
         openaiBaseUrl: 'https://mock.local/v1'
       } as never,
       targetProviderConfig: {
-        type: 'openai_chat_completions'
+        name: 'Minimax',
+        models: ['MiniMax-M2.7'],
+        type: 'openai_chat_completions',
+        baseurl: 'https://api.minimax.io/v1'
       } as never
     });
 
@@ -535,6 +985,106 @@ describe('openAIResponsesTargetAdapter', () => {
     const body = built.value.body as Record<string, unknown>;
     expect(parsed.value.reasoning_split).toBeUndefined();
     expect(body.reasoning_split).toBe(true);
+  });
+
+  it('keeps interleaved thinking as reasoning_details for Minimax tool-call history', () => {
+    const body = buildInterleavedThinkingOpenAIChatBody({
+      name: 'generic-openai-compatible',
+      models: ['m2'],
+      type: 'openai_chat_completions',
+      baseurl: 'https://api.minimax.io/v1'
+    });
+
+    expect(body.reasoning_split).toBe(true);
+    expect(body.thinking).toBeUndefined();
+    expect(body.output_config).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(body.messages).toEqual(expectedInterleavedThinkingToolMessages(true));
+  });
+
+  it('enables reasoning_split automatically for Minimax OpenAI chat domains', () => {
+    for (const baseurl of [
+      'https://api.minimax.io/v1',
+      'https://api.minimax.chat/v1',
+      'https://api.minimaxi.com/v1'
+    ]) {
+      const parsed = parseOpenAIResponsesRequest({
+        model: 'm2',
+        reasoning: {
+          effort: 'high'
+        },
+        input: 'hello'
+      });
+
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) {
+        return;
+      }
+
+      const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+        request: {
+          headers: {}
+        } as never,
+        standardRequest: parsed.value,
+        config: {
+          openaiApiKey: 'sk-test',
+          openaiBaseUrl: 'https://mock.local/v1'
+        } as never,
+        targetProviderConfig: {
+          name: 'generic-openai-compatible',
+          models: ['m2'],
+          type: 'openai_chat_completions',
+          baseurl
+        } as never
+      });
+
+      expect(built.ok).toBe(true);
+      if (!built.ok) {
+        return;
+      }
+
+      const body = built.value.body as Record<string, unknown>;
+      expect(parsed.value.reasoning_split).toBeUndefined();
+      expect(body.reasoning_split).toBe(true);
+      expect(body.thinking).toBeUndefined();
+      expect(body.output_config).toBeUndefined();
+      expect(body.reasoning_effort).toBeUndefined();
+    }
+  });
+
+  it('does not enable reasoning_split automatically for generic OpenAI chat/completions targets', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'glm-5',
+      input: 'hello'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        name: 'generic-openai-compatible',
+        models: ['glm-5'],
+        type: 'openai_chat_completions'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).reasoning_split).toBeUndefined();
   });
 
   it('requests usage in OpenAI chat/completions streams when targeting chat from Responses', () => {
@@ -641,6 +1191,43 @@ describe('openAIResponsesTargetAdapter', () => {
 
     const body = built.value.body as Record<string, unknown>;
     expect(body.reasoning_split).toBe(true);
+  });
+
+  it('can disable reasoning_split for incompatible OpenAI chat/completions targets', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'MiniMax-M2.7',
+      reasoning_split: true,
+      input: 'hello'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        name: 'strict-chat',
+        models: ['MiniMax-M2.7'],
+        type: 'openai_chat_completions',
+        openaiChatReasoningSplit: 'disabled'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).reasoning_split).toBeUndefined();
   });
 
   it('flattens OpenAI Responses namespace tools when targeting OpenAI chat', () => {
@@ -986,3 +1573,120 @@ describe('openAIResponsesTargetAdapter', () => {
     ]);
   });
 });
+
+function buildInterleavedThinkingOpenAIChatBody(
+  targetProviderConfig: Record<string, unknown>
+): Record<string, unknown> {
+  const parsed = parseOpenAIResponsesRequest({
+    model: 'interleaved-thinking-model',
+    reasoning: {
+      effort: 'medium'
+    },
+    input: [
+      {
+        type: 'reasoning',
+        id: 'rs_interleaved',
+        status: 'completed',
+        content: [
+          {
+            type: 'reasoning_text',
+            text: 'Need to call the weather tool before answering.'
+          }
+        ]
+      },
+      {
+        type: 'function_call',
+        call_id: 'call_weather',
+        name: 'get_weather',
+        arguments: '{"city":"Shanghai"}'
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'call_weather',
+        output: '{"temperature":22}'
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'continue'
+          }
+        ]
+      }
+    ]
+  });
+
+  expect(parsed.ok).toBe(true);
+  if (!parsed.ok) {
+    throw new Error(parsed.error);
+  }
+
+  const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+    request: {
+      headers: {}
+    } as never,
+    standardRequest: parsed.value,
+    config: {
+      openaiApiKey: 'sk-test',
+      openaiBaseUrl: 'https://mock.local/v1'
+    } as never,
+    targetProviderConfig: targetProviderConfig as never
+  });
+
+  expect(built.ok).toBe(true);
+  if (!built.ok) {
+    throw new Error(built.error);
+  }
+
+  return built.value.body as Record<string, unknown>;
+}
+
+function expectedInterleavedThinkingToolMessages(includeReasoning: boolean): Array<Record<string, unknown>> {
+  const assistantMessage: Record<string, unknown> = {
+    role: 'assistant',
+    content: '',
+    tool_calls: [
+      {
+        id: 'call_weather',
+        type: 'function',
+        function: {
+          name: 'get_weather',
+          arguments: '{"city":"Shanghai"}'
+        }
+      }
+    ]
+  };
+
+  if (includeReasoning) {
+    assistantMessage.reasoning_content = 'Need to call the weather tool before answering.';
+    assistantMessage.reasoning_details = [
+      {
+        type: 'reasoning.text',
+        text: 'Need to call the weather tool before answering.',
+        format: 'openai-responses-v1',
+        index: 0
+      }
+    ];
+  }
+
+  return [
+    assistantMessage,
+    {
+      role: 'tool',
+      tool_call_id: 'call_weather',
+      content: '{"temperature":22}'
+    },
+    {
+      role: 'user',
+      content: 'continue'
+    }
+  ];
+}
+
+function expectedXiaomiMimoInterleavedThinkingToolMessages(): Array<Record<string, unknown>> {
+  const messages = expectedInterleavedThinkingToolMessages(true);
+  delete messages[0].reasoning_details;
+  return messages;
+}

@@ -60,7 +60,10 @@ import {
   addNamespaceFieldsToStandardResponse,
   isHostedWebSearchTool
 } from '../adapters/builtins/target/tools';
-import { applyOpenAIChatStreamUsageOption } from '../adapters/builtins/target/shared';
+import {
+  applyOpenAIChatStreamUsageOption,
+  rewriteOpenAIChatCompatibleRequest
+} from '../adapters/builtins/target/shared';
 import type { GatewayRuntime } from './runtime';
 import { applyHealthAwareRouting } from './health-routing';
 import { evaluateGatewayPolicy, type GatewayPolicyResult } from './policy';
@@ -943,7 +946,12 @@ export async function handleGatewayRequest(
         targetProvider,
         transformedPayload
       );
-      const standardResponseResult = targetAdapter.toStandardResponse(standardPayload);
+      const standardResponseResult = targetAdapter.toStandardResponse(standardPayload, {
+        request,
+        standardRequest,
+        config,
+        targetProviderConfig
+      });
       if (!standardResponseResult.ok) {
         const attempt: ProviderAttemptFailure = {
           provider: targetProvider,
@@ -1227,7 +1235,12 @@ export async function handleGatewayRequest(
       targetProvider,
       transformedPayload
     );
-    const standardResponseResult = targetAdapter.toStandardResponse(standardPayload);
+    const standardResponseResult = targetAdapter.toStandardResponse(standardPayload, {
+      request,
+      standardRequest,
+      config,
+      targetProviderConfig
+    });
     if (!standardResponseResult.ok) {
       const attempt: ProviderAttemptFailure = {
         provider: targetProvider,
@@ -1670,7 +1683,12 @@ async function runTransparentToolExecutionLoop(input: {
       input.targetProvider,
       transformedPayload
     );
-    const standardResponseResult = input.targetAdapter.toStandardResponse(standardPayload);
+    const standardResponseResult = input.targetAdapter.toStandardResponse(standardPayload, {
+      request: input.request,
+      standardRequest: workingRequest,
+      config: input.config,
+      targetProviderConfig: input.targetProviderConfig
+    });
     if (!standardResponseResult.ok) {
       const attempt: ProviderAttemptFailure = {
         provider: input.targetProvider,
@@ -2188,7 +2206,12 @@ async function handleVirtualModelRequest(
         targetProvider,
         transformedPayload
       );
-      const standardResponseResult = targetAdapter.toStandardResponse(standardPayload);
+      const standardResponseResult = targetAdapter.toStandardResponse(standardPayload, {
+        request,
+        standardRequest: workingRequest,
+        config,
+        targetProviderConfig
+      });
       if (!standardResponseResult.ok) {
         loopExhausted = false;
         const attempt: ProviderAttemptFailure = {
@@ -3469,7 +3492,12 @@ async function* runOptimisticVirtualModelStream(input: {
         input.targetProvider,
         upstreamPayload
       );
-      const standardResponseResult = input.targetAdapter.toStandardResponse(standardPayload);
+      const standardResponseResult = input.targetAdapter.toStandardResponse(standardPayload, {
+        request: input.request,
+        standardRequest: workingRequest,
+        config: input.config,
+        targetProviderConfig: input.targetProviderConfig
+      });
       if (!standardResponseResult.ok) {
         yield* buildOptimisticVirtualModelStreamErrorFrames(input.source, standardResponseResult.error);
         return;
@@ -6352,6 +6380,7 @@ function applyProviderRequestOverrides(
   if (hasBodyOverride && isPlainObject(body)) {
     body = mergeJsonObjects(body, extraBody);
   }
+  body = rewriteOpenAIChatCompatibleRequest(body, providerConfig);
 
   return {
     url,

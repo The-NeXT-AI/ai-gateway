@@ -1786,16 +1786,21 @@ function buildAnthropicStreamContentBlockFrames(index: number, block: unknown): 
 
   if (type === 'tool_use') {
     const inputJson = normalizeToolArguments(block.input);
+    const contentBlock: Record<string, unknown> = {
+      type: 'tool_use',
+      id: asString(block.id) || `toolu_${randomUUID().replace(/-/g, '')}`,
+      name: asString(block.name) || 'tool',
+      input: {}
+    };
+    const thoughtSignature = asString(block.thought_signature) || asString(block.thoughtSignature);
+    if (thoughtSignature) {
+      contentBlock.thought_signature = thoughtSignature;
+    }
     const frames = [
       encodeSseEvent('content_block_start', {
         type: 'content_block_start',
         index,
-        content_block: {
-          type: 'tool_use',
-          id: asString(block.id) || `toolu_${randomUUID().replace(/-/g, '')}`,
-          name: asString(block.name) || 'tool',
-          input: {}
-        }
+        content_block: contentBlock
       })
     ];
     if (inputJson && inputJson !== '{}') {

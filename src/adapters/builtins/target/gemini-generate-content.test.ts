@@ -451,6 +451,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
               type: 'tool_use',
               id: 'toolu_1',
               name: 'get_weather',
+              thought_signature: 'gemini-function-signature',
               input: {
                 city: 'Shanghai'
               }
@@ -507,7 +508,9 @@ describe('geminiGenerateContentTargetAdapter', () => {
             thought: true
           },
           {
+            thoughtSignature: 'gemini-function-signature',
             functionCall: {
+              id: 'toolu_1',
               name: 'get_weather',
               args: {
                 city: 'Shanghai'
@@ -521,6 +524,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
         parts: [
           {
             functionResponse: {
+              id: 'toolu_1',
               name: 'get_weather',
               response: {
                 content: 'Sunny, 28 C.'
@@ -629,7 +633,9 @@ describe('geminiGenerateContentTargetAdapter', () => {
                 thought: true
               },
               {
+                thoughtSignature: 'gemini-function-signature',
                 functionCall: {
+                  id: 'toolu_sig',
                   name: 'get_weather',
                   args: {
                     city: 'Shanghai'
@@ -667,7 +673,10 @@ describe('geminiGenerateContentTargetAdapter', () => {
       }),
       expect.objectContaining({
         type: 'function_call',
+        id: 'toolu_sig',
+        call_id: 'toolu_sig',
         name: 'get_weather',
+        thought_signature: 'gemini-function-signature',
         arguments: '{"city":"Shanghai"}'
       })
     ]);
@@ -681,11 +690,160 @@ describe('geminiGenerateContentTargetAdapter', () => {
       },
       {
         type: 'tool_use',
-        id: expect.any(String),
+        id: 'toolu_sig',
         name: 'get_weather',
+        thought_signature: 'gemini-function-signature',
         input: {
           city: 'Shanghai'
         }
+      }
+    ]);
+  });
+
+  it('replays cached Gemini thought signatures when Anthropic follow-up omits the extension field', () => {
+    const request = {
+      headers: {
+        'x-api-key': 'profile-a'
+      },
+      url: '/v1beta/models/gemini-3.5-flash:generateContent'
+    } as never;
+    const config = {
+      geminiApiKey: 'sk-test',
+      geminiBaseUrl: 'https://mock.local',
+      geminiApiVersion: 'v1beta'
+    } as never;
+    const targetProviderConfig = {
+      name: 'google-main'
+    } as never;
+    const firstTurnRequest: StandardRequest = {
+      model: 'gemini-3.5-flash',
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Weather in Paris?' }] }]
+    };
+
+    const firstTurn = geminiGenerateContentTargetAdapter.toStandardResponse(
+      {
+        candidates: [
+          {
+            content: {
+              role: 'model',
+              parts: [
+                {
+                  thoughtSignature: 'cached-gemini-function-signature',
+                  functionCall: {
+                    id: 'cached_toolu_weather',
+                    name: 'get_weather',
+                    args: {
+                      city: 'Paris'
+                    }
+                  }
+                }
+              ]
+            },
+            finishReason: 'STOP'
+          }
+        ],
+        usageMetadata: {
+          promptTokenCount: 10,
+          candidatesTokenCount: 5,
+          totalTokenCount: 15
+        },
+        modelVersion: 'gemini-3.5-flash'
+      },
+      {
+        request,
+        standardRequest: firstTurnRequest,
+        config,
+        targetProviderConfig
+      }
+    );
+
+    expect(firstTurn.ok).toBe(true);
+    if (!firstTurn.ok) {
+      return;
+    }
+
+    const standardRequest: StandardRequest = {
+      model: 'gemini-3.5-flash',
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'Weather in Paris?' }]
+        },
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'cached_toolu_weather',
+              name: 'get_weather',
+              input: {
+                city: 'Paris'
+              }
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'cached_toolu_weather',
+              content: '18 C, partly cloudy'
+            }
+          ]
+        }
+      ]
+    };
+
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request,
+      standardRequest,
+      config,
+      targetProviderConfig
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.contents).toEqual([
+      {
+        role: 'user',
+        parts: [{ text: 'Weather in Paris?' }]
+      },
+      {
+        role: 'model',
+        parts: [
+          {
+            thoughtSignature: 'cached-gemini-function-signature',
+            functionCall: {
+              id: 'cached_toolu_weather',
+              name: 'get_weather',
+              args: {
+                city: 'Paris'
+              }
+            }
+          }
+        ]
+      },
+      {
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              id: 'cached_toolu_weather',
+              name: 'get_weather',
+              response: {
+                content: '18 C, partly cloudy'
+              }
+            }
+          }
+        ]
       }
     ]);
   });

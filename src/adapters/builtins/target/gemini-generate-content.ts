@@ -1,10 +1,13 @@
+import { createHash } from 'node:crypto';
 import type {
   StandardGeminiInteractionsOptions,
   StandardRequest,
   StandardRequestInputContent,
   StandardRequestInputMessage,
+  StandardResponse,
   TargetAdapter,
   TargetAdapterRequestInput,
+  TargetAdapterResponseInput,
   Result,
   UpstreamRequest
 } from '../../../types';
@@ -23,9 +26,12 @@ import {
 const geminiSchemaStringKeys = new Set(['description', 'format', 'title']);
 const geminiSchemaNumberKeys = new Set(['maximum', 'minimum', 'maxItems', 'minItems']);
 const geminiSchemaArrayKeys = new Set(['enum', 'required', 'propertyOrdering']);
+const maxGeminiThoughtSignatureCacheEntries = 4096;
+const geminiThoughtSignaturesByToolUseId = new Map<string, string>();
 
 interface GeminiContentConversionState {
   toolNamesById: Map<string, string>;
+  thoughtSignatureCacheScope: string;
 }
 
 export const geminiGenerateContentTargetAdapter: TargetAdapter = {
@@ -71,7 +77,11 @@ export const geminiGenerateContentTargetAdapter: TargetAdapter = {
     }
 
     const body: Record<string, unknown> = {
-      contents: standardInputToGeminiContents(input.standardRequest.input, input.standardRequest.tools)
+      contents: standardInputToGeminiContents(
+        input.standardRequest.input,
+        input.standardRequest.tools,
+        buildGeminiThoughtSignatureCacheScope(input)
+      )
     };
 
     if ((body.contents as unknown[]).length === 0) {
@@ -110,8 +120,12 @@ export const geminiGenerateContentTargetAdapter: TargetAdapter = {
       body
     });
   },
-  toStandardResponse(payload) {
-    return parseGeminiToStandardResponse(payload);
+  toStandardResponse(payload, input) {
+    const result = parseGeminiToStandardResponse(payload);
+    if (result.ok) {
+      rememberGeminiThoughtSignatures(result.value, buildGeminiThoughtSignatureCacheScope(input));
+    }
+    return result;
   }
 };
 
@@ -180,10 +194,12 @@ function buildGeminiInteractionsRequestFromStandard(input: TargetAdapterRequestI
 
 function standardInputToGeminiContents(
   input: string | StandardRequestInputMessage[],
-  tools?: unknown[]
+  tools: unknown[] | undefined,
+  thoughtSignatureCacheScope: string
 ): Array<Record<string, unknown>> {
   const state: GeminiContentConversionState = {
-    toolNamesById: new Map()
+    toolNamesById: new Map(),
+    thoughtSignatureCacheScope
   };
 
   return collectStandardInputMessages(input).map((message) => ({
@@ -475,12 +491,20 @@ function standardContentToGeminiParts(
     if (item.type === 'tool_use') {
       const targetName = mapStandardToolNameToTargetName(item.name, tools);
       state.toolNamesById.set(item.id, targetName);
-      parts.push({
-        functionCall: {
-          name: targetName,
-          args: normalizeGeminiFunctionCallArgs(item.input)
-        }
-      });
+      const functionCall: Record<string, unknown> = {
+        id: item.id,
+        name: targetName,
+        args: normalizeGeminiFunctionCallArgs(item.input)
+      };
+      const thoughtSignature =
+        item.thought_signature || readCachedGeminiThoughtSignature(state.thoughtSignatureCacheScope, item.id);
+      const part: Record<string, unknown> = {
+        functionCall
+      };
+      if (thoughtSignature) {
+        part.thoughtSignature = thoughtSignature;
+      }
+      parts.push(part);
       continue;
     }
 
@@ -504,6 +528,7 @@ function standardContentToGeminiParts(
 
     parts.push({
       functionResponse: {
+        id: item.tool_use_id,
         name:
           state.toolNamesById.get(item.tool_use_id) ??
           mapStandardToolNameToTargetName(item.tool_use_id, tools),
@@ -515,6 +540,90 @@ function standardContentToGeminiParts(
   flushText();
 
   return parts.length > 0 ? parts : [{ text: '' }];
+}
+
+function rememberGeminiThoughtSignatures(response: StandardResponse, thoughtSignatureCacheScope: string): void {
+  for (const item of response.output) {
+    if (item.type !== 'function_call' || !item.thought_signature) {
+      continue;
+    }
+
+    rememberGeminiThoughtSignature(thoughtSignatureCacheScope, item.id, item.thought_signature);
+    if (item.call_id !== item.id) {
+      rememberGeminiThoughtSignature(thoughtSignatureCacheScope, item.call_id, item.thought_signature);
+    }
+  }
+}
+
+function rememberGeminiThoughtSignature(
+  thoughtSignatureCacheScope: string,
+  toolUseId: string,
+  signature: string
+): void {
+  if (!toolUseId || !signature) {
+    return;
+  }
+
+  const cacheKey = buildGeminiThoughtSignatureCacheKey(thoughtSignatureCacheScope, toolUseId);
+  if (geminiThoughtSignaturesByToolUseId.has(cacheKey)) {
+    geminiThoughtSignaturesByToolUseId.delete(cacheKey);
+  }
+  geminiThoughtSignaturesByToolUseId.set(cacheKey, signature);
+
+  while (geminiThoughtSignaturesByToolUseId.size > maxGeminiThoughtSignatureCacheEntries) {
+    const oldestKey = geminiThoughtSignaturesByToolUseId.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+    geminiThoughtSignaturesByToolUseId.delete(oldestKey);
+  }
+}
+
+function readCachedGeminiThoughtSignature(
+  thoughtSignatureCacheScope: string,
+  toolUseId: string
+): string | undefined {
+  const cacheKey = buildGeminiThoughtSignatureCacheKey(thoughtSignatureCacheScope, toolUseId);
+  const signature = geminiThoughtSignaturesByToolUseId.get(cacheKey);
+  if (!signature) {
+    return undefined;
+  }
+
+  geminiThoughtSignaturesByToolUseId.delete(cacheKey);
+  geminiThoughtSignaturesByToolUseId.set(cacheKey, signature);
+  return signature;
+}
+
+function buildGeminiThoughtSignatureCacheKey(thoughtSignatureCacheScope: string, toolUseId: string): string {
+  return `${thoughtSignatureCacheScope}\0${toolUseId}`;
+}
+
+function buildGeminiThoughtSignatureCacheScope(
+  input?: TargetAdapterRequestInput | TargetAdapterResponseInput
+): string {
+  if (!input) {
+    return 'global';
+  }
+
+  const providerName = input.targetProviderConfig?.name || 'gemini';
+  const model = input.standardRequest.model || '';
+  const credentialFingerprint = fingerprintRequestCredential(input.request);
+  return `${providerName}\0${model}\0${credentialFingerprint}`;
+}
+
+function fingerprintRequestCredential(request: TargetAdapterRequestInput['request']): string {
+  const credential =
+    readHeaderValue(request.headers['x-api-key']) ||
+    readHeaderValue(request.headers.authorization) ||
+    'anonymous';
+  return createHash('sha256').update(credential).digest('hex').slice(0, 16);
+}
+
+function readHeaderValue(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) {
+    return value.find((item) => item.trim());
+  }
+  return value?.trim() || undefined;
 }
 
 function standardReasoningToGeminiThoughtPart(

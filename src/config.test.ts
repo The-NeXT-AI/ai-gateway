@@ -413,6 +413,64 @@ describe('Gateway config providerPlugins', () => {
     expect(config.providers[1]?.openaiChatStreamUsage).toBe('disabled');
   });
 
+  it('parses OpenAI chat reasoning split compatibility config', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'reasoning-auto',
+          type: 'openai_chat_completions',
+          openaiChatReasoningSplit: 'auto',
+          models: ['MiniMax-M2.7']
+        },
+        {
+          name: 'reasoning-enabled',
+          type: 'openai_chat_completions',
+          chatReasoningSplit: true,
+          models: ['custom-reasoning']
+        },
+        {
+          name: 'reasoning-disabled',
+          type: 'openai_chat_completions',
+          reasoningSplit: false,
+          models: ['legacy-chat']
+        }
+      ]
+    });
+
+    expect(config.providers[0]?.openaiChatReasoningSplit).toBe('auto');
+    expect(config.providers[1]?.openaiChatReasoningSplit).toBe('enabled');
+    expect(config.providers[2]?.openaiChatReasoningSplit).toBe('disabled');
+  });
+
+  it('parses OpenAI chat thinking options compatibility config', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'thinking-auto',
+          type: 'openai_chat_completions',
+          openaiChatThinkingOptions: 'auto',
+          models: ['glm-5.2']
+        },
+        {
+          name: 'thinking-enabled',
+          type: 'openai_chat_completions',
+          openaiChatReasoningOptions: true,
+          models: ['custom-thinking']
+        },
+        {
+          name: 'thinking-disabled',
+          type: 'openai_chat_completions',
+          thinkingOptions: false,
+          models: ['legacy-chat']
+        }
+      ]
+    });
+
+    expect(config.providers[0]?.openaiChatThinkingOptions).toBe('auto');
+    expect(config.providers[1]?.openaiChatThinkingOptions).toBe('enabled');
+    expect(config.providers[2]?.openaiChatThinkingOptions).toBe('disabled');
+  });
+
   it('parses gateway logging config from file and environment', () => {
     expect(parseGatewayConfigFromRaw({}).logging).toEqual({
       enabled: false,

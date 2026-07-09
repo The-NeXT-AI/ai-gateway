@@ -26,10 +26,7 @@ export const openAIChatCompletionsSourceAdapter: SourceAdapter = {
     return ok({
       url: `${input.config.openaiBaseUrl}/chat/completions`,
       headers: headersResult.value,
-      body: {
-        ...input.body,
-        reasoning_split: true
-      }
+      body: input.body
     });
   }
 };

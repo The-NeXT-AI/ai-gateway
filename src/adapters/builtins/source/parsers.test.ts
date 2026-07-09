@@ -248,6 +248,7 @@ describe('parseAnthropicMessagesRequest', () => {
               type: 'tool_use',
               id: 'toolu_weather',
               name: 'get_weather',
+              thought_signature: 'gemini-function-signature',
               input: {
                 city: 'Shanghai'
               }
@@ -294,6 +295,7 @@ describe('parseAnthropicMessagesRequest', () => {
             type: 'tool_use',
             id: 'toolu_weather',
             name: 'get_weather',
+            thought_signature: 'gemini-function-signature',
             input: {
               city: 'Shanghai'
             }
@@ -383,6 +385,28 @@ describe('parseOpenAIChatCompletionsRequest', () => {
         ]
       }
     ]);
+  });
+
+  it('keeps OpenAI-compatible reasoning_effort as standard reasoning effort', () => {
+    const result = parseOpenAIChatCompletionsRequest({
+      model: 'glm-5.2',
+      reasoning_effort: 'high',
+      messages: [
+        {
+          role: 'user',
+          content: 'hello'
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value.reasoning).toEqual({
+      effort: 'high'
+    });
   });
 
   it('parses tools, assistant tool_calls, and tool role messages into standard input', () => {

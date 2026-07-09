@@ -42,7 +42,7 @@ export function parseOpenAIResponsesRequest(body: Record<string, unknown>): Resu
     tools: readTools(body.tools),
     tool_choice: readToolChoice(body.tool_choice),
     reasoning_split: readReasoningSplitOption(body),
-    reasoning: readOptionalRequestOption(body.reasoning),
+    reasoning: readReasoningOption(body),
     thinking: readOptionalRequestOption(body.thinking),
     output_config: readOptionalRequestOption(body.output_config)
   });
@@ -103,7 +103,7 @@ export function parseOpenAIChatCompletionsRequest(body: Record<string, unknown>)
     tools: readTools(body.tools),
     tool_choice: readToolChoice(body.tool_choice),
     reasoning_split: readReasoningSplitOption(body),
-    reasoning: readOptionalRequestOption(body.reasoning),
+    reasoning: readReasoningOption(body),
     thinking: readOptionalRequestOption(body.thinking),
     output_config: readOptionalRequestOption(body.output_config)
   });
@@ -1257,12 +1257,17 @@ function extractAnthropicMessageContent(
         continue;
       }
 
-      normalized.push({
+      const toolUse: StandardRequestInputContent = {
         type: 'tool_use',
         id,
         name,
         input: block.input ?? {}
-      });
+      };
+      const thoughtSignature = readThoughtSignature(block);
+      if (thoughtSignature) {
+        toolUse.thought_signature = thoughtSignature;
+      }
+      normalized.push(toolUse);
       continue;
     }
 
@@ -1446,12 +1451,17 @@ function extractGeminiMessageContent(
         asString(functionCall.call_id) ||
         asString(functionCall.callId) ||
         `gemini_tool_${messageIndex}_${partIndex}`;
-      normalized.push({
+      const toolUse: StandardRequestInputContent = {
         type: 'tool_use',
         id,
         name,
         input: normalizeGeminiFunctionCallArguments(functionCall.args ?? functionCall.arguments)
-      });
+      };
+      const thoughtSignature = readGeminiThoughtSignature(part, functionCall);
+      if (thoughtSignature) {
+        toolUse.thought_signature = thoughtSignature;
+      }
+      normalized.push(toolUse);
       trackGeminiToolUseId(state, name, id);
       continue;
     }
@@ -1527,6 +1537,20 @@ function readGeminiFunctionResponse(part: Record<string, unknown>): Record<strin
   }
 
   return undefined;
+}
+
+function readGeminiThoughtSignature(
+  part: Record<string, unknown>,
+  functionCall?: Record<string, unknown>
+): string | undefined {
+  return (
+    readThoughtSignature(part) ||
+    (functionCall ? readThoughtSignature(functionCall) : undefined)
+  );
+}
+
+function readThoughtSignature(value: Record<string, unknown>): string | undefined {
+  return asString(value.thoughtSignature) || asString(value.thought_signature);
 }
 
 function normalizeGeminiFunctionCallArguments(value: unknown): unknown {
@@ -1808,6 +1832,23 @@ function readReasoningSplitOption(body: Record<string, unknown>): boolean | unde
 
 function readOptionalRequestOption(value: unknown): unknown | undefined {
   return value === undefined ? undefined : value;
+}
+
+function readReasoningOption(body: Record<string, unknown>): unknown {
+  const reasoning = readOptionalRequestOption(body.reasoning);
+  const effort = asString(body.reasoning_effort);
+  if (effort === undefined) {
+    return reasoning;
+  }
+
+  if (isObject(reasoning) && !Object.prototype.hasOwnProperty.call(reasoning, 'effort')) {
+    return {
+      ...reasoning,
+      effort
+    };
+  }
+
+  return reasoning ?? { effort };
 }
 
 function readRecordOption(value: unknown): Record<string, unknown> | undefined {

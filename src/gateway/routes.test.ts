@@ -4091,7 +4091,7 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
-  it('preserves Gemini generateContent thought signatures in streamed Anthropic tool_use blocks', async () => {
+  it('emits Gemini generateContent thought signatures as streamed Anthropic thinking signatures', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(
         JSON.stringify({
@@ -4171,9 +4171,11 @@ describe('gateway routes protocol conversion', () => {
       expect(response.statusCode).toBe(200);
       expect(response.headers['content-type']).toContain('text/event-stream');
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(response.body).toContain('"type":"thinking"');
+      expect(response.body).toContain('"type":"signature_delta","signature":"gemini-function-signature"');
       expect(response.body).toContain('"type":"tool_use"');
       expect(response.body).toContain('"id":"toolu_weather_stream"');
-      expect(response.body).toContain('"thought_signature":"gemini-function-signature"');
+      expect(response.body).not.toContain('"thought_signature":"gemini-function-signature"');
       expect(response.body).toContain('"type":"input_json_delta","partial_json":"{\\"location\\":\\"Paris\\"}"');
     } finally {
       await app.close();
@@ -4287,12 +4289,17 @@ describe('gateway routes protocol conversion', () => {
       });
 
       expect(firstResponse.statusCode).toBe(200);
-      expect(firstResponse.body).toContain('"thought_signature":"gemini-function-signature"');
+      expect(firstResponse.body).toContain('"type":"thinking"');
+      expect(firstResponse.body).toContain('"signature":"gemini-function-signature"');
+      expect(firstResponse.body).not.toContain('"thought_signature":"gemini-function-signature"');
 
       const secondResponse = await app.inject({
         method: 'POST',
         url: '/v1/messages',
-        headers,
+        headers: {
+          ...headers,
+          'x-api-key': 'different-test-key'
+        },
         payload: {
           model: 'gemini-3.5-flash',
           max_tokens: 128,
@@ -4314,6 +4321,11 @@ describe('gateway routes protocol conversion', () => {
             {
               role: 'assistant',
               content: [
+                {
+                  type: 'thinking',
+                  thinking: '',
+                  signature: 'gemini-function-signature'
+                },
                 {
                   type: 'tool_use',
                   id: 'toolu_weather_followup',

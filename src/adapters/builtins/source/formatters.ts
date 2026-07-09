@@ -184,19 +184,39 @@ function collectAnthropicContentBlocks(response: StandardResponse): Array<Record
       continue;
     }
 
+    if (item.thought_signature) {
+      attachAnthropicThinkingSignature(blocks, item.thought_signature);
+    }
+
     const block: Record<string, unknown> = {
       type: 'tool_use',
       id: item.call_id || item.id,
       name: item.name,
       input: parseFunctionArguments(item.arguments)
     };
-    if (item.thought_signature) {
-      block.thought_signature = item.thought_signature;
-    }
     blocks.push(block);
   }
 
   return blocks.length > 0 ? blocks : [{ type: 'text', text: '' }];
+}
+
+function attachAnthropicThinkingSignature(blocks: Array<Record<string, unknown>>, signature: string): void {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (block.type === 'thinking') {
+      block.signature = signature;
+      return;
+    }
+    if (block.type !== 'redacted_thinking') {
+      break;
+    }
+  }
+
+  blocks.push({
+    type: 'thinking',
+    thinking: '',
+    signature
+  });
 }
 
 function collectGeminiParts(response: StandardResponse): Array<Record<string, unknown>> {

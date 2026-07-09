@@ -30,6 +30,7 @@ const maxGeminiThoughtSignatureCacheEntries = 4096;
 const geminiThoughtSignaturesByToolUseId = new Map<string, string>();
 
 interface GeminiContentConversionState {
+  pendingThoughtSignature?: string;
   toolNamesById: Map<string, string>;
   thoughtSignatureCacheScope: string;
 }
@@ -487,6 +488,10 @@ function standardContentToGeminiParts(
       if (reasoningPart) {
         parts.push(reasoningPart);
       }
+      const thoughtSignature = standardReasoningThoughtSignature(item);
+      if (thoughtSignature) {
+        state.pendingThoughtSignature = thoughtSignature;
+      }
       continue;
     }
 
@@ -499,7 +504,10 @@ function standardContentToGeminiParts(
         args: normalizeGeminiFunctionCallArgs(item.input)
       };
       const thoughtSignature =
-        item.thought_signature || readCachedGeminiThoughtSignature(state.thoughtSignatureCacheScope, item.id);
+        item.thought_signature ||
+        state.pendingThoughtSignature ||
+        readCachedGeminiThoughtSignature(state.thoughtSignatureCacheScope, item.id);
+      state.pendingThoughtSignature = undefined;
       const part: Record<string, unknown> = {
         functionCall
       };
@@ -633,6 +641,22 @@ function standardReasoningToGeminiThoughtPart(
 ): Record<string, unknown> | undefined {
   const text = standardReasoningText(item);
   return text ? { text, thought: true } : undefined;
+}
+
+function standardReasoningThoughtSignature(
+  item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
+): string | undefined {
+  const details = Array.isArray(item.reasoning_details) ? item.reasoning_details : [];
+  for (const detail of details) {
+    if (!isObject(detail)) {
+      continue;
+    }
+    const signature = asString(detail.signature);
+    if (signature) {
+      return signature;
+    }
+  }
+  return undefined;
 }
 
 function standardReasoningText(

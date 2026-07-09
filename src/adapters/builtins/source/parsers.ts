@@ -1317,26 +1317,31 @@ function normalizeAnthropicThinkingBlock(
   const blockType = asString(block.type);
   if (blockType === 'thinking') {
     const thinking = asString(block.thinking) || asString(block.text);
-    if (!thinking) {
+    const signature = asString(block.signature);
+    if (!thinking && !signature) {
       return null;
     }
 
     const detail: Record<string, unknown> = {
       type: 'reasoning.text',
-      text: thinking,
       format: 'anthropic-claude-v1',
       index
     };
-    const signature = asString(block.signature);
+    if (thinking) {
+      detail.text = thinking;
+    }
     if (signature) {
       detail.signature = signature;
     }
 
-    return {
+    const reasoning: StandardRequestInputContent = {
       type: 'reasoning',
-      text: thinking,
       reasoning_details: [detail]
     };
+    if (thinking) {
+      reasoning.text = thinking;
+    }
+    return reasoning;
   }
 
   if (blockType === 'redacted_thinking') {

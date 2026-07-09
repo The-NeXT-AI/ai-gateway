@@ -686,13 +686,13 @@ describe('geminiGenerateContentTargetAdapter', () => {
     expect(anthropic.content).toEqual([
       {
         type: 'thinking',
-        thinking: 'Need to call the weather tool.'
+        thinking: 'Need to call the weather tool.',
+        signature: 'gemini-function-signature'
       },
       {
         type: 'tool_use',
         id: 'toolu_sig',
         name: 'get_weather',
-        thought_signature: 'gemini-function-signature',
         input: {
           city: 'Shanghai'
         }

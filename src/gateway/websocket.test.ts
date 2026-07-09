@@ -1,7 +1,7 @@
 import { createServer, type IncomingHttpHeaders, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import Fastify from 'fastify';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket, WebSocketServer } from 'ws';
 import { ProviderPluginRegistry } from '../adapters/registry';
 import type { GatewayConfig } from '../types';
@@ -18,6 +18,8 @@ describe('gateway responses websocket relay', () => {
       }
       await task();
     }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it('forwards response.completed before closing when upstream closes immediately', async () => {
@@ -313,6 +315,70 @@ describe('gateway responses websocket relay', () => {
     expect(upstream.state.upgradeHeaders?.authorization).toBe('Bearer plugin-token');
     expect(upstream.state.upgradeHeaders?.['chatgpt-account-id']).toBe('acct-from-plugin');
   });
+
+  it('enforces introspected model restrictions before forwarding websocket response.create messages', async () => {
+    const upstream = await startUpstreamResponsesWebSocketServer({
+      expectedPath: '/v1/responses'
+    });
+    cleanupTasks.push(async () => {
+      await upstream.close();
+    });
+
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          active: true,
+          userId: 'user-1',
+          tenantId: 'tenant-a',
+          restrictions: {
+            allowedModels: ['openai/gpt-5']
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const gateway = Fastify({ logger: false });
+    const gatewayConfig = createWsGatewayTestConfig(`http://127.0.0.1:${upstream.port}/v1`);
+    gatewayConfig.auth = {
+      ...gatewayConfig.auth,
+      enabled: true,
+      mode: 'http_introspection',
+      required: true,
+      introspection: {
+        ...gatewayConfig.auth.introspection,
+        endpoint: 'http://auth.local/introspect'
+      }
+    };
+    registerGatewayResponsesWebSocketRoute(gateway, gatewayConfig);
+    await gateway.listen({ host: '127.0.0.1', port: 0 });
+    cleanupTasks.push(async () => {
+      await gateway.close();
+    });
+
+    const gatewayPort = (gateway.server.address() as AddressInfo).port;
+    const errorPayload = await waitForWebSocketError(
+      `ws://127.0.0.1:${gatewayPort}/v1/responses`,
+      {
+        authorization: 'Bearer restricted-token'
+      },
+      {
+        type: 'response.create',
+        model: 'o3',
+        input: 'blocked'
+      }
+    );
+
+    expect(errorPayload.status).toBe(403);
+    expect(errorPayload.error?.message).toContain('o3');
+    expect(upstream.state.receivedMessages).toHaveLength(0);
+  });
 });
 
 async function startUpstreamResponsesWebSocketServer(options: {
@@ -441,6 +507,68 @@ async function waitForResponseCompleted(
       settled = true;
       clearTimeout(timeout);
       reject(new Error('WebSocket closed before response.completed event was received.'));
+    });
+
+    socket.on('error', (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+}
+
+async function waitForWebSocketError(
+  websocketUrl: string,
+  headers: Record<string, string> | undefined,
+  payload: Record<string, unknown>
+): Promise<{ status?: number; error?: { message?: string } }> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const socket = new WebSocket(websocketUrl, {
+      headers
+    });
+    const timeout = setTimeout(() => {
+      settled = true;
+      socket.terminate();
+      reject(new Error('Timed out waiting for websocket error event.'));
+    }, 8000);
+
+    socket.on('open', () => {
+      socket.send(JSON.stringify(payload));
+    });
+
+    socket.on('message', (raw) => {
+      let parsed: { type?: string; status?: number; error?: { message?: string } };
+      try {
+        parsed = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      if (parsed.type !== 'error') {
+        return;
+      }
+
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timeout);
+      socket.close(1000, 'test-done');
+      resolve(parsed);
+    });
+
+    socket.on('close', () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      reject(new Error('WebSocket closed before error event was received.'));
     });
 
     socket.on('error', (error) => {

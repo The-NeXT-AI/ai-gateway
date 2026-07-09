@@ -39,6 +39,8 @@ import type {
   GatewaySchedulingConfig,
   GatewayTransparentToolExecutionConfig,
   GatewayTransparentToolUnknownPolicy,
+  GatewayPluginConfig,
+  GatewayPluginProviderHookConfig,
   GatewayUpstreamCircuitBreakerConfig,
   GatewayUpstreamConcurrencyConfig,
   GatewayUpstreamRetryConfig,
@@ -73,7 +75,13 @@ import type {
   RawTraceConfig,
   RawTraceSyncConfig
 } from './types';
-import { parseProvider, parseProviderList, providerFromProviderType, trimTrailingSlash } from './utils';
+import {
+  isSafeProviderToken,
+  parseProvider,
+  parseProviderList,
+  providerFromProviderType,
+  trimTrailingSlash
+} from './utils';
 
 const defaultConfigFileName = 'gateway.config.json';
 const defaultCodexOauthTokenEndpoint = 'https://auth.openai.com/oauth/token';
@@ -232,6 +240,14 @@ interface GatewayPrecheckEstimationJsonConfig {
 interface GatewayPrecheckStorageJsonConfig {
   type?: unknown;
   backend?: unknown;
+  url?: unknown;
+  redisUrl?: unknown;
+  keyPrefix?: unknown;
+  prefix?: unknown;
+  connectTimeoutMs?: unknown;
+  connectTimeoutSeconds?: unknown;
+  commandTimeoutMs?: unknown;
+  commandTimeoutSeconds?: unknown;
 }
 
 interface GatewayPrecheckJsonConfig {
@@ -541,6 +557,7 @@ interface GatewayJsonConfig {
   port?: unknown;
   providers?: unknown;
   Providers?: unknown;
+  plugins?: unknown;
   providerPlugins?: unknown;
   virtualModelProfiles?: unknown;
   providerExternal?: unknown;
@@ -752,6 +769,22 @@ interface ProviderPluginJsonConfig {
   response?: unknown;
 }
 
+interface GatewayPluginMatchJsonConfig {
+  provider?: unknown;
+  providerName?: unknown;
+}
+
+interface GatewayPluginJsonConfig {
+  key?: unknown;
+  enabled?: unknown;
+  modulePath?: unknown;
+  path?: unknown;
+  match?: unknown;
+  providerHooks?: unknown;
+  providerHook?: unknown;
+  hooks?: unknown;
+}
+
 interface AgentEventQueueJsonConfig {
   enabled?: unknown;
   queueName?: unknown;
@@ -846,6 +879,10 @@ export function parseProviderPluginsFromRaw(raw: unknown): ProviderPluginConfig[
   return parseProviderPluginsConfig(raw);
 }
 
+export function parseGatewayPluginsFromRaw(raw: unknown): GatewayPluginConfig[] {
+  return parseGatewayPluginsConfig(raw);
+}
+
 export function parseVirtualModelProfilesFromRaw(raw: unknown): VirtualModelProfileConfig[] {
   return parseVirtualModelProfilesConfig(raw);
 }
@@ -899,6 +936,7 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
     host: readString(process.env.HOST) || readString(jsonConfig.host) || '0.0.0.0',
     port: readFiniteNumber(process.env.PORT) ?? readFiniteNumber(jsonConfig.port) ?? 3000,
     providers,
+    plugins: parseGatewayPluginsConfig(jsonConfig.plugins),
     providerPlugins: parseProviderPluginsConfig(jsonConfig.providerPlugins),
     virtualModelProfiles: parseVirtualModelProfilesConfig(jsonConfig.virtualModelProfiles),
     providerExternal: parseProviderExternalSourceConfig(providerExternalRaw),
@@ -1216,15 +1254,40 @@ function parseGatewayPrecheckConfig(value: unknown): GatewayPrecheckConfig {
 function parseGatewayPrecheckStorageConfig(
   value: GatewayPrecheckStorageJsonConfig | undefined
 ): GatewayPrecheckConfig['storage'] {
-  return {
-    type: parseGatewayPrecheckStorageType(
-      readString(process.env.PRECHECK_STORAGE_TYPE) ||
-        readString(process.env.PRECHECK_STORAGE_BACKEND) ||
-        readString(value?.type) ||
-        readString(value?.backend),
-      'memory'
-    )
-  };
+  const type = parseGatewayPrecheckStorageType(
+    readString(process.env.PRECHECK_STORAGE_TYPE) ||
+      readString(process.env.PRECHECK_STORAGE_BACKEND) ||
+      readString(value?.type) ||
+      readString(value?.backend),
+    'memory'
+  );
+  if (type === 'redis') {
+    return {
+      type,
+      url:
+        readString(process.env.PRECHECK_REDIS_URL) ||
+        readString(value?.redisUrl) ||
+        readString(value?.url) ||
+        'redis://127.0.0.1:6379/0',
+      keyPrefix:
+        readString(process.env.PRECHECK_REDIS_KEY_PREFIX) ||
+        readString(value?.keyPrefix) ||
+        readString(value?.prefix) ||
+        'next-ai:gateway:precheck',
+      connectTimeoutMs: resolvePrecheckWindowMs(
+        [process.env.PRECHECK_REDIS_CONNECT_TIMEOUT_MS, value?.connectTimeoutMs],
+        [process.env.PRECHECK_REDIS_CONNECT_TIMEOUT_SECONDS, value?.connectTimeoutSeconds],
+        1000
+      ),
+      commandTimeoutMs: resolvePrecheckWindowMs(
+        [process.env.PRECHECK_REDIS_COMMAND_TIMEOUT_MS, value?.commandTimeoutMs],
+        [process.env.PRECHECK_REDIS_COMMAND_TIMEOUT_SECONDS, value?.commandTimeoutSeconds],
+        1000
+      )
+    };
+  }
+
+  return { type };
 }
 
 function parseGatewayPrecheckStorageType(
@@ -1234,6 +1297,10 @@ function parseGatewayPrecheckStorageType(
   const normalized = value?.trim().toLowerCase();
   if (normalized === 'memory' || normalized === 'in_memory' || normalized === 'in-memory') {
     return 'memory';
+  }
+
+  if (normalized === 'redis') {
+    return 'redis';
   }
 
   return fallback;
@@ -3620,47 +3687,157 @@ function parseProviderPluginsConfig(value: unknown): ProviderPluginConfig[] {
   const usedKeys = new Set<string>();
 
   for (const entry of value) {
+    const plugin = parseProviderPluginEntry(entry, usedKeys);
+    if (plugin) {
+      parsed.push(plugin);
+    }
+  }
+
+  return parsed;
+}
+
+function parseGatewayPluginsConfig(value: unknown): GatewayPluginConfig[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const parsed: GatewayPluginConfig[] = [];
+  const usedKeys = new Set<string>();
+
+  for (const entry of value) {
     if (!isPlainObject(entry)) {
       continue;
     }
 
-    const item = entry as ProviderPluginJsonConfig;
-    const keyBase = readString(item.key);
+    const raw = entry as GatewayPluginJsonConfig;
+    const keyBase = readString(raw.key);
     if (!keyBase) {
       continue;
     }
 
-    const enabled = readBoolean(item.enabled);
+    const enabled = readBoolean(raw.enabled);
     if (enabled === false) {
       continue;
     }
 
-    const auth = parseProviderPluginMutation(item.auth);
-    const request = parseProviderPluginMutation(item.request);
-    const response = parseProviderPluginResponseMutation(item.response);
-    const codexOauth = parseProviderPluginCodexOauth(item.codexOauth);
-    const deepseekThinking = parseProviderPluginDeepSeekThinking(
-      item.deepseekThinking ?? item.deepSeekThinking
+    const key = uniqueProviderName(keyBase, usedKeys);
+    const match = parseGatewayPluginMatch(raw.match);
+    const providerHooks = parseGatewayPluginProviderHooks(
+      raw.providerHooks ?? raw.providerHook ?? raw.hooks,
+      key,
+      match
     );
-    if (!auth && !request && !response && !codexOauth && !deepseekThinking) {
+    const modulePath = readString(raw.modulePath) || readString(raw.path);
+    if (!modulePath && providerHooks.length === 0) {
       continue;
     }
-
-    const provider = parseProvider(readString(item.provider));
-    const providerName = readString(item.providerName);
-    const key = uniqueProviderName(keyBase, usedKeys);
 
     parsed.push({
       key,
       enabled: true,
-      provider,
-      providerName,
-      codexOauth,
-      deepseekThinking,
-      auth,
-      request,
-      response
+      modulePath,
+      match,
+      providerHooks
     });
+  }
+
+  return parsed;
+}
+
+function parseProviderPluginEntry(
+  entry: unknown,
+  usedKeys: Set<string>,
+  defaults?: {
+    keyPrefix?: string;
+    provider?: Provider;
+    providerName?: string;
+  }
+): ProviderPluginConfig | undefined {
+  if (!isPlainObject(entry)) {
+    return undefined;
+  }
+
+  const item = entry as ProviderPluginJsonConfig;
+  const keyBase = readString(item.key) || defaults?.keyPrefix;
+  if (!keyBase) {
+    return undefined;
+  }
+
+  const enabled = readBoolean(item.enabled);
+  if (enabled === false) {
+    return undefined;
+  }
+
+  const auth = parseProviderPluginMutation(item.auth);
+  const request = parseProviderPluginMutation(item.request);
+  const response = parseProviderPluginResponseMutation(item.response);
+  const codexOauth = parseProviderPluginCodexOauth(item.codexOauth);
+  const deepseekThinking = parseProviderPluginDeepSeekThinking(
+    item.deepseekThinking ?? item.deepSeekThinking
+  );
+  if (!auth && !request && !response && !codexOauth && !deepseekThinking) {
+    return undefined;
+  }
+
+  const provider = parseProvider(readString(item.provider)) || defaults?.provider;
+  const providerName = readString(item.providerName) || defaults?.providerName;
+  const key = uniqueProviderName(keyBase, usedKeys);
+
+  return {
+    key,
+    enabled: true,
+    provider,
+    providerName,
+    codexOauth,
+    deepseekThinking,
+    auth,
+    request,
+    response
+  };
+}
+
+function parseGatewayPluginMatch(value: unknown): GatewayPluginConfig['match'] | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+
+  const raw = value as GatewayPluginMatchJsonConfig;
+  const provider = parseProvider(readString(raw.provider));
+  const providerName = readString(raw.providerName);
+  if (!provider && !providerName) {
+    return undefined;
+  }
+
+  return {
+    provider,
+    providerName
+  };
+}
+
+function parseGatewayPluginProviderHooks(
+  value: unknown,
+  pluginKey: string,
+  match?: GatewayPluginConfig['match']
+): GatewayPluginProviderHookConfig[] {
+  if (value === undefined || value === null) {
+    return [];
+  }
+
+  const rawHooks = Array.isArray(value) ? value : [value];
+  const parsed: GatewayPluginProviderHookConfig[] = [];
+  const usedKeys = new Set<string>();
+
+  for (const rawHook of rawHooks) {
+    const hook = parseProviderPluginEntry(rawHook, usedKeys, {
+      keyPrefix: pluginKey,
+      provider: match?.provider,
+      providerName: match?.providerName
+    });
+    if (!hook) {
+      continue;
+    }
+
+    parsed.push(hook);
   }
 
   return parsed;
@@ -4088,7 +4265,7 @@ function parseProviderTypeToken(value: string | undefined): ProviderType | undef
     return 'gemini_generate_content';
   }
 
-  return undefined;
+  return isSafeProviderToken(normalized) ? normalized : undefined;
 }
 
 function parseOpenAIChatToolsFormatToken(value: string | undefined): ProviderConfig['openaiChatToolsFormat'] {

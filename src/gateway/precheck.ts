@@ -1,12 +1,17 @@
 import { createHash } from 'node:crypto';
+import net from 'node:net';
+import tls from 'node:tls';
 import type { FastifyRequest } from 'fastify';
 import { calculateUsageBilling } from '../billing';
 import type {
   BillingRate,
   GatewayConfig,
   GatewayPrecheckRuleBaseConfig,
+  GatewayPrecheckRedisStorageConfig,
+  GatewayPrecheckStorageConfig,
   GatewayPrecheckScope,
   GatewayPrecheckSubject,
+  GatewayApiKeyRestrictions,
   GatewayRateLimitDimensionConfig,
   GatewayRateLimitMetric,
   GatewayRateLimitPrecheckConfig,
@@ -81,19 +86,32 @@ interface PendingCheck {
   windowStart: number;
 }
 
+type RedisReservationResult =
+  | { ok: true }
+  | { ok: false; failedIndex: number; used: number };
+
+type RedisReservationExecutor = (
+  storage: GatewayPrecheckRedisStorageConfig,
+  checks: PendingCheck[]
+) => Promise<RedisReservationResult>;
+
 const counters = new Map<string, WindowCounter>();
+const redisClients = new Map<string, RedisPrecheckClient>();
+let redisReservationExecutorForTests: RedisReservationExecutor | undefined;
 
 export async function evaluateGatewayPrecheck(input: GatewayPrecheckInput): Promise<GatewayPrecheckResult> {
   const precheck = input.config.precheck;
-  if (!precheck?.enabled) {
+  const apiKeyRestrictionLimits = resolveApiKeyRestrictionRateLimits(input.request);
+  if (!precheck?.enabled && apiKeyRestrictionLimits.length === 0) {
     return { ok: true };
   }
 
-  const rateLimitRules = precheck.rateLimit.enabled
-    ? resolveRateLimitRules(precheck.rateLimit)
-    : [];
-  const hasQuota = precheck.quota.enabled && precheck.quota.maxTokens > 0;
-  const hasBudget = precheck.budget.enabled && precheck.budget.maxCostUsd > 0;
+  const staticPrecheckEnabled = precheck.enabled === true;
+  const rateLimitRules = staticPrecheckEnabled && precheck.rateLimit.enabled
+    ? [...resolveRateLimitRules(precheck.rateLimit), ...apiKeyRestrictionLimits]
+    : apiKeyRestrictionLimits;
+  const hasQuota = staticPrecheckEnabled && precheck.quota.enabled && precheck.quota.maxTokens > 0;
+  const hasBudget = staticPrecheckEnabled && precheck.budget.enabled && precheck.budget.maxCostUsd > 0;
 
   if (rateLimitRules.length === 0 && !hasQuota && !hasBudget) {
     return { ok: true };
@@ -152,6 +170,18 @@ export async function evaluateGatewayPrecheck(input: GatewayPrecheckInput): Prom
     );
   }
 
+  return reserveChecks(input.config.precheck.storage, checks, estimate);
+}
+
+async function reserveChecks(
+  storage: GatewayPrecheckStorageConfig,
+  checks: PendingCheck[],
+  estimate: GatewayPrecheckEstimate | undefined
+): Promise<GatewayPrecheckResult> {
+  if (storage.type === 'redis') {
+    return reserveRedisChecks(storage, checks, estimate);
+  }
+
   return reserveMemoryChecks(checks, estimate);
 }
 
@@ -175,12 +205,66 @@ function reserveMemoryChecks(
   return { ok: true, estimate };
 }
 
+async function reserveRedisChecks(
+  storage: GatewayPrecheckRedisStorageConfig,
+  checks: PendingCheck[],
+  estimate: GatewayPrecheckEstimate | undefined
+): Promise<GatewayPrecheckResult> {
+  if (checks.length === 0) {
+    return { ok: true, estimate };
+  }
+
+  try {
+    const reservation = redisReservationExecutorForTests
+      ? await redisReservationExecutorForTests(storage, checks)
+      : await getRedisPrecheckClient(storage).reserve(checks);
+    if (reservation.ok) {
+      return { ok: true, estimate };
+    }
+
+    const failedCheck = checks[Math.max(0, reservation.failedIndex - 1)] || checks[0];
+    return buildPrecheckFailure(failedCheck, reservation.used, estimate);
+  } catch (error) {
+    return buildPrecheckStoreFailure(checks[0], estimate, error);
+  }
+}
+
+function getRedisPrecheckClient(storage: GatewayPrecheckRedisStorageConfig): RedisPrecheckClient {
+  const cacheKey = [
+    storage.url,
+    storage.keyPrefix,
+    storage.connectTimeoutMs,
+    storage.commandTimeoutMs
+  ].join('|');
+  const existing = redisClients.get(cacheKey);
+  if (existing) {
+    return existing;
+  }
+
+  const created = new RedisPrecheckClient(storage);
+  redisClients.set(cacheKey, created);
+  return created;
+}
+
 export async function closeGatewayPrecheckStore(): Promise<void> {
-  return;
+  const clients = [...redisClients.values()];
+  redisClients.clear();
+  await Promise.allSettled(clients.map((client) => client.close()));
 }
 
 export function resetGatewayPrecheckStateForTests(): void {
   counters.clear();
+  redisReservationExecutorForTests = undefined;
+  for (const client of redisClients.values()) {
+    void client.close();
+  }
+  redisClients.clear();
+}
+
+export function setGatewayPrecheckRedisReservationExecutorForTests(
+  executor: RedisReservationExecutor | undefined
+): void {
+  redisReservationExecutorForTests = executor;
 }
 
 function resolveRateLimitRules(
@@ -205,6 +289,433 @@ function resolveRateLimitRules(
       headerName: rateLimit.headerName
     }
   ];
+}
+
+function resolveApiKeyRestrictionRateLimits(
+  request: FastifyRequest
+): GatewayRateLimitDimensionConfig[] {
+  const restrictions = (
+    request as FastifyRequest & {
+      gatewayApiKeyRestrictions?: GatewayApiKeyRestrictions;
+    }
+  ).gatewayApiKeyRestrictions;
+  if (!restrictions) {
+    return [];
+  }
+
+  const maxRequests = normalizePositiveInteger(
+    restrictions.rateLimit ?? restrictions.requestsPerMinute
+  );
+  if (!maxRequests) {
+    return [];
+  }
+
+  const windowSeconds =
+    normalizePositiveInteger(restrictions.rateLimitWindowSeconds) || 60;
+  return [
+    {
+      enabled: true,
+      name: 'api_key_restriction',
+      metric: 'requests',
+      windowMs: Math.min(Math.max(windowSeconds, 1), 3600) * 1000,
+      max: maxRequests,
+      subject: 'api_key',
+      scope: 'global',
+    },
+  ];
+}
+
+function normalizePositiveInteger(value: unknown): number | undefined {
+  const numeric =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string'
+        ? Number(value)
+        : NaN;
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return undefined;
+  }
+
+  return Math.floor(numeric);
+}
+
+const redisReserveScript = `
+local count = tonumber(ARGV[1])
+for i = 1, count do
+  local offset = 1 + ((i - 1) * 3)
+  local requested = tonumber(ARGV[offset + 1])
+  local limit = tonumber(ARGV[offset + 2])
+  local used = tonumber(redis.call("GET", KEYS[i]) or "0")
+  if used + requested > limit then
+    return {0, i, used}
+  end
+end
+for i = 1, count do
+  local offset = 1 + ((i - 1) * 3)
+  local requested = tonumber(ARGV[offset + 1])
+  local ttl = tonumber(ARGV[offset + 3])
+  redis.call("INCRBYFLOAT", KEYS[i], requested)
+  redis.call("PEXPIRE", KEYS[i], ttl)
+end
+return {1, 0, 0}
+`.trim();
+
+class RedisPrecheckClient {
+  private socket?: net.Socket | tls.TLSSocket;
+  private connecting?: Promise<void>;
+  private buffer = Buffer.alloc(0);
+  private pending: Array<{
+    resolve: (value: RedisReply) => void;
+    reject: (error: Error) => void;
+    timer: NodeJS.Timeout;
+  }> = [];
+
+  constructor(private readonly storage: GatewayPrecheckRedisStorageConfig) {}
+
+  async reserve(checks: PendingCheck[]): Promise<RedisReservationResult> {
+    const now = Date.now();
+    const keys = checks.map((check) => this.buildRedisKey(check));
+    const args = checks.flatMap((check) => [
+      formatRedisNumber(check.requested),
+      formatRedisNumber(check.limit),
+      String(Math.max(check.windowStart + check.windowMs - now, 1) + 1000)
+    ]);
+    const reply = await this.command([
+      'EVAL',
+      redisReserveScript,
+      String(keys.length),
+      ...keys,
+      String(keys.length),
+      ...args
+    ]);
+    const parsed = parseRedisReservationReply(reply);
+    if (!parsed) {
+      throw new Error('Redis precheck reservation returned an invalid response.');
+    }
+
+    return parsed;
+  }
+
+  async close(): Promise<void> {
+    const socket = this.socket;
+    this.socket = undefined;
+    this.connecting = undefined;
+    if (!socket) {
+      return;
+    }
+
+    socket.destroy();
+  }
+
+  private buildRedisKey(check: PendingCheck): string {
+    const prefix = this.storage.keyPrefix.replace(/:+$/, '') || 'next-ai:gateway:precheck';
+    const hash = createHash('sha256').update(check.key).digest('hex');
+    return `${prefix}:${hash}:${check.windowStart}`;
+  }
+
+  private async command(args: string[]): Promise<RedisReply> {
+    await this.ensureConnected();
+    return this.rawCommand(args);
+  }
+
+  private async ensureConnected(): Promise<void> {
+    if (this.socket && !this.socket.destroyed && !this.connecting) {
+      return;
+    }
+
+    if (!this.connecting) {
+      this.connecting = this.connect();
+    }
+
+    const connecting = this.connecting;
+    try {
+      await connecting;
+    } finally {
+      if (this.connecting === connecting) {
+        this.connecting = undefined;
+      }
+    }
+  }
+
+  private async connect(): Promise<void> {
+    const parsed = parseRedisUrl(this.storage.url);
+    const socket = parsed.tls
+      ? tls.connect({
+          host: parsed.host,
+          port: parsed.port,
+          servername: parsed.host
+        })
+      : net.createConnection({
+          host: parsed.host,
+          port: parsed.port
+        });
+    this.socket = socket;
+    socket.setNoDelay(true);
+    socket.on('data', (chunk) => this.handleData(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    socket.on('error', (error) => this.handleSocketError(error));
+    socket.on('close', () => this.handleSocketClose());
+
+    await waitForSocketConnect(socket, this.storage.connectTimeoutMs, parsed.tls);
+
+    if (parsed.password) {
+      await this.rawCommand(
+        parsed.username
+          ? ['AUTH', parsed.username, parsed.password]
+          : ['AUTH', parsed.password]
+      );
+    }
+
+    if (parsed.db !== undefined && parsed.db > 0) {
+      await this.rawCommand(['SELECT', String(parsed.db)]);
+    }
+  }
+
+  private rawCommand(args: string[]): Promise<RedisReply> {
+    const socket = this.socket;
+    if (!socket || socket.destroyed) {
+      return Promise.reject(new Error('Redis precheck socket is not connected.'));
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error('Redis precheck command timed out.'));
+        socket.destroy();
+      }, this.storage.commandTimeoutMs);
+      this.pending.push({ resolve, reject, timer });
+      socket.write(serializeRedisCommand(args), (error) => {
+        if (error) {
+          clearTimeout(timer);
+          this.removePending(resolve);
+          reject(error);
+        }
+      });
+    });
+  }
+
+  private removePending(resolve: (value: RedisReply) => void): void {
+    const index = this.pending.findIndex((item) => item.resolve === resolve);
+    if (index >= 0) {
+      this.pending.splice(index, 1);
+    }
+  }
+
+  private handleData(chunk: Buffer): void {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+    while (this.pending.length > 0) {
+      const parsed = parseRedisReply(this.buffer, 0);
+      if (!parsed) {
+        return;
+      }
+
+      this.buffer = this.buffer.subarray(parsed.offset);
+      const pending = this.pending.shift();
+      if (!pending) {
+        return;
+      }
+
+      clearTimeout(pending.timer);
+      if (parsed.value instanceof Error) {
+        pending.reject(parsed.value);
+      } else {
+        pending.resolve(parsed.value);
+      }
+    }
+  }
+
+  private handleSocketError(error: Error): void {
+    this.rejectAll(error);
+  }
+
+  private handleSocketClose(): void {
+    this.socket = undefined;
+    this.connecting = undefined;
+    this.rejectAll(new Error('Redis precheck socket closed.'));
+  }
+
+  private rejectAll(error: Error): void {
+    const pending = this.pending.splice(0);
+    for (const item of pending) {
+      clearTimeout(item.timer);
+      item.reject(error);
+    }
+  }
+}
+
+type RedisReply = string | number | null | RedisReply[];
+
+interface ParsedRedisUrl {
+  tls: boolean;
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  db?: number;
+}
+
+function parseRedisUrl(value: string): ParsedRedisUrl {
+  const parsed = new URL(value);
+  if (parsed.protocol !== 'redis:' && parsed.protocol !== 'rediss:') {
+    throw new Error('precheck.storage redis url must use redis:// or rediss://.');
+  }
+
+  const dbRaw = parsed.pathname.replace(/^\//, '').trim();
+  const db = dbRaw ? Number(dbRaw) : undefined;
+  if (db !== undefined && (!Number.isInteger(db) || db < 0)) {
+    throw new Error('precheck.storage redis url has an invalid database index.');
+  }
+
+  return {
+    tls: parsed.protocol === 'rediss:',
+    host: parsed.hostname || '127.0.0.1',
+    port: parsed.port ? Number(parsed.port) : 6379,
+    username: parsed.username ? decodeURIComponent(parsed.username) : undefined,
+    password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
+    db
+  };
+}
+
+function waitForSocketConnect(
+  socket: net.Socket | tls.TLSSocket,
+  timeoutMs: number,
+  secure: boolean
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const connectEvent = secure ? 'secureConnect' : 'connect';
+    const timer = setTimeout(() => {
+      cleanup();
+      socket.destroy();
+      reject(new Error('Redis precheck connection timed out.'));
+    }, timeoutMs);
+    const onConnect = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off(connectEvent, onConnect);
+      socket.off('error', onError);
+    };
+
+    socket.once(connectEvent, onConnect);
+    socket.once('error', onError);
+  });
+}
+
+function serializeRedisCommand(args: string[]): Buffer {
+  const chunks: string[] = [`*${args.length}\r\n`];
+  for (const arg of args) {
+    const value = Buffer.from(arg);
+    chunks.push(`$${value.length}\r\n`, arg, '\r\n');
+  }
+
+  return Buffer.from(chunks.join(''));
+}
+
+function parseRedisReply(
+  buffer: Buffer,
+  offset: number
+): { value: RedisReply | Error; offset: number } | undefined {
+  if (offset >= buffer.length) {
+    return undefined;
+  }
+
+  const type = String.fromCharCode(buffer[offset]);
+  if (type === '+' || type === '-' || type === ':') {
+    const lineEnd = buffer.indexOf('\r\n', offset + 1);
+    if (lineEnd < 0) {
+      return undefined;
+    }
+
+    const line = buffer.toString('utf8', offset + 1, lineEnd);
+    if (type === '+') {
+      return { value: line, offset: lineEnd + 2 };
+    }
+    if (type === '-') {
+      return { value: new Error(line), offset: lineEnd + 2 };
+    }
+
+    return { value: Number(line), offset: lineEnd + 2 };
+  }
+
+  if (type === '$') {
+    const lineEnd = buffer.indexOf('\r\n', offset + 1);
+    if (lineEnd < 0) {
+      return undefined;
+    }
+
+    const length = Number(buffer.toString('utf8', offset + 1, lineEnd));
+    if (length < 0) {
+      return { value: null, offset: lineEnd + 2 };
+    }
+
+    const start = lineEnd + 2;
+    const end = start + length;
+    if (buffer.length < end + 2) {
+      return undefined;
+    }
+
+    return {
+      value: buffer.toString('utf8', start, end),
+      offset: end + 2
+    };
+  }
+
+  if (type === '*') {
+    const lineEnd = buffer.indexOf('\r\n', offset + 1);
+    if (lineEnd < 0) {
+      return undefined;
+    }
+
+    const count = Number(buffer.toString('utf8', offset + 1, lineEnd));
+    if (count < 0) {
+      return { value: null, offset: lineEnd + 2 };
+    }
+
+    const values: RedisReply[] = [];
+    let cursor = lineEnd + 2;
+    for (let index = 0; index < count; index += 1) {
+      const item = parseRedisReply(buffer, cursor);
+      if (!item) {
+        return undefined;
+      }
+
+      if (item.value instanceof Error) {
+        return item;
+      }
+
+      values.push(item.value);
+      cursor = item.offset;
+    }
+
+    return { value: values, offset: cursor };
+  }
+
+  return { value: new Error(`Unsupported Redis reply type: ${type}`), offset: buffer.length };
+}
+
+function parseRedisReservationReply(reply: RedisReply): RedisReservationResult | undefined {
+  if (!Array.isArray(reply) || reply.length < 3) {
+    return undefined;
+  }
+
+  const allowed = Number(reply[0]);
+  if (allowed === 1) {
+    return { ok: true };
+  }
+
+  return {
+    ok: false,
+    failedIndex: Math.max(Number(reply[1]) || 1, 1),
+    used: Number(reply[2]) || 0
+  };
+}
+
+function formatRedisNumber(value: number): string {
+  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(12)));
 }
 
 function buildRateLimitPendingCheck(
@@ -312,6 +823,32 @@ function buildPrecheckFailure(
       window_ms: check.windowMs,
       limit: check.limit,
       used,
+      requested: check.requested,
+      metric: check.metric,
+      limit_name: check.limitName,
+      estimated: estimate
+    }
+  };
+}
+
+function buildPrecheckStoreFailure(
+  check: PendingCheck,
+  estimate: GatewayPrecheckEstimate | undefined,
+  error: unknown
+): GatewayPrecheckFailure {
+  void error;
+  return {
+    ok: false,
+    kind: check.kind,
+    statusCode: 503,
+    code: 'precheck_store_unavailable',
+    message: 'Gateway precheck store is unavailable.',
+    details: {
+      subject: check.subjectKey,
+      scope: check.scopeKey,
+      window_ms: check.windowMs,
+      limit: check.limit,
+      used: 0,
       requested: check.requested,
       metric: check.metric,
       limit_name: check.limitName,

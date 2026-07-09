@@ -2571,7 +2571,7 @@ function emitGeminiInteractionsFramesFromOpenAIChatChunk(
 
   frames.push(...emitGeminiInteractionsToolCallsFromOpenAIChatDelta(state, delta?.tool_calls));
 
-  const usage = isObject(payload.usage) ? payload.usage : undefined;
+  const usage = openAIChatChunkUsage(payload, firstChoice);
   if (usage) {
     state.usage = buildGeminiInteractionsUsageFromOpenAIChatUsage(usage);
   }
@@ -3247,9 +3247,9 @@ function emitGeminiFramesFromOpenAIChatChunk(
     state.model = model;
   }
 
-  updateGeminiRelayUsageFromOpenAIChat(state, isObject(payload.usage) ? payload.usage : undefined);
-
   const firstChoice = Array.isArray(payload.choices) && isObject(payload.choices[0]) ? payload.choices[0] : undefined;
+  updateGeminiRelayUsageFromOpenAIChat(state, openAIChatChunkUsage(payload, firstChoice));
+
   const delta = isObject(firstChoice?.delta) ? firstChoice.delta : undefined;
   const deltaText = asString(delta?.content) || asString(delta?.reasoning_content) || '';
   const finishReason = asString(firstChoice?.finish_reason);
@@ -3576,7 +3576,7 @@ function updateGeminiRelayUsageFromOpenAIChat(
   }
 
   const promptDetails = isObject(usage.prompt_tokens_details) ? usage.prompt_tokens_details : undefined;
-  const cachedTokens = asNumber(promptDetails?.cached_tokens);
+  const cachedTokens = asNumber(promptDetails?.cached_tokens) ?? asNumber(usage.cached_tokens);
   if (cachedTokens !== undefined) {
     state.usage.cachedContentTokenCount = cachedTokens;
   }
@@ -3697,10 +3697,10 @@ function emitOpenAIResponsesFramesFromChatChunk(
     state.model = model;
   }
 
-  const usage = isObject(payload.usage) ? payload.usage : undefined;
+  const firstChoice = Array.isArray(payload.choices) && isObject(payload.choices[0]) ? payload.choices[0] : undefined;
+  const usage = openAIChatChunkUsage(payload, firstChoice);
   updateOpenAIResponsesRelayUsageFromChat(state, usage);
 
-  const firstChoice = Array.isArray(payload.choices) && isObject(payload.choices[0]) ? payload.choices[0] : undefined;
   const delta = isObject(firstChoice?.delta) ? firstChoice.delta : undefined;
   const deltaText = asString(delta?.content) || '';
   const reasoningDeltas = collectOpenAIChatReasoningDeltas(delta);
@@ -4456,6 +4456,17 @@ function updateOpenAIResponsesRelayUsageFromChat(
   state.usage = mappedUsage;
 }
 
+function openAIChatChunkUsage(
+  payload: Record<string, unknown>,
+  firstChoice: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  return isObject(payload.usage)
+    ? payload.usage
+    : isObject(firstChoice?.usage)
+      ? firstChoice.usage
+      : undefined;
+}
+
 function emitAnthropicFramesFromOpenAIChatChunk(
   state: AnthropicRelayState,
   payload: Record<string, unknown>
@@ -4470,10 +4481,10 @@ function emitAnthropicFramesFromOpenAIChatChunk(
     state.model = model;
   }
 
-  const usage = isObject(payload.usage) ? payload.usage : undefined;
+  const firstChoice = Array.isArray(payload.choices) && isObject(payload.choices[0]) ? payload.choices[0] : undefined;
+  const usage = openAIChatChunkUsage(payload, firstChoice);
   updateAnthropicRelayUsage(state, usage);
 
-  const firstChoice = Array.isArray(payload.choices) && isObject(payload.choices[0]) ? payload.choices[0] : undefined;
   const delta = isObject(firstChoice?.delta) ? firstChoice.delta : undefined;
   const deltaText = asString(delta?.content) || '';
   const reasoningDeltas = collectOpenAIChatReasoningDeltas(delta);
@@ -5088,6 +5099,7 @@ function buildGeminiInteractionsUsageFromOpenAIUsage(
     total_cached_tokens:
       asNumber(isObject(usage.input_tokens_details) ? usage.input_tokens_details.cached_tokens : undefined) ??
       asNumber(isObject(usage.prompt_tokens_details) ? usage.prompt_tokens_details.cached_tokens : undefined) ??
+      asNumber(usage.cached_tokens) ??
       asNumber(usage.cache_read_tokens) ??
       asNumber(usage.cache_read_input_tokens)
   };
@@ -5957,9 +5969,9 @@ function collectOpenAINonStreamStateFromChatChunk(
     state.model = model;
   }
 
-  updateOpenAIResponsesRelayUsageFromChat(state, isObject(payload.usage) ? payload.usage : undefined);
-
   const firstChoice = Array.isArray(payload.choices) && isObject(payload.choices[0]) ? payload.choices[0] : undefined;
+  updateOpenAIResponsesRelayUsageFromChat(state, openAIChatChunkUsage(payload, firstChoice));
+
   const delta = isObject(firstChoice?.delta) ? firstChoice.delta : undefined;
   const deltaText = asString(delta?.content) || '';
   if (deltaText) {

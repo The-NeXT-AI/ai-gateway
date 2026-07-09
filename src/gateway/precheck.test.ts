@@ -1,7 +1,11 @@
 import type { FastifyRequest } from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { GatewayConfig, GatewayPrecheckConfig, ProviderConfig, StandardRequest } from '../types';
-import { evaluateGatewayPrecheck, resetGatewayPrecheckStateForTests } from './precheck';
+import {
+  evaluateGatewayPrecheck,
+  resetGatewayPrecheckStateForTests,
+  setGatewayPrecheckRedisReservationExecutorForTests
+} from './precheck';
 
 type TestPrecheckConfig = Omit<GatewayPrecheckConfig, 'storage'> &
   Partial<Pick<GatewayPrecheckConfig, 'storage'>>;
@@ -306,6 +310,245 @@ describe('evaluateGatewayPrecheck', () => {
     }
   });
 
+  it('enforces API key restriction rate limits even when static precheck is disabled', async () => {
+    const config = createConfig({
+      enabled: false,
+      rateLimit: disabledRateLimit(),
+      quota: disabledQuota(),
+      budget: disabledBudget(),
+      estimation: {
+        charsPerToken: 4,
+        defaultMaxOutputTokens: 0
+      }
+    });
+    const request = createRequest() as FastifyRequest & {
+      gatewayIdentity?: { apiKeyId: string; source: 'http_introspection'; billingSubjectKey: string };
+      gatewayApiKeyRestrictions?: { rateLimit: number; rateLimitWindowSeconds: number };
+    };
+    request.gatewayIdentity = {
+      source: 'http_introspection',
+      billingSubjectKey: 'user-1',
+      apiKeyId: 'key-1'
+    };
+    request.gatewayApiKeyRestrictions = {
+      rateLimit: 1,
+      rateLimitWindowSeconds: 60
+    };
+    const input = {
+      request,
+      config,
+      targetProvider: 'openai' as const,
+      model: 'gpt-test',
+      standardRequest: createStandardRequest('hello')
+    };
+
+    expect((await evaluateGatewayPrecheck(input)).ok).toBe(true);
+    const rejected = await evaluateGatewayPrecheck(input);
+
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(rejected.statusCode).toBe(429);
+      expect(rejected.details.limit_name).toBe('api_key_restriction');
+      expect(rejected.details.subject).toBe('key-1');
+      expect(rejected.details.limit).toBe(1);
+      expect(rejected.details.window_ms).toBe(60_000);
+    }
+  });
+
+  it('does not enable static precheck rules when only API key restrictions are active', async () => {
+    const config = createConfig({
+      enabled: false,
+      rateLimit: createRateLimit([
+        {
+          enabled: true,
+          name: 'static-global',
+          metric: 'requests',
+          windowMs: 60_000,
+          max: 1,
+          subject: 'global',
+          scope: 'global'
+        }
+      ]),
+      quota: disabledQuota(),
+      budget: disabledBudget(),
+      estimation: {
+        charsPerToken: 4,
+        defaultMaxOutputTokens: 0
+      }
+    });
+    const request = createRequest() as FastifyRequest & {
+      gatewayIdentity?: { apiKeyId: string; source: 'http_introspection'; billingSubjectKey: string };
+      gatewayApiKeyRestrictions?: { requestsPerMinute: number };
+    };
+    request.gatewayIdentity = {
+      source: 'http_introspection',
+      billingSubjectKey: 'user-1',
+      apiKeyId: 'key-2'
+    };
+    request.gatewayApiKeyRestrictions = {
+      requestsPerMinute: 2
+    };
+    const input = {
+      request,
+      config,
+      targetProvider: 'openai' as const,
+      model: 'gpt-test',
+      standardRequest: createStandardRequest('hello')
+    };
+
+    expect((await evaluateGatewayPrecheck(input)).ok).toBe(true);
+    expect((await evaluateGatewayPrecheck(input)).ok).toBe(true);
+    const rejected = await evaluateGatewayPrecheck(input);
+
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(rejected.details.limit_name).toBe('api_key_restriction');
+      expect(rejected.details.limit).toBe(2);
+    }
+  });
+
+  it('uses Redis storage reservation when precheck storage is redis', async () => {
+    const config = createConfig({
+      enabled: true,
+      rateLimit: createRateLimit([
+        {
+          enabled: true,
+          name: 'global-rpm',
+          metric: 'requests',
+          windowMs: 60_000,
+          max: 5,
+          subject: 'global',
+          scope: 'global'
+        }
+      ]),
+      quota: disabledQuota(),
+      budget: disabledBudget(),
+      estimation: {
+        charsPerToken: 4,
+        defaultMaxOutputTokens: 0
+      },
+      storage: {
+        type: 'redis',
+        url: 'redis://cache.local:6379/2',
+        keyPrefix: 'test:precheck',
+        connectTimeoutMs: 50,
+        commandTimeoutMs: 50
+      }
+    });
+    const calls: Array<{ storage: GatewayPrecheckConfig['storage']; limitNames: Array<string | undefined> }> = [];
+    setGatewayPrecheckRedisReservationExecutorForTests(async (storage, checks) => {
+      calls.push({
+        storage,
+        limitNames: checks.map((check) => check.limitName)
+      });
+      return { ok: true };
+    });
+
+    const result = await evaluateGatewayPrecheck({
+      request: createRequest(),
+      config,
+      targetProvider: 'openai',
+      model: 'gpt-test',
+      standardRequest: createStandardRequest('hello')
+    });
+
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].storage).toMatchObject({
+      type: 'redis',
+      url: 'redis://cache.local:6379/2',
+      keyPrefix: 'test:precheck'
+    });
+    expect(calls[0].limitNames).toEqual(['global-rpm']);
+  });
+
+  it('returns a rate-limit failure from Redis reservation denial', async () => {
+    const config = createConfig({
+      enabled: true,
+      rateLimit: createRateLimit([
+        {
+          enabled: true,
+          name: 'global-rpm',
+          metric: 'requests',
+          windowMs: 60_000,
+          max: 1,
+          subject: 'global',
+          scope: 'global'
+        }
+      ]),
+      quota: disabledQuota(),
+      budget: disabledBudget(),
+      estimation: {
+        charsPerToken: 4,
+        defaultMaxOutputTokens: 0
+      },
+      storage: redisPrecheckStorage()
+    });
+    setGatewayPrecheckRedisReservationExecutorForTests(async () => ({
+      ok: false,
+      failedIndex: 1,
+      used: 1
+    }));
+
+    const result = await evaluateGatewayPrecheck({
+      request: createRequest(),
+      config,
+      targetProvider: 'openai',
+      model: 'gpt-test',
+      standardRequest: createStandardRequest('hello')
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.statusCode).toBe(429);
+      expect(result.code).toBe('rate_limit_exceeded');
+      expect(result.details.limit_name).toBe('global-rpm');
+      expect(result.details.used).toBe(1);
+    }
+  });
+
+  it('fails closed when Redis precheck storage is unavailable', async () => {
+    const config = createConfig({
+      enabled: true,
+      rateLimit: createRateLimit([
+        {
+          enabled: true,
+          name: 'global-rpm',
+          metric: 'requests',
+          windowMs: 60_000,
+          max: 1,
+          subject: 'global',
+          scope: 'global'
+        }
+      ]),
+      quota: disabledQuota(),
+      budget: disabledBudget(),
+      estimation: {
+        charsPerToken: 4,
+        defaultMaxOutputTokens: 0
+      },
+      storage: redisPrecheckStorage()
+    });
+    setGatewayPrecheckRedisReservationExecutorForTests(async () => {
+      throw new Error('redis down');
+    });
+
+    const result = await evaluateGatewayPrecheck({
+      request: createRequest(),
+      config,
+      targetProvider: 'openai',
+      model: 'gpt-test',
+      standardRequest: createStandardRequest('hello')
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.statusCode).toBe(503);
+      expect(result.code).toBe('precheck_store_unavailable');
+      expect(result.details.limit_name).toBe('global-rpm');
+    }
+  });
+
 });
 
 function disabledRateLimit(): GatewayPrecheckConfig['rateLimit'] {
@@ -406,6 +649,16 @@ function createConfig(precheck: TestPrecheckConfig): GatewayConfig {
 function memoryPrecheckStorage(): GatewayPrecheckConfig['storage'] {
   return {
     type: 'memory'
+  };
+}
+
+function redisPrecheckStorage(): GatewayPrecheckConfig['storage'] {
+  return {
+    type: 'redis',
+    url: 'redis://127.0.0.1:6379/0',
+    keyPrefix: 'test:precheck',
+    connectTimeoutMs: 50,
+    commandTimeoutMs: 50
   };
 }
 

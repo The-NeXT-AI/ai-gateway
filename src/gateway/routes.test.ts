@@ -1,5 +1,5 @@
 import { createCipheriv, randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Fastify from 'fastify';
@@ -14,6 +14,7 @@ import { resetGatewayPrecheckStateForTests } from './precheck';
 import { resetGatewaySchedulingStateForTests } from './scheduler';
 import { closeRawTraceManager, initializeRawTraceManager } from '../raw-trace';
 import { closeCodexOauthStateStore, updateDistributedCredentialEncryption } from '../provider/plugins';
+import { syncGatewayPluginModulesFromConfig } from '../plugins/loader';
 import type { GatewayConfig, ProviderConfig, ProviderPluginConfig, TargetAdapter } from '../types';
 
 describe('gateway routes protocol conversion', () => {
@@ -1120,6 +1121,172 @@ describe('gateway routes protocol conversion', () => {
       expect(fetchMock).toHaveBeenCalledTimes(3);
       const [, thirdAttemptInit] = fetchMock.mock.calls[2] as unknown as [string, RequestInit];
       expect((thirdAttemptInit.headers as Record<string, string>).authorization).toBe('Bearer credential-b');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not fall back to the next provider when the status is not allowed for cross-provider fallback', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.startsWith('https://primary.example/v1/')) {
+        return new Response(JSON.stringify({ error: { message: 'bad request' } }), {
+          status: 400,
+          headers: {
+            'content-type': 'application/json'
+          }
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_backup_should_not_run',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'backup'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            total_tokens: 6
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const primary = createProviderConfig('openai-primary', 'openai_chat_completions', ['glm-5']);
+    primary.baseurl = 'https://primary.example/v1';
+    const backup = createProviderConfig('openai-backup', 'openai_chat_completions', ['glm-5']);
+    backup.baseurl = 'https://backup.example/v1';
+    const config = createConfig([primary, backup]);
+    config.scheduling.enabled = true;
+    config.scheduling.fallback = {
+      ...config.scheduling.fallback,
+      retryStatusCodes: [502],
+      crossProviderStatusCodes: [502]
+    };
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-providers': 'openai-primary,openai-backup'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.headers['x-gateway-fallback-used']).toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(response.body);
+      expect(body.error.attempts).toHaveLength(1);
+      expect(body.error.attempts[0]).toMatchObject({
+        provider_name: 'openai-primary',
+        stage: 'upstream_response',
+        status: 400
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('falls back to the next provider when the status is allowed for cross-provider fallback', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.startsWith('https://primary.example/v1/')) {
+        return new Response(JSON.stringify({ error: { message: 'bad gateway' } }), {
+          status: 502,
+          headers: {
+            'content-type': 'application/json'
+          }
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_backup',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'backup'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            total_tokens: 6
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const primary = createProviderConfig('openai-primary', 'openai_chat_completions', ['glm-5']);
+    primary.baseurl = 'https://primary.example/v1';
+    const backup = createProviderConfig('openai-backup', 'openai_chat_completions', ['glm-5']);
+    backup.baseurl = 'https://backup.example/v1';
+    const config = createConfig([primary, backup]);
+    config.scheduling.enabled = true;
+    config.scheduling.fallback = {
+      ...config.scheduling.fallback,
+      retryStatusCodes: [502],
+      crossProviderStatusCodes: [502]
+    };
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-providers': 'openai-primary,openai-backup'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['x-gateway-fallback-used']).toBe('true');
+      expect(response.headers['x-gateway-target-provider-name']).toBe('openai-backup');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     } finally {
       await app.close();
     }
@@ -2481,6 +2648,57 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('streams chat/completions choice-level usage as Anthropic message_delta usage', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'data: {"id":"chatcmpl_choice_usage","object":"chat.completion.chunk","model":"kimi-for-coding","choices":[{"index":0,"delta":{"content":"hello"}}]}\n\n',
+        'data: {"id":"chatcmpl_choice_usage","object":"chat.completion.chunk","model":"kimi-for-coding","choices":[{"index":0,"delta":{},"finish_reason":"length","usage":{"prompt_tokens":12,"completion_tokens":16,"total_tokens":28,"cached_tokens":3,"prompt_tokens_details":{"cached_tokens":3}}}]}\n\n',
+        'data: {"id":"chatcmpl_choice_usage","object":"chat.completion.chunk","model":"kimi-for-coding","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":16,"total_tokens":28,"cached_tokens":3,"prompt_tokens_details":{"cached_tokens":3}}}\n\n',
+        'data: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['kimi-for-coding'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'kimi-for-coding',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const messageDeltaLine = response.body
+        .split('\n')
+        .find((line) => line.startsWith('data: ') && line.includes('"type":"message_delta"'));
+      expect(messageDeltaLine).toBeDefined();
+      const messageDelta = JSON.parse(String(messageDeltaLine).slice('data: '.length));
+      expect(messageDelta.usage).toMatchObject({
+        input_tokens: 12,
+        output_tokens: 16,
+        cache_read_input_tokens: 3
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
   it('defaults Responses completed usage when chat/completions stream omits usage', async () => {
     const fetchMock = vi.fn(async () => {
       return createSseResponse([
@@ -2583,6 +2801,58 @@ describe('gateway routes protocol conversion', () => {
         total_tokens: 5
       });
       expect(response.body).toContain('data: [DONE]');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('includes chat/completions choice-level usage in Responses completed event', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'data: {"id":"chatcmpl_choice_usage_responses","object":"chat.completion.chunk","model":"kimi-for-coding","choices":[{"index":0,"delta":{"content":"hello"}}]}\n\n',
+        'data: {"id":"chatcmpl_choice_usage_responses","object":"chat.completion.chunk","model":"kimi-for-coding","choices":[{"index":0,"delta":{},"finish_reason":"length","usage":{"prompt_tokens":12,"completion_tokens":16,"total_tokens":28,"cached_tokens":3,"prompt_tokens_details":{"cached_tokens":3}}}]}\n\n',
+        'data: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['kimi-for-coding'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'kimi-for-coding',
+          input: 'hello',
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const completedLine = response.body
+        .split('\n')
+        .find((line) => line.startsWith('data: ') && line.includes('"type":"response.completed"'));
+      expect(completedLine).toBeDefined();
+      const completed = JSON.parse(String(completedLine).slice('data: '.length));
+      expect(completed.response.usage).toMatchObject({
+        input_tokens: 12,
+        input_tokens_details: {
+          cached_tokens: 3
+        },
+        output_tokens: 16,
+        total_tokens: 28
+      });
     } finally {
       await app.close();
     }
@@ -5422,6 +5692,155 @@ describe('gateway routes protocol conversion', () => {
     } finally {
       delete process.env.OPENAI_MAIN_DYNAMIC_AUTH;
       await app.close();
+    }
+  });
+
+  it('loads a unified plugin module target adapter for a custom provider protocol', async () => {
+    const pluginDir = await mkdtemp(join(tmpdir(), 'gateway-plugin-'));
+    const pluginModulePath = join(pluginDir, 'acme-plugin.mjs');
+    await writeFile(
+      pluginModulePath,
+      `
+export function createGatewayPlugin() {
+  return {
+    targetAdapters: [
+      {
+        key: 'acme_messages',
+        provider: 'acme',
+        providerTypes: ['acme_messages'],
+        buildRequestFromStandard(input) {
+          return {
+            ok: true,
+            value: {
+              method: 'POST',
+              url: input.targetProviderConfig.baseurl + '/messages',
+              headers: {
+                'content-type': 'application/json',
+                authorization: 'Bearer ' + input.targetProviderConfig.apikey
+              },
+              body: {
+                model: input.standardRequest.model,
+                prompt: input.standardRequest.input
+              }
+            }
+          };
+        },
+        toStandardResponse(payload) {
+          return {
+            ok: true,
+            value: {
+              id: payload.id || 'resp_acme',
+              object: 'response',
+              status: 'completed',
+              model: payload.model || 'unknown',
+              output_text: payload.text || '',
+              output: [
+                {
+                  id: 'msg_acme',
+                  type: 'message',
+                  role: 'assistant',
+                  status: 'completed',
+                  content: [
+                    {
+                      type: 'output_text',
+                      text: payload.text || '',
+                      annotations: []
+                    }
+                  ]
+                }
+              ],
+              usage: payload.usage || {}
+            }
+          };
+        }
+      }
+    ]
+  };
+}
+`,
+      'utf8'
+    );
+
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          id: 'resp_from_acme',
+          model: body.model,
+          text: `acme:${body.prompt}`,
+          usage: {
+            input_tokens: 3,
+            output_tokens: 5,
+            total_tokens: 8
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const acmeProvider = {
+      ...createProviderConfig('acme-main', 'acme_messages', ['acme-large']),
+      apikey: 'acme-test-key',
+      baseurl: 'https://api.acme.test'
+    };
+    const config = createConfig([acmeProvider]);
+    config.defaultTargetProvider = 'acme';
+    config.defaultTargetProviders = ['acme'];
+    config.plugins = [
+      {
+        key: 'acme',
+        enabled: true,
+        modulePath: pluginModulePath,
+        providerHooks: []
+      }
+    ];
+
+    const runtime = createGatewayRuntime(config);
+    await syncGatewayPluginModulesFromConfig(runtime, config);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, runtime);
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'acme-main'
+        },
+        payload: {
+          model: 'acme-large',
+          input: 'hello custom protocol'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://api.acme.test/messages');
+      expect(upstreamInit.method).toBe('POST');
+      expect((upstreamInit.headers as Record<string, string>).authorization).toBe('Bearer acme-test-key');
+      expect(JSON.parse(String(upstreamInit.body))).toEqual({
+        model: 'acme-large',
+        prompt: 'hello custom protocol'
+      });
+
+      const payload = JSON.parse(response.body);
+      expect(payload.id).toBe('resp_from_acme');
+      expect(payload.output_text).toBe('acme:hello custom protocol');
+      expect(payload.usage.total_tokens).toBe(8);
+    } finally {
+      await app.close();
+      await rm(pluginDir, { recursive: true, force: true });
     }
   });
 

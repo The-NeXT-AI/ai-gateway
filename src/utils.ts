@@ -18,7 +18,7 @@ export function parseProvider(value: string | undefined): Provider | undefined {
     return 'gemini';
   }
 
-  return undefined;
+  return isSafeProviderToken(normalized) ? normalized : undefined;
 }
 
 export function parseProviderList(value: string | undefined): Provider[] {
@@ -54,7 +54,37 @@ export function providerFromProviderType(type: ProviderType): Provider {
     return 'anthropic';
   }
 
-  return 'gemini';
+  if (type === 'gemini_generate_content' || type === 'gemini_interactions') {
+    return 'gemini';
+  }
+
+  const normalized = String(type).trim().toLowerCase();
+  if (!normalized) {
+    return 'unknown';
+  }
+
+  const separatorIndex = findProviderTypeSeparatorIndex(normalized);
+  const provider = separatorIndex > 0 ? normalized.slice(0, separatorIndex) : normalized;
+  return isSafeProviderToken(provider) ? provider : 'unknown';
+}
+
+export function isSafeProviderToken(value: string): boolean {
+  return /^[a-z0-9][a-z0-9_.:-]*$/.test(value);
+}
+
+function findProviderTypeSeparatorIndex(value: string): number {
+  const underscoreIndex = value.indexOf('_');
+  if (underscoreIndex > 0) {
+    return underscoreIndex;
+  }
+
+  const colonIndex = value.indexOf(':');
+  if (colonIndex > 0) {
+    return colonIndex;
+  }
+
+  const dotIndex = value.indexOf('.');
+  return dotIndex > 0 ? dotIndex : -1;
 }
 
 export function trimTrailingSlash(value: string): string {

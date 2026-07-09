@@ -1,12 +1,14 @@
 import type { FastifyRequest } from 'fastify';
 
-export type Provider = 'openai' | 'anthropic' | 'gemini';
-export type ProviderType =
+export type BuiltinProvider = 'openai' | 'anthropic' | 'gemini';
+export type Provider = BuiltinProvider | (string & {});
+export type BuiltinProviderType =
   | 'openai_responses'
   | 'openai_chat_completions'
   | 'anthropic_messages'
   | 'gemini_generate_content'
   | 'gemini_interactions';
+export type ProviderType = BuiltinProviderType | (string & {});
 
 export interface BillingTier {
   upToTokens?: number;
@@ -279,6 +281,18 @@ export interface GatewayAuthIntrospectionConfig {
   responseMap: GatewayAuthIntrospectionResponseMapConfig;
 }
 
+export interface GatewayApiKeyRestrictions {
+  ipWhitelist?: string[];
+  allowedIps?: string[];
+  allowedOrigins?: string[];
+  allowedDomains?: string[];
+  allowedModels?: string[];
+  modelWhitelist?: string[];
+  rateLimit?: number;
+  requestsPerMinute?: number;
+  rateLimitWindowSeconds?: number;
+}
+
 export interface GatewayAuthConfig {
   enabled: boolean;
   mode: GatewayAuthMode;
@@ -351,11 +365,23 @@ export interface GatewayPrecheckEstimationConfig {
   defaultMaxOutputTokens: number;
 }
 
-export type GatewayPrecheckStorageType = 'memory';
+export type GatewayPrecheckStorageType = 'memory' | 'redis';
 
-export interface GatewayPrecheckStorageConfig {
-  type: GatewayPrecheckStorageType;
+export interface GatewayPrecheckMemoryStorageConfig {
+  type: 'memory';
 }
+
+export interface GatewayPrecheckRedisStorageConfig {
+  type: 'redis';
+  url: string;
+  keyPrefix: string;
+  connectTimeoutMs: number;
+  commandTimeoutMs: number;
+}
+
+export type GatewayPrecheckStorageConfig =
+  | GatewayPrecheckMemoryStorageConfig
+  | GatewayPrecheckRedisStorageConfig;
 
 export interface GatewayPrecheckConfig {
   enabled: boolean;
@@ -721,6 +747,7 @@ export interface GatewayConfig {
   host: string;
   port: number;
   providers: ProviderConfig[];
+  plugins?: GatewayPluginConfig[];
   providerPlugins?: ProviderPluginConfig[];
   virtualModelProfiles?: VirtualModelProfileConfig[];
   providerExternal?: ProviderExternalSourceConfig;
@@ -769,9 +796,11 @@ export interface GatewaySourceContext {
 }
 
 export interface UpstreamRequest {
+  method?: string;
   url: string;
   headers: Record<string, string>;
   body: unknown;
+  bodyEncoding?: 'json' | 'text' | 'form' | 'bytes' | 'none';
 }
 
 export type HeaderBag = FastifyRequest['headers'];
@@ -990,7 +1019,10 @@ export interface TargetAdapterResponseInput {
 }
 
 export interface TargetAdapter {
+  key?: string;
   provider: Provider;
+  providerTypes?: ProviderType[];
+  providerFallback?: boolean;
   buildRequestFromStandard(input: TargetAdapterRequestInput): Result<UpstreamRequest>;
   toStandardResponse(payload: unknown, input?: TargetAdapterResponseInput): Result<StandardResponse>;
 }
@@ -1064,6 +1096,31 @@ export interface ProviderPluginConfig {
   auth?: ProviderPluginMutationConfig;
   request?: ProviderPluginMutationConfig;
   response?: ProviderPluginResponseMutationConfig;
+}
+
+export interface GatewayPluginMatchConfig {
+  provider?: Provider;
+  providerName?: string;
+}
+
+export interface GatewayPluginProviderHookConfig {
+  key: string;
+  enabled: boolean;
+  provider?: Provider;
+  providerName?: string;
+  codexOauth?: ProviderPluginCodexOAuthConfig;
+  deepseekThinking?: ProviderPluginDeepSeekThinkingConfig;
+  auth?: ProviderPluginMutationConfig;
+  request?: ProviderPluginMutationConfig;
+  response?: ProviderPluginResponseMutationConfig;
+}
+
+export interface GatewayPluginConfig {
+  key: string;
+  enabled: boolean;
+  modulePath?: string;
+  match?: GatewayPluginMatchConfig;
+  providerHooks: GatewayPluginProviderHookConfig[];
 }
 
 export interface ProviderPluginRequestInput extends ProviderPluginContext {

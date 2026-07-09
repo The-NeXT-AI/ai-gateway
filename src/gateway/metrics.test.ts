@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { parseGatewayConfigFromRaw } from '../config';
 import {
+  recordGatewayBillingDelivery,
   recordGatewayHttpRequest,
   recordGatewayStreamConversion,
   recordGatewayToolExecution,
@@ -47,6 +48,18 @@ describe('gateway metrics', () => {
     );
     expect(metrics).toContain(
       'gateway_http_request_duration_ms_max{method="POST",route="/v1/responses",status_class="2xx",status_code="200"} 12.346'
+    );
+    expect(metrics).toContain(
+      'gateway_http_request_duration_seconds_bucket{le="0.05",method="POST",route="/v1/responses",status_class="2xx",status_code="200"} 2'
+    );
+    expect(metrics).toContain(
+      'gateway_http_request_duration_seconds_bucket{le="+Inf",method="POST",route="/v1/responses",status_class="2xx",status_code="200"} 2'
+    );
+    expect(metrics).toContain(
+      'gateway_http_request_duration_seconds_sum{method="POST",route="/v1/responses",status_class="2xx",status_code="200"} 0.019'
+    );
+    expect(metrics).toContain(
+      'gateway_http_request_duration_seconds_count{method="POST",route="/v1/responses",status_class="2xx",status_code="200"} 2'
     );
     expect(metrics).not.toContain('gateway_provider_info');
   });
@@ -124,6 +137,37 @@ describe('gateway metrics', () => {
     );
     expect(metrics).toContain(
       'gateway_stream_conversions_total{mode="buffered",source_adapter="openai_responses",target_provider="anthropic",target_provider_name="anthropic-main"} 1'
+    );
+  });
+
+  it('renders billing delivery counters by outcome and transport', () => {
+    const config = parseGatewayConfigFromRaw({
+      metrics: {
+        enabled: true,
+        includeProviderHealth: false
+      }
+    });
+
+    recordGatewayBillingDelivery({
+      outcome: 'delivered',
+      transport: 'http'
+    });
+    recordGatewayBillingDelivery({
+      outcome: 'failed',
+      transport: 'http'
+    });
+    recordGatewayBillingDelivery({
+      outcome: 'failed',
+      transport: 'http'
+    });
+
+    const metrics = renderGatewayMetrics(config);
+
+    expect(metrics).toContain(
+      'gateway_billing_events_total{outcome="delivered",transport="http"} 1'
+    );
+    expect(metrics).toContain(
+      'gateway_billing_events_total{outcome="failed",transport="http"} 2'
     );
   });
 });

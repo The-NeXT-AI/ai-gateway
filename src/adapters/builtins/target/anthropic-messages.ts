@@ -16,6 +16,8 @@ const defaultAnthropicMaxTokens = 1024;
 
 export const anthropicMessagesTargetAdapter: TargetAdapter = {
   provider: 'anthropic',
+  providerTypes: ['anthropic_messages'],
+  providerFallback: true,
   buildRequestFromStandard(input) {
     const headersResult = buildAnthropicHeaders(input.request.headers, {
       ...input.config,

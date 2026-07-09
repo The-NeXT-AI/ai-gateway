@@ -1,11 +1,14 @@
+import { createDecipheriv } from 'node:crypto';
 import { asString, isObject, parseProvider, parseProviderList, providerFromProviderType } from '../utils';
 import {
+  parseGatewayPluginsFromRaw,
   parseProviderPluginsFromRaw,
   parseProvidersFromRaw,
   parseVirtualModelProfilesFromRaw
 } from '../config';
 import type {
   GatewayConfig,
+  GatewayPluginConfig,
   Provider,
   ProviderConfig,
   ProviderExternalSourceConfig,
@@ -22,6 +25,8 @@ export interface ProviderExternalLogger {
 
 interface ExternalProviderSnapshot {
   providers: ProviderConfig[];
+  plugins?: GatewayPluginConfig[];
+  pluginsProvided: boolean;
   providerPlugins?: ProviderPluginConfig[];
   providerPluginsProvided: boolean;
   virtualModelProfiles?: VirtualModelProfileConfig[];
@@ -40,6 +45,8 @@ const DEFAULT_PROVIDER_TIMEOUT_MS = 5000;
 const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const ANTHROPIC_DEFAULT_BASE_URL = 'https://api.anthropic.com';
 const GEMINI_DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com';
+const EXTERNAL_CREDENTIAL_ENCRYPTED_PREFIX = 'enc:v1:';
+const EXTERNAL_CREDENTIAL_ENCRYPTION_ALGORITHM = 'aes-256-gcm';
 
 export function isProviderExternalSourceEnabled(config: GatewayConfig): boolean {
   return Boolean(config.providerExternal?.enabled);
@@ -58,6 +65,8 @@ export async function hydrateProvidersFromExternalSource(
   applyProvidersSnapshot(
     config,
     snapshot.providers,
+    snapshot.plugins,
+    snapshot.pluginsProvided,
     snapshot.providerPlugins,
     snapshot.providerPluginsProvided,
     snapshot.virtualModelProfiles,
@@ -73,6 +82,9 @@ export async function hydrateProvidersFromExternalSource(
       command: source.command,
       transport: source.transport,
       providers: snapshot.providers.length,
+      plugins: snapshot.pluginsProvided
+        ? snapshot.plugins?.length || 0
+        : undefined,
       providerPlugins: snapshot.providerPluginsProvided
         ? snapshot.providerPlugins?.length || 0
         : undefined,
@@ -88,12 +100,17 @@ export async function hydrateProvidersFromExternalSource(
 export function applyProvidersSnapshot(
   config: GatewayConfig,
   providers: ProviderConfig[],
+  plugins?: GatewayPluginConfig[],
+  pluginsProvided = false,
   providerPlugins?: ProviderPluginConfig[],
   providerPluginsProvided = false,
   virtualModelProfiles?: VirtualModelProfileConfig[],
   virtualModelProfilesProvided = false
 ): void {
   applyProvidersToGatewayConfig(config, providers);
+  if (pluginsProvided) {
+    config.plugins = [...(plugins || [])];
+  }
   if (providerPluginsProvided) {
     config.providerPlugins = [...(providerPlugins || [])];
   }
@@ -136,6 +153,20 @@ async function fetchExternalProviders(
     }
 
     let providerPlugins: ProviderPluginConfig[] | undefined;
+    let plugins: GatewayPluginConfig[] | undefined;
+    if (snapshotPayload.pluginsProvided) {
+      if (!Array.isArray(snapshotPayload.plugins)) {
+        throw new Error(
+          'External provider endpoint payload field "plugins" must be an array when present.'
+        );
+      }
+
+      plugins = parseGatewayPluginsFromRaw(snapshotPayload.plugins);
+      if (snapshotPayload.plugins.length > 0 && plugins.length === 0) {
+        throw new Error('External provider endpoint payload does not contain valid plugin items.');
+      }
+    }
+
     if (snapshotPayload.providerPluginsProvided) {
       if (!Array.isArray(snapshotPayload.providerPlugins)) {
         throw new Error(
@@ -184,9 +215,15 @@ async function fetchExternalProviders(
         snapshotPayload.credentialEncryption
       );
     }
+    const decryptedProviders = decryptProviderCredentials(
+      providers,
+      credentialEncryption
+    );
 
     return {
-      providers,
+      providers: decryptedProviders,
+      plugins,
+      pluginsProvided: snapshotPayload.pluginsProvided,
       providerPlugins,
       providerPluginsProvided: snapshotPayload.providerPluginsProvided,
       virtualModelProfiles,
@@ -419,6 +456,8 @@ function areProviderListsEqual(a: Provider[], b: Provider[]): boolean {
 
 function extractProvidersPayload(payload: unknown): {
   providers: unknown[];
+  plugins: unknown;
+  pluginsProvided: boolean;
   providerPlugins: unknown;
   providerPluginsProvided: boolean;
   virtualModelProfiles: unknown;
@@ -429,6 +468,8 @@ function extractProvidersPayload(payload: unknown): {
   if (Array.isArray(payload)) {
     return {
       providers: payload,
+      plugins: undefined,
+      pluginsProvided: false,
       providerPlugins: undefined,
       providerPluginsProvided: false,
       virtualModelProfiles: undefined,
@@ -442,6 +483,7 @@ function extractProvidersPayload(payload: unknown): {
     throw new Error('External provider endpoint payload must be an array or object.');
   }
 
+  const pluginsResolution = resolvePluginsPayload(payload);
   const providerPluginsResolution = resolveProviderPluginsPayload(payload);
   const virtualModelProfilesResolution = resolveVirtualModelProfilesPayload(payload);
   const credentialEncryptionResolution = resolveCredentialEncryptionPayload(payload);
@@ -450,6 +492,8 @@ function extractProvidersPayload(payload: unknown): {
   if (Array.isArray(payload.providers)) {
     return {
       providers: payload.providers,
+      plugins: pluginsResolution.value,
+      pluginsProvided: pluginsResolution.provided,
       providerPlugins: providerPluginsResolution.value,
       providerPluginsProvided: providerPluginsResolution.provided,
       virtualModelProfiles: virtualModelProfilesResolution.value,
@@ -462,6 +506,8 @@ function extractProvidersPayload(payload: unknown): {
   if (Array.isArray(payload.Providers)) {
     return {
       providers: payload.Providers,
+      plugins: pluginsResolution.value,
+      pluginsProvided: pluginsResolution.provided,
       providerPlugins: providerPluginsResolution.value,
       providerPluginsProvided: providerPluginsResolution.provided,
       virtualModelProfiles: virtualModelProfilesResolution.value,
@@ -475,6 +521,8 @@ function extractProvidersPayload(payload: unknown): {
     if (Array.isArray(payloadData.providers)) {
       return {
         providers: payloadData.providers,
+        plugins: pluginsResolution.value,
+        pluginsProvided: pluginsResolution.provided,
         providerPlugins: providerPluginsResolution.value,
         providerPluginsProvided: providerPluginsResolution.provided,
         virtualModelProfiles: virtualModelProfilesResolution.value,
@@ -487,6 +535,8 @@ function extractProvidersPayload(payload: unknown): {
     if (Array.isArray(payloadData.Providers)) {
       return {
         providers: payloadData.Providers,
+        plugins: pluginsResolution.value,
+        pluginsProvided: pluginsResolution.provided,
         providerPlugins: providerPluginsResolution.value,
         providerPluginsProvided: providerPluginsResolution.provided,
         virtualModelProfiles: virtualModelProfilesResolution.value,
@@ -498,6 +548,46 @@ function extractProvidersPayload(payload: unknown): {
   }
 
   throw new Error('External provider endpoint payload must include providers array.');
+}
+
+function resolvePluginsPayload(payload: Record<string, unknown>): {
+  provided: boolean;
+  value: unknown;
+} {
+  if (Object.prototype.hasOwnProperty.call(payload, 'plugins')) {
+    return {
+      provided: true,
+      value: payload.plugins
+    };
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, 'Plugins')) {
+    return {
+      provided: true,
+      value: payload.Plugins
+    };
+  }
+
+  if (isObject(payload.data)) {
+    if (Object.prototype.hasOwnProperty.call(payload.data, 'plugins')) {
+      return {
+        provided: true,
+        value: payload.data.plugins
+      };
+    }
+
+    if (Object.prototype.hasOwnProperty.call(payload.data, 'Plugins')) {
+      return {
+        provided: true,
+        value: payload.data.Plugins
+      };
+    }
+  }
+
+  return {
+    provided: false,
+    value: undefined
+  };
 }
 
 function resolveVirtualModelProfilesPayload(payload: Record<string, unknown>): {
@@ -582,6 +672,145 @@ function normalizeCredentialEncryptionPayload(value: unknown): ExternalCredentia
     keyVersion,
     algorithm
   };
+}
+
+function decryptProviderCredentials(
+  providers: ProviderConfig[],
+  credentialEncryption?: ExternalCredentialEncryptionConfig
+): ProviderConfig[] {
+  return providers.map((provider) => {
+    const apikey = decryptExternalCredentialIfNeeded(
+      provider.apikey,
+      credentialEncryption,
+      `providers.${provider.name}.apikey`
+    );
+    const credentials = provider.credentials?.map((credential) => ({
+      ...credential,
+      apikey: decryptExternalCredentialIfNeeded(
+        credential.apikey,
+        credentialEncryption,
+        `providers.${provider.name}.credentials.${credential.id}.apikey`
+      )
+    }));
+
+    return {
+      ...provider,
+      apikey,
+      credentials
+    };
+  });
+}
+
+function decryptExternalCredentialIfNeeded(
+  value: string | undefined,
+  credentialEncryption: ExternalCredentialEncryptionConfig | undefined,
+  fieldName: string
+): string | undefined {
+  if (!value || !value.startsWith(EXTERNAL_CREDENTIAL_ENCRYPTED_PREFIX)) {
+    return value;
+  }
+
+  const key = resolveExternalCredentialEncryptionKey(credentialEncryption);
+  if (!key) {
+    throw new Error(`${fieldName} is encrypted but no credential encryption key is configured.`);
+  }
+
+  const encodedEnvelope = value.slice(EXTERNAL_CREDENTIAL_ENCRYPTED_PREFIX.length);
+  if (!encodedEnvelope) {
+    throw new Error(`${fieldName} encrypted credential payload is empty.`);
+  }
+
+  let envelope: {
+    iv?: unknown;
+    tag?: unknown;
+    data?: unknown;
+    keyVersion?: unknown;
+  };
+  try {
+    envelope = JSON.parse(Buffer.from(encodedEnvelope, 'base64url').toString('utf8'));
+  } catch {
+    throw new Error(`${fieldName} encrypted credential payload is malformed.`);
+  }
+
+  const iv = normalizeOptionalString(envelope.iv);
+  const tag = normalizeOptionalString(envelope.tag);
+  const data = normalizeOptionalString(envelope.data);
+  if (!iv || !tag || !data) {
+    throw new Error(`${fieldName} encrypted credential payload is incomplete.`);
+  }
+
+  const keyVersion = normalizeOptionalString(envelope.keyVersion);
+  const expectedKeyVersion =
+    normalizeOptionalString(credentialEncryption?.keyVersion) ||
+    normalizeOptionalString(process.env.GATEWAY_CREDENTIAL_ENCRYPTION_KEY_VERSION);
+  if (keyVersion && expectedKeyVersion && keyVersion !== expectedKeyVersion) {
+    throw new Error(
+      `${fieldName} encrypted credential key version mismatch: expected ${expectedKeyVersion}, got ${keyVersion}.`
+    );
+  }
+
+  try {
+    const decipher = createDecipheriv(
+      EXTERNAL_CREDENTIAL_ENCRYPTION_ALGORITHM,
+      key,
+      Buffer.from(iv, 'base64')
+    );
+    decipher.setAuthTag(Buffer.from(tag, 'base64'));
+    const decrypted = Buffer.concat([
+      decipher.update(Buffer.from(data, 'base64')),
+      decipher.final()
+    ]).toString('utf8');
+    const normalized = normalizeOptionalString(decrypted);
+    if (!normalized) {
+      throw new Error(`${fieldName} decrypted credential is empty.`);
+    }
+    return normalized;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('decrypted credential is empty')) {
+      throw error;
+    }
+    throw new Error(`${fieldName} encrypted credential decryption failed.`);
+  }
+}
+
+function resolveExternalCredentialEncryptionKey(
+  credentialEncryption?: ExternalCredentialEncryptionConfig
+): Buffer | undefined {
+  const configured =
+    normalizeOptionalString(credentialEncryption?.key) ||
+    normalizeOptionalString(process.env.GATEWAY_CREDENTIAL_ENCRYPTION_KEY);
+  if (!configured) {
+    return undefined;
+  }
+
+  return (
+    tryDecodeExternalCredentialKey(configured, 'base64') ||
+    tryDecodeExternalCredentialKey(configured, 'hex') ||
+    tryDecodeExternalCredentialUtf8Key(configured)
+  );
+}
+
+function tryDecodeExternalCredentialKey(value: string, encoding: 'base64' | 'hex'): Buffer | undefined {
+  try {
+    const decoded = Buffer.from(value, encoding);
+    if (decoded.length !== 32) {
+      return undefined;
+    }
+    if (encoding === 'base64' && decoded.toString('base64').replace(/=+$/g, '') !== value.replace(/=+$/g, '')) {
+      return undefined;
+    }
+    if (encoding === 'hex' && decoded.toString('hex') !== value.toLowerCase()) {
+      return undefined;
+    }
+    return decoded;
+  } catch {
+    return undefined;
+  }
+}
+
+function tryDecodeExternalCredentialUtf8Key(value: string): Buffer | undefined {
+  const key = Buffer.from(value, 'utf8');
+  return key.length === 32 ? key : undefined;
 }
 
 function resolveProviderPluginsPayload(payload: Record<string, unknown>): {

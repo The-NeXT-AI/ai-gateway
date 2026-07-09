@@ -1,8 +1,8 @@
 import { createHmac } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { GatewayAuthConfig } from '../types';
-import { authenticateGatewayRequest } from './auth';
+import type { GatewayAuthConfig, ProviderConfig } from '../types';
+import { authenticateGatewayRequest, evaluateApiKeyModelRestriction } from './auth';
 
 const baseConfig: GatewayAuthConfig = {
   enabled: true,
@@ -314,6 +314,222 @@ describe('gateway auth', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('passes client context to introspection and stores returned restrictions', async () => {
+    const fetchMock = vi.fn(async () => {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          active: true,
+          userId: 'user-2',
+          tenantId: 'tenant-b',
+          restrictions: {
+            ipWhitelist: ['203.0.113.0/24'],
+            allowedOrigins: ['https://app.example'],
+            allowedModels: ['openai/gpt-5'],
+            ignored: 'not-returned-by-server'
+          }
+        })
+      } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const request = createRequest(
+      {
+        authorization: 'Bearer token-123',
+        'x-forwarded-for': '198.51.100.10, 10.0.0.1',
+        origin: 'https://app.example'
+      },
+      {
+        ip: '203.0.113.42',
+        body: {
+          model: 'openai/gpt-5'
+        }
+      }
+    );
+    const result = await authenticateGatewayRequest(request, {
+      ...baseConfig,
+      mode: 'http_introspection'
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.apiKeyRestrictions).toEqual({
+      ipWhitelist: ['203.0.113.0/24'],
+      allowedOrigins: ['https://app.example'],
+      allowedModels: ['openai/gpt-5']
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const fetchBody = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    expect(fetchBody).toMatchObject({
+      token: 'token-123',
+      clientIp: '203.0.113.42',
+      origin: 'https://app.example',
+      model: 'openai/gpt-5',
+      models: ['openai/gpt-5'],
+      method: 'POST',
+      path: '/v1/responses'
+    });
+  });
+
+  it('rejects introspected API keys outside IP or origin restrictions', async () => {
+    const fetchMock = vi.fn(async () => {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          active: true,
+          userId: 'user-2',
+          tenantId: 'tenant-b',
+          restrictions: {
+            ipWhitelist: ['203.0.113.0/24'],
+            allowedOrigins: ['https://console.example']
+          }
+        })
+      } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ipResult = await authenticateGatewayRequest(
+      createRequest({
+        authorization: 'Bearer token-123',
+        'x-forwarded-for': '198.51.100.10',
+        origin: 'https://console.example'
+      }),
+      {
+        ...baseConfig,
+        mode: 'http_introspection'
+      }
+    );
+    expect(ipResult.ok).toBe(false);
+    if (!ipResult.ok) {
+      expect(ipResult.statusCode).toBe(403);
+      expect(ipResult.error).toContain('IP');
+    }
+
+    const originResult = await authenticateGatewayRequest(
+      createRequest(
+        {
+          authorization: 'Bearer token-123',
+          'x-forwarded-for': '198.51.100.10',
+          origin: 'https://other.example'
+        },
+        {
+          ip: '203.0.113.42'
+        }
+      ),
+      {
+        ...baseConfig,
+        mode: 'http_introspection'
+      }
+    );
+    expect(originResult.ok).toBe(false);
+    if (!originResult.ok) {
+      expect(originResult.statusCode).toBe(403);
+      expect(originResult.error).toContain('origin');
+    }
+  });
+
+  it('does not trust x-forwarded-for for introspected API key IP restrictions', async () => {
+    const fetchMock = vi.fn(async () => {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          active: true,
+          userId: 'user-2',
+          tenantId: 'tenant-b',
+          restrictions: {
+            ipWhitelist: ['203.0.113.0/24']
+          }
+        })
+      } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await authenticateGatewayRequest(
+      createRequest(
+        {
+          authorization: 'Bearer token-123',
+          'x-forwarded-for': '203.0.113.42'
+        },
+        {
+          ip: '198.51.100.10'
+        }
+      ),
+      {
+        ...baseConfig,
+        mode: 'http_introspection'
+      }
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.statusCode).toBe(403);
+      expect(result.error).toContain('IP');
+    }
+  });
+
+  it('defers model restrictions until routed model and provider are known', async () => {
+    const fetchMock = vi.fn(async () => {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          active: true,
+          userId: 'user-2',
+          tenantId: 'tenant-b',
+          restrictions: {
+            allowedModels: ['openai/gpt-5']
+          }
+        })
+      } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const requestedResult = await authenticateGatewayRequest(
+      createRequest(
+        {
+          authorization: 'Bearer token-123'
+        },
+        {
+          body: {
+            model: 'gpt-5'
+          }
+        }
+      ),
+      {
+        ...baseConfig,
+        mode: 'http_introspection'
+      }
+    );
+    expect(requestedResult.ok).toBe(true);
+
+    const routedRequest = createRequest();
+    routedRequest.gatewayApiKeyRestrictions = requestedResult.ok
+      ? requestedResult.apiKeyRestrictions
+      : undefined;
+    const providerConfig = {
+      name: 'openai-main',
+      type: 'openai_responses'
+    } as ProviderConfig;
+
+    const allowedResult = evaluateApiKeyModelRestriction(routedRequest, 'gpt-5', {
+      provider: 'openai',
+      providerConfig
+    });
+    expect(allowedResult.ok).toBe(true);
+
+    const routedResult = evaluateApiKeyModelRestriction(routedRequest, 'o3', {
+      provider: 'openai',
+      providerConfig
+    });
+    expect(routedResult.ok).toBe(false);
+    if (!routedResult.ok) {
+      expect(routedResult.statusCode).toBe(403);
+      expect(routedResult.error).toContain('o3');
+    }
+  });
+
   it('reads identity fields from envelope data payload', async () => {
     const fetchMock = vi.fn(async () => {
       return {
@@ -621,6 +837,43 @@ describe('gateway auth', () => {
     expect(result.identity?.billingSubjectKey).toBe('nested-tenant:nested-user');
   });
 
+  it('keeps restrictions when optional introspection returns no billing subject', async () => {
+    const fetchMock = vi.fn(async () => {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          active: true,
+          restrictions: {
+            allowedModels: ['openai/gpt-5'],
+            requestsPerMinute: 2
+          }
+        })
+      } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await authenticateGatewayRequest(
+      createRequest({
+        authorization: 'Bearer token-optional'
+      }),
+      {
+        ...baseConfig,
+        mode: 'http_introspection',
+        required: false
+      }
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.identity).toBeUndefined();
+      expect(result.apiKeyRestrictions).toEqual({
+        allowedModels: ['openai/gpt-5'],
+        requestsPerMinute: 2
+      });
+    }
+  });
+
   it('allows missing token when introspection is optional', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
@@ -643,13 +896,15 @@ function createRequest(
     ip?: string;
     method?: string;
     url?: string;
+    body?: unknown;
   } = {}
 ): FastifyRequest {
   return {
     headers,
     ip: overrides.ip || '10.0.0.10',
     method: overrides.method || 'POST',
-    url: overrides.url || '/v1/responses'
+    url: overrides.url || '/v1/responses',
+    body: overrides.body
   } as FastifyRequest;
 }
 

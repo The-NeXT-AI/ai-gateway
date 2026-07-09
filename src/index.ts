@@ -37,6 +37,7 @@ import {
   registerMcpGatewayRoutes,
   registerMcpGatewayWebSocketRoute
 } from './mcp-gateway';
+import { syncGatewayPluginModulesFromConfig } from './plugins/loader';
 import { closeRawTraceManager, initializeRawTraceManager } from './raw-trace';
 import type { GatewayConfig, GatewayLoggingConfig } from './types';
 
@@ -296,7 +297,7 @@ const start = async () => {
       reason: 'external_config_startup'
     });
     await hydrateProvidersFromExternalSource(config, fastify.log);
-    applyStaticRuntimeConfig(config);
+    await applyStaticRuntimeConfig(config);
     await agentRuntime.initialize();
 
     try {
@@ -352,14 +353,15 @@ const start = async () => {
 start();
 
 async function reloadRuntimeFromConfig(nextConfig: GatewayConfig): Promise<void> {
-  applyStaticRuntimeConfig(nextConfig);
+  await applyStaticRuntimeConfig(nextConfig);
   await initializeBillingPublisher(nextConfig.billingQueue, nextConfig.billingWebhook, fastify.log);
   await initializeAgentEventPublisher(nextConfig.agent.eventQueue, nextConfig.agent.eventWebhook, fastify.log);
   await initializeRawTraceManager(nextConfig.rawTrace, fastify.log);
 }
 
-function applyStaticRuntimeConfig(nextConfig: GatewayConfig): void {
+async function applyStaticRuntimeConfig(nextConfig: GatewayConfig): Promise<void> {
   syncProviderPluginsFromConfig(runtime.providerPlugins, nextConfig);
+  await syncGatewayPluginModulesFromConfig(runtime, nextConfig, fastify.log);
   initializeProviderHealthScheduler(nextConfig, fastify.log);
 }
 

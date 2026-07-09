@@ -1,7 +1,13 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { FastifyRequest, preHandlerHookHandler } from 'fastify';
 import { isInternalIp } from '../shared/ip';
-import type { GatewayAuthConfig, GatewayRequestIdentity } from '../types';
+import type {
+  GatewayApiKeyRestrictions,
+  GatewayAuthConfig,
+  GatewayRequestIdentity,
+  Provider,
+  ProviderConfig
+} from '../types';
 import { readBearerToken, readHeader } from '../utils';
 
 const SDK_COMPATIBLE_TOKEN_HEADERS = [
@@ -18,6 +24,7 @@ const agentInternalAuthHeaderValue = '1';
 interface GatewayAuthResultOk {
   ok: true;
   identity?: GatewayRequestIdentity;
+  apiKeyRestrictions?: GatewayApiKeyRestrictions;
 }
 
 interface GatewayAuthResultError {
@@ -31,6 +38,7 @@ export type GatewayAuthResult = GatewayAuthResultOk | GatewayAuthResultError;
 declare module 'fastify' {
   interface FastifyRequest {
     gatewayIdentity?: GatewayRequestIdentity;
+    gatewayApiKeyRestrictions?: GatewayApiKeyRestrictions;
   }
 }
 
@@ -47,6 +55,7 @@ export function createGatewayAuthPreHandler(config: GatewayAuthConfig): preHandl
     }
 
     request.gatewayIdentity = result.identity;
+    request.gatewayApiKeyRestrictions = result.apiKeyRestrictions;
   };
 }
 
@@ -220,11 +229,29 @@ async function authenticateViaIntrospection(
 
   const token = tokenLookup.token;
 
+  const modelCandidates = collectRequestedModelsFromRequest(request);
+  const clientIp = resolveClientIp(request);
+  const origin = readHeaderValue(request.headers, 'origin');
+  const referer = readHeaderValue(request.headers, 'referer');
+
   const requestBody: Record<string, unknown> = {
     [config.introspection.requestTokenField]: token,
     method: request.method.toUpperCase(),
     path: sanitizePath(request.url)
   };
+  if (clientIp) {
+    requestBody.clientIp = clientIp;
+  }
+  if (origin) {
+    requestBody.origin = origin;
+  }
+  if (referer) {
+    requestBody.referer = referer;
+  }
+  if (modelCandidates.length > 0) {
+    requestBody.model = modelCandidates[0];
+    requestBody.models = modelCandidates;
+  }
 
   const headers: Record<string, string> = {
     'content-type': 'application/json'
@@ -319,6 +346,15 @@ async function authenticateViaIntrospection(
           readStringFromPath(payload, config.introspection.responseMap.apiKeyId)
         : undefined)
   };
+  const apiKeyRestrictions = readApiKeyRestrictions(introspectionPayload) || readApiKeyRestrictions(payload);
+  const restrictionResult = evaluateApiKeyRequestRestrictions(
+    request,
+    apiKeyRestrictions
+  );
+  if (!restrictionResult.ok) {
+    return restrictionResult;
+  }
+
   const billingSubjectKey = resolveBillingSubjectKey(identity);
   if (!billingSubjectKey) {
     if (config.required) {
@@ -329,7 +365,10 @@ async function authenticateViaIntrospection(
       };
     }
 
-    return { ok: true };
+    return {
+      ok: true,
+      apiKeyRestrictions
+    };
   }
 
   return {
@@ -338,8 +377,29 @@ async function authenticateViaIntrospection(
       source: 'http_introspection',
       billingSubjectKey,
       ...identity
-    }
+    },
+    apiKeyRestrictions
   };
+}
+
+export function evaluateApiKeyModelRestriction(
+  request: FastifyRequest,
+  model: string | undefined,
+  target?: {
+    provider?: Provider;
+    providerConfig?: ProviderConfig;
+  }
+): GatewayAuthResult {
+  const restrictions = request.gatewayApiKeyRestrictions;
+  const modelValue = normalizeString(model);
+  if (!restrictions || !modelValue) {
+    return { ok: true };
+  }
+
+  return evaluateModelRestriction(
+    buildModelRestrictionCandidates(modelValue, target),
+    restrictions
+  );
 }
 
 export function resolveBillingSubjectKey(identity: {
@@ -673,6 +733,347 @@ function readValueByPath(value: unknown, path: string): unknown {
   }
 
   return current;
+}
+
+function readApiKeyRestrictions(value: unknown): GatewayApiKeyRestrictions | undefined {
+  const raw = isRecord(value)
+    ? isRecord(value.restrictions)
+      ? value.restrictions
+      : isRecord(value.apiKey) && isRecord(value.apiKey.restrictions)
+        ? value.apiKey.restrictions
+        : undefined
+    : undefined;
+  if (!raw) {
+    return undefined;
+  }
+
+  const restrictions: GatewayApiKeyRestrictions = {};
+  copyStringArray(raw, restrictions, 'ipWhitelist');
+  copyStringArray(raw, restrictions, 'allowedIps');
+  copyStringArray(raw, restrictions, 'allowedOrigins');
+  copyStringArray(raw, restrictions, 'allowedDomains');
+  copyStringArray(raw, restrictions, 'allowedModels');
+  copyStringArray(raw, restrictions, 'modelWhitelist');
+  copyNumber(raw, restrictions, 'rateLimit');
+  copyNumber(raw, restrictions, 'requestsPerMinute');
+  copyNumber(raw, restrictions, 'rateLimitWindowSeconds');
+
+  return Object.keys(restrictions).length > 0 ? restrictions : undefined;
+}
+
+function copyStringArray<K extends keyof GatewayApiKeyRestrictions>(
+  source: Record<string, unknown>,
+  target: GatewayApiKeyRestrictions,
+  key: K
+) {
+  const value = source[key];
+  if (!Array.isArray(value)) {
+    return;
+  }
+
+  const strings = value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (strings.length > 0) {
+    target[key] = strings as GatewayApiKeyRestrictions[K];
+  }
+}
+
+function copyNumber<K extends keyof GatewayApiKeyRestrictions>(
+  source: Record<string, unknown>,
+  target: GatewayApiKeyRestrictions,
+  key: K
+) {
+  const value = source[key];
+  const numeric = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  if (Number.isFinite(numeric)) {
+    target[key] = numeric as GatewayApiKeyRestrictions[K];
+  }
+}
+
+function evaluateApiKeyRequestRestrictions(
+  request: FastifyRequest,
+  restrictions: GatewayApiKeyRestrictions | undefined
+): GatewayAuthResult {
+  if (!restrictions) {
+    return { ok: true };
+  }
+
+  const allowedIps = mergeRestrictionLists(restrictions.ipWhitelist, restrictions.allowedIps);
+  if (allowedIps.length > 0 && !matchesIpList(resolveClientIp(request), allowedIps)) {
+    return {
+      ok: false,
+      statusCode: 403,
+      error: 'API key is not allowed from this IP.'
+    };
+  }
+
+  const allowedDomains = mergeRestrictionLists(restrictions.allowedOrigins, restrictions.allowedDomains);
+  if (allowedDomains.length > 0 && !matchesRequestOrigin(request, allowedDomains)) {
+    return {
+      ok: false,
+      statusCode: 403,
+      error: 'API key is not allowed from this origin.'
+    };
+  }
+
+  return { ok: true };
+}
+
+function evaluateModelRestriction(
+  model: string | string[],
+  restrictions: GatewayApiKeyRestrictions
+): GatewayAuthResult {
+  const allowedModels = mergeRestrictionLists(restrictions.allowedModels, restrictions.modelWhitelist);
+  if (allowedModels.length === 0) {
+    return { ok: true };
+  }
+
+  const candidates = Array.isArray(model) ? model : [model];
+  if (allowedModels.some((pattern) => candidates.some((candidate) => matchesWildcard(pattern, candidate)))) {
+    return { ok: true };
+  }
+
+  return {
+    ok: false,
+    statusCode: 403,
+    error: `API key is not allowed to use this model: ${candidates[0]}`
+  };
+}
+
+function buildModelRestrictionCandidates(
+  model: string,
+  target:
+    | {
+        provider?: Provider;
+        providerConfig?: ProviderConfig;
+      }
+    | undefined
+): string[] {
+  const candidates: string[] = [];
+  pushUniqueString(candidates, model);
+  if (target?.provider) {
+    pushUniqueString(candidates, `${target.provider}/${model}`);
+  }
+  if (target?.providerConfig?.name) {
+    pushUniqueString(candidates, `${target.providerConfig.name}/${model}`);
+  }
+  if (target?.providerConfig?.type) {
+    pushUniqueString(candidates, `${target.providerConfig.type}/${model}`);
+  }
+  return candidates;
+}
+
+function mergeRestrictionLists(...values: Array<string[] | undefined>): string[] {
+  const merged: string[] = [];
+  for (const value of values) {
+    if (!Array.isArray(value)) {
+      continue;
+    }
+
+    for (const item of value) {
+      const normalized = item.trim();
+      if (normalized && !merged.includes(normalized)) {
+        merged.push(normalized);
+      }
+    }
+  }
+
+  return merged;
+}
+
+function collectRequestedModelsFromRequest(request: FastifyRequest): string[] {
+  const models: string[] = [];
+  pushUniqueString(models, readHeaderValue(request.headers, 'x-target-model'));
+  if (isRecord(request.body)) {
+    pushUniqueString(models, normalizeString(request.body.model));
+  }
+
+  pushUniqueString(models, readModelFromPath(request.url));
+  return models;
+}
+
+function readModelFromPath(url: string): string | undefined {
+  const path = sanitizePath(url);
+  const marker = '/models/';
+  const markerIndex = path.indexOf(marker);
+  if (markerIndex < 0) {
+    return undefined;
+  }
+
+  const tail = decodeURIComponent(path.slice(markerIndex + marker.length));
+  const model = tail.split(':')[0]?.trim();
+  return model || undefined;
+}
+
+function pushUniqueString(values: string[], value: string | undefined) {
+  if (value && !values.includes(value)) {
+    values.push(value);
+  }
+}
+
+function normalizeString(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  return normalized || undefined;
+}
+
+function resolveClientIp(request: FastifyRequest): string {
+  return readClientIp(request) || request.socket?.remoteAddress || '';
+}
+
+function matchesIpList(ip: string, allowed: string[]): boolean {
+  const normalizedIp = normalizeIpValue(ip);
+  if (!normalizedIp) {
+    return false;
+  }
+
+  return allowed.some((entry) => {
+    const normalizedEntry = normalizeIpValue(entry);
+    if (!normalizedEntry) {
+      return false;
+    }
+
+    if (!normalizedEntry.includes('/')) {
+      return normalizedEntry === normalizedIp;
+    }
+
+    return matchesIpv4Cidr(normalizedIp, normalizedEntry);
+  });
+}
+
+function normalizeIpValue(value: string): string | undefined {
+  const first = value.split(',')[0]?.trim();
+  if (!first) {
+    return undefined;
+  }
+
+  const withoutPort = stripIpPort(first);
+  if (!withoutPort) {
+    return undefined;
+  }
+
+  return withoutPort.startsWith('::ffff:') ? withoutPort.slice('::ffff:'.length) : withoutPort;
+}
+
+function stripIpPort(value: string): string {
+  if (value.startsWith('[') && value.includes(']')) {
+    return value.slice(1, value.indexOf(']'));
+  }
+
+  const colonCount = value.split(':').length - 1;
+  if (colonCount === 1 && value.includes('.')) {
+    return value.split(':')[0] || value;
+  }
+
+  return value;
+}
+
+function matchesIpv4Cidr(ip: string, cidr: string): boolean {
+  const [base, bitsRaw] = cidr.split('/');
+  const bits = Number(bitsRaw);
+  if (!base || !Number.isInteger(bits) || bits < 0 || bits > 32) {
+    return false;
+  }
+
+  const ipNumber = ipv4ToNumber(ip);
+  const baseNumber = ipv4ToNumber(base);
+  if (ipNumber === undefined || baseNumber === undefined) {
+    return false;
+  }
+
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return (ipNumber & mask) === (baseNumber & mask);
+}
+
+function ipv4ToNumber(ip: string): number | undefined {
+  const parts = ip.split('.').map((part) => Number(part));
+  if (
+    parts.length !== 4 ||
+    parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
+  ) {
+    return undefined;
+  }
+
+  return (
+    ((parts[0] << 24) >>> 0) +
+    ((parts[1] << 16) >>> 0) +
+    ((parts[2] << 8) >>> 0) +
+    parts[3]
+  ) >>> 0;
+}
+
+function matchesRequestOrigin(request: FastifyRequest, allowed: string[]): boolean {
+  const origin = readHeaderValue(request.headers, 'origin');
+  const referer = readHeaderValue(request.headers, 'referer');
+  const candidates = [origin, referer].filter((value): value is string => Boolean(value));
+  if (candidates.length === 0) {
+    return false;
+  }
+
+  return candidates.some((candidate) =>
+    allowed.some((allowedEntry) => matchesOriginOrDomain(candidate, allowedEntry))
+  );
+}
+
+function matchesOriginOrDomain(requestOrigin: string, allowedEntry: string): boolean {
+  if (allowedEntry === '*') {
+    return true;
+  }
+
+  const requestParts = parseOriginParts(requestOrigin);
+  const allowedParts = parseOriginParts(allowedEntry);
+  if (!requestParts || !allowedParts) {
+    return false;
+  }
+
+  if (allowedEntry.includes('://') && allowedParts.origin) {
+    return requestParts.origin === allowedParts.origin;
+  }
+
+  return (
+    matchesWildcard(allowedParts.hostname, requestParts.hostname) ||
+    requestParts.hostname === allowedParts.hostname ||
+    requestParts.hostname.endsWith(`.${allowedParts.hostname}`)
+  );
+}
+
+function parseOriginParts(value: string): { origin?: string; hostname: string } | undefined {
+  const trimmed = value.trim().toLowerCase().replace(/\/+$/, '');
+  if (!trimmed) {
+    return undefined;
+  }
+
+  try {
+    const parsed = new URL(trimmed.includes('://') ? trimmed : `https://${trimmed}`);
+    return {
+      origin: parsed.origin,
+      hostname: parsed.hostname
+    };
+  } catch {
+    const hostname = trimmed.replace(/^https?:\/\//, '').split('/')[0]?.split(':')[0]?.trim();
+    return hostname ? { hostname } : undefined;
+  }
+}
+
+function matchesWildcard(pattern: string, value: string): boolean {
+  if (pattern === '*') {
+    return true;
+  }
+
+  if (!pattern.includes('*')) {
+    return pattern === value;
+  }
+
+  const escaped = pattern
+    .split('*')
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('.*');
+  return new RegExp(`^${escaped}$`).test(value);
 }
 
 function allowInternalAgentRequestWithoutIntrospection(

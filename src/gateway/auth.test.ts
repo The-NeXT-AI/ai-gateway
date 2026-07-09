@@ -327,6 +327,8 @@ describe('gateway auth', () => {
             ipWhitelist: ['203.0.113.0/24'],
             allowedOrigins: ['https://app.example'],
             allowedModels: ['openai/gpt-5'],
+            tokensPerMinute: 200000,
+            costLimitUsd: 1.25,
             ignored: 'not-returned-by-server'
           }
         })
@@ -356,7 +358,9 @@ describe('gateway auth', () => {
     expect(result.apiKeyRestrictions).toEqual({
       ipWhitelist: ['203.0.113.0/24'],
       allowedOrigins: ['https://app.example'],
-      allowedModels: ['openai/gpt-5']
+      allowedModels: ['openai/gpt-5'],
+      tokensPerMinute: 200000,
+      costLimitUsd: 1.25
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const fetchBody = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
@@ -846,7 +850,9 @@ describe('gateway auth', () => {
           active: true,
           restrictions: {
             allowedModels: ['openai/gpt-5'],
-            requestsPerMinute: 2
+            requestsPerMinute: 2,
+            tpm: 200000,
+            costPerMinuteUsd: 1.25
           }
         })
       } as Response;
@@ -869,7 +875,9 @@ describe('gateway auth', () => {
       expect(result.identity).toBeUndefined();
       expect(result.apiKeyRestrictions).toEqual({
         allowedModels: ['openai/gpt-5'],
-        requestsPerMinute: 2
+        requestsPerMinute: 2,
+        tpm: 200000,
+        costPerMinuteUsd: 1.25
       });
     }
   });

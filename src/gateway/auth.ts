@@ -756,7 +756,16 @@ function readApiKeyRestrictions(value: unknown): GatewayApiKeyRestrictions | und
   copyStringArray(raw, restrictions, 'modelWhitelist');
   copyNumber(raw, restrictions, 'rateLimit');
   copyNumber(raw, restrictions, 'requestsPerMinute');
+  copyNumber(raw, restrictions, 'rpm');
   copyNumber(raw, restrictions, 'rateLimitWindowSeconds');
+  copyNumber(raw, restrictions, 'tokensPerMinute');
+  copyNumber(raw, restrictions, 'tpm');
+  copyNumber(raw, restrictions, 'tokenLimitWindowSeconds');
+  copyNumber(raw, restrictions, 'costLimitUsd');
+  copyNumber(raw, restrictions, 'costLimit');
+  copyNumber(raw, restrictions, 'maxCostUsd');
+  copyNumber(raw, restrictions, 'costPerMinuteUsd');
+  copyNumber(raw, restrictions, 'costLimitWindowSeconds');
 
   return Object.keys(restrictions).length > 0 ? restrictions : undefined;
 }

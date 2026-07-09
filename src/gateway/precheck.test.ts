@@ -407,6 +407,95 @@ describe('evaluateGatewayPrecheck', () => {
     }
   });
 
+  it('enforces API key token limits even when static precheck is disabled', async () => {
+    const config = createConfig({
+      enabled: false,
+      rateLimit: disabledRateLimit(),
+      quota: disabledQuota(),
+      budget: disabledBudget(),
+      estimation: {
+        charsPerToken: 1,
+        defaultMaxOutputTokens: 0
+      }
+    });
+    const request = createRequest() as FastifyRequest & {
+      gatewayIdentity?: { apiKeyId: string; source: 'http_introspection'; billingSubjectKey: string };
+      gatewayApiKeyRestrictions?: { tokensPerMinute: number; tokenLimitWindowSeconds: number };
+    };
+    request.gatewayIdentity = {
+      source: 'http_introspection',
+      billingSubjectKey: 'user-1',
+      apiKeyId: 'key-tpm'
+    };
+    request.gatewayApiKeyRestrictions = {
+      tokensPerMinute: 5,
+      tokenLimitWindowSeconds: 120
+    };
+
+    const result = await evaluateGatewayPrecheck({
+      request,
+      config,
+      targetProvider: 'openai',
+      model: 'gpt-test',
+      standardRequest: createStandardRequest('123456')
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.statusCode).toBe(429);
+      expect(result.details.limit_name).toBe('api_key_tpm');
+      expect(result.details.metric).toBe('tokens');
+      expect(result.details.subject).toBe('key-tpm');
+      expect(result.details.window_ms).toBe(120_000);
+      expect(result.details.requested).toBe(14);
+    }
+  });
+
+  it('enforces API key cost limits even when static precheck is disabled', async () => {
+    const config = createConfig({
+      enabled: false,
+      rateLimit: disabledRateLimit(),
+      quota: disabledQuota(),
+      budget: disabledBudget(),
+      estimation: {
+        charsPerToken: 1,
+        defaultMaxOutputTokens: 0
+      }
+    });
+    const request = createRequest() as FastifyRequest & {
+      gatewayIdentity?: { apiKeyId: string; source: 'http_introspection'; billingSubjectKey: string };
+      gatewayApiKeyRestrictions?: { costLimitUsd: number; costLimitWindowSeconds: number };
+    };
+    request.gatewayIdentity = {
+      source: 'http_introspection',
+      billingSubjectKey: 'user-1',
+      apiKeyId: 'key-cost'
+    };
+    request.gatewayApiKeyRestrictions = {
+      costLimitUsd: 0.01,
+      costLimitWindowSeconds: 60
+    };
+
+    const result = await evaluateGatewayPrecheck({
+      request,
+      config,
+      targetProvider: 'openai',
+      model: 'gpt-test',
+      standardRequest: createStandardRequest('123456')
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.statusCode).toBe(402);
+      expect(result.code).toBe('budget_exceeded');
+      expect(result.details.limit_name).toBe('api_key_cost');
+      expect(result.details.metric).toBe('cost_usd');
+      expect(result.details.subject).toBe('key-cost');
+      expect(result.details.requested).toBeGreaterThan(0.01);
+      expect(result.details.estimated?.estimatedCostUsd).toBeGreaterThan(0.01);
+    }
+  });
+
   it('uses Redis storage reservation when precheck storage is redis', async () => {
     const config = createConfig({
       enabled: true,

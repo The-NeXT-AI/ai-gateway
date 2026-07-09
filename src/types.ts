@@ -288,7 +288,16 @@ export interface GatewayApiKeyRestrictions {
   modelWhitelist?: string[];
   rateLimit?: number;
   requestsPerMinute?: number;
+  rpm?: number;
   rateLimitWindowSeconds?: number;
+  tokensPerMinute?: number;
+  tpm?: number;
+  tokenLimitWindowSeconds?: number;
+  costLimitUsd?: number;
+  costLimit?: number;
+  maxCostUsd?: number;
+  costPerMinuteUsd?: number;
+  costLimitWindowSeconds?: number;
 }
 
 export interface GatewayAuthConfig {

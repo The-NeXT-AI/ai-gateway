@@ -86,6 +86,11 @@ interface PendingCheck {
   windowStart: number;
 }
 
+interface ApiKeyRestrictionBudgetLimit extends GatewayPrecheckRuleBaseConfig {
+  name: string;
+  maxCostUsd: number;
+}
+
 type RedisReservationResult =
   | { ok: true }
   | { ok: false; failedIndex: number; used: number };
@@ -101,25 +106,32 @@ let redisReservationExecutorForTests: RedisReservationExecutor | undefined;
 
 export async function evaluateGatewayPrecheck(input: GatewayPrecheckInput): Promise<GatewayPrecheckResult> {
   const precheck = input.config.precheck;
-  const apiKeyRestrictionLimits = resolveApiKeyRestrictionRateLimits(input.request);
-  if (!precheck?.enabled && apiKeyRestrictionLimits.length === 0) {
+  const apiKeyRestrictionRateLimits = resolveApiKeyRestrictionRateLimits(input.request);
+  const apiKeyRestrictionBudgetLimits = resolveApiKeyRestrictionBudgetLimits(input.request);
+  if (
+    !precheck?.enabled &&
+    apiKeyRestrictionRateLimits.length === 0 &&
+    apiKeyRestrictionBudgetLimits.length === 0
+  ) {
     return { ok: true };
   }
 
   const staticPrecheckEnabled = precheck.enabled === true;
   const rateLimitRules = staticPrecheckEnabled && precheck.rateLimit.enabled
-    ? [...resolveRateLimitRules(precheck.rateLimit), ...apiKeyRestrictionLimits]
-    : apiKeyRestrictionLimits;
+    ? [...resolveRateLimitRules(precheck.rateLimit), ...apiKeyRestrictionRateLimits]
+    : apiKeyRestrictionRateLimits;
   const hasQuota = staticPrecheckEnabled && precheck.quota.enabled && precheck.quota.maxTokens > 0;
   const hasBudget = staticPrecheckEnabled && precheck.budget.enabled && precheck.budget.maxCostUsd > 0;
+  const hasApiKeyBudget = apiKeyRestrictionBudgetLimits.length > 0;
 
-  if (rateLimitRules.length === 0 && !hasQuota && !hasBudget) {
+  if (rateLimitRules.length === 0 && !hasQuota && !hasBudget && !hasApiKeyBudget) {
     return { ok: true };
   }
 
   const needsEstimate =
     hasQuota ||
     hasBudget ||
+    hasApiKeyBudget ||
     rateLimitRules.some((limit) => limit.metric === 'tokens' || limit.metric === 'images');
   const estimate =
     needsEstimate
@@ -168,6 +180,23 @@ export async function evaluateGatewayPrecheck(input: GatewayPrecheckInput): Prom
         now
       )
     );
+  }
+
+  if (hasApiKeyBudget && estimate) {
+    for (const limit of apiKeyRestrictionBudgetLimits) {
+      checks.push(
+        buildPendingCheck(
+          'budget',
+          input,
+          limit,
+          'cost_usd',
+          limit.name,
+          limit.maxCostUsd,
+          estimate.estimatedCostUsd,
+          now
+        )
+      );
+    }
   }
 
   return reserveChecks(input.config.precheck.storage, checks, estimate);
@@ -294,35 +323,88 @@ function resolveRateLimitRules(
 function resolveApiKeyRestrictionRateLimits(
   request: FastifyRequest
 ): GatewayRateLimitDimensionConfig[] {
-  const restrictions = (
-    request as FastifyRequest & {
-      gatewayApiKeyRestrictions?: GatewayApiKeyRestrictions;
-    }
-  ).gatewayApiKeyRestrictions;
+  const restrictions = readRequestApiKeyRestrictions(request);
   if (!restrictions) {
     return [];
   }
 
+  const limits: GatewayRateLimitDimensionConfig[] = [];
   const maxRequests = normalizePositiveInteger(
-    restrictions.rateLimit ?? restrictions.requestsPerMinute
+    restrictions.rateLimit ?? restrictions.requestsPerMinute ?? restrictions.rpm
   );
-  if (!maxRequests) {
-    return [];
-  }
-
-  const windowSeconds =
-    normalizePositiveInteger(restrictions.rateLimitWindowSeconds) || 60;
-  return [
-    {
+  if (maxRequests) {
+    limits.push({
       enabled: true,
       name: 'api_key_restriction',
       metric: 'requests',
-      windowMs: Math.min(Math.max(windowSeconds, 1), 3600) * 1000,
+      windowMs: resolveRestrictionWindowMs(restrictions.rateLimitWindowSeconds),
       max: maxRequests,
+      subject: 'api_key',
+      scope: 'global',
+    });
+  }
+
+  const maxTokens = normalizePositiveInteger(
+    restrictions.tokensPerMinute ?? restrictions.tpm
+  );
+  if (maxTokens) {
+    limits.push({
+      enabled: true,
+      name: 'api_key_tpm',
+      metric: 'tokens',
+      windowMs: resolveRestrictionWindowMs(restrictions.tokenLimitWindowSeconds),
+      max: maxTokens,
+      subject: 'api_key',
+      scope: 'global',
+    });
+  }
+
+  return limits;
+}
+
+function resolveApiKeyRestrictionBudgetLimits(
+  request: FastifyRequest
+): ApiKeyRestrictionBudgetLimit[] {
+  const restrictions = readRequestApiKeyRestrictions(request);
+  if (!restrictions) {
+    return [];
+  }
+
+  const maxCostUsd = normalizePositiveNumber(
+    restrictions.costLimitUsd ??
+      restrictions.costLimit ??
+      restrictions.maxCostUsd ??
+      restrictions.costPerMinuteUsd
+  );
+  if (!maxCostUsd) {
+    return [];
+  }
+
+  return [
+    {
+      enabled: true,
+      name: 'api_key_cost',
+      windowMs: resolveRestrictionWindowMs(restrictions.costLimitWindowSeconds),
+      maxCostUsd,
       subject: 'api_key',
       scope: 'global',
     },
   ];
+}
+
+function readRequestApiKeyRestrictions(
+  request: FastifyRequest
+): GatewayApiKeyRestrictions | undefined {
+  return (
+    request as FastifyRequest & {
+      gatewayApiKeyRestrictions?: GatewayApiKeyRestrictions;
+    }
+  ).gatewayApiKeyRestrictions;
+}
+
+function resolveRestrictionWindowMs(value: unknown): number {
+  const windowSeconds = normalizePositiveInteger(value) || 60;
+  return Math.min(Math.max(windowSeconds, 1), 3600) * 1000;
 }
 
 function normalizePositiveInteger(value: unknown): number | undefined {
@@ -337,6 +419,20 @@ function normalizePositiveInteger(value: unknown): number | undefined {
   }
 
   return Math.floor(numeric);
+}
+
+function normalizePositiveNumber(value: unknown): number | undefined {
+  const numeric =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string'
+        ? Number(value)
+        : NaN;
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return undefined;
+  }
+
+  return numeric;
 }
 
 const redisReserveScript = `

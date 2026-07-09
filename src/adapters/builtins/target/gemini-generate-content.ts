@@ -12,7 +12,7 @@ import type {
   UpstreamRequest
 } from '../../../types';
 import { err, ok } from '../../../types';
-import { asString, collectStandardInputMessages, isObject } from '../../../utils';
+import { asBoolean, asNumber, asString, collectStandardInputMessages, isObject } from '../../../utils';
 import { buildGeminiInteractionsUrl, buildGeminiUrl } from '../common';
 import { parseGeminiToStandardResponse } from './shared';
 import {
@@ -31,6 +31,7 @@ const geminiThoughtSignaturesByToolUseId = new Map<string, string>();
 
 interface GeminiContentConversionState {
   pendingThoughtSignature?: string;
+  pendingThoughtPart?: Record<string, unknown>;
   toolNamesById: Map<string, string>;
   thoughtSignatureCacheScope: string;
 }
@@ -77,6 +78,11 @@ export const geminiGenerateContentTargetAdapter: TargetAdapter = {
       generationConfig.stopSequences = Array.isArray(input.standardRequest.stop)
         ? input.standardRequest.stop
         : [input.standardRequest.stop];
+    }
+
+    const thinkingConfig = buildGeminiThinkingConfig(input.standardRequest);
+    if (thinkingConfig) {
+      generationConfig.thinkingConfig = thinkingConfig;
     }
 
     const body: Record<string, unknown> = {
@@ -253,10 +259,12 @@ function standardInputToGeminiInteractionsInput(
 
       if (item.type === 'reasoning' && message.role === 'assistant') {
         const summary = standardReasoningText(item);
-        if (summary) {
+        const signature = standardReasoningThoughtSignature(item);
+        if (summary || signature) {
           steps.push({
             type: 'thought',
-            summary: geminiInteractionTextContent(summary)
+            ...(summary ? { summary: geminiInteractionTextContent(summary) } : {}),
+            ...(signature ? { signature } : {})
           });
         }
         continue;
@@ -349,6 +357,60 @@ function readReasoningEffort(reasoning: unknown): string | undefined {
 
   const effort = asString(reasoning.effort);
   return effort && ['none', 'minimal', 'low', 'medium', 'high'].includes(effort) ? effort : undefined;
+}
+
+function buildGeminiThinkingConfig(standardRequest: StandardRequest): Record<string, unknown> | undefined {
+  const explicitThinking = isPlainRecord(standardRequest.thinking) ? standardRequest.thinking : undefined;
+  const reasoningEffort =
+    readReasoningEffort(standardRequest.reasoning) ||
+    readReasoningEffort(standardRequest.output_config);
+  const thinkingType = normalizeThinkingType(explicitThinking?.type);
+  const enabled = asBoolean(explicitThinking?.enabled);
+  const budget = readGeminiThinkingBudget(explicitThinking);
+  const includeThoughts =
+    asBoolean(explicitThinking?.includeThoughts) ??
+    asBoolean(explicitThinking?.include_thoughts);
+
+  if (thinkingType === 'disabled' || enabled === false || reasoningEffort === 'none' || budget === 0) {
+    return { thinkingBudget: 0 };
+  }
+
+  const config: Record<string, unknown> = {};
+  if (budget !== undefined) {
+    config.thinkingBudget = budget;
+  }
+
+  if (includeThoughts !== undefined) {
+    config.includeThoughts = includeThoughts;
+  } else if (thinkingType === 'enabled' || enabled === true || reasoningEffort) {
+    config.includeThoughts = true;
+  }
+
+  return Object.keys(config).length > 0 ? config : undefined;
+}
+
+function normalizeThinkingType(value: unknown): 'enabled' | 'disabled' | undefined {
+  const type = asString(value)?.trim().toLowerCase();
+  if (type === 'enabled' || type === 'auto') {
+    return 'enabled';
+  }
+  if (type === 'disabled' || type === 'none' || type === 'off') {
+    return 'disabled';
+  }
+  return undefined;
+}
+
+function readGeminiThinkingBudget(value: Record<string, unknown> | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  return (
+    asNumber(value.thinkingBudget) ??
+    asNumber(value.thinking_budget) ??
+    asNumber(value.budget_tokens) ??
+    asNumber(value.budgetTokens)
+  );
 }
 
 function applyGeminiInteractionsOptions(
@@ -487,6 +549,7 @@ function standardContentToGeminiParts(
       const reasoningPart = standardReasoningToGeminiThoughtPart(item);
       if (reasoningPart) {
         parts.push(reasoningPart);
+        state.pendingThoughtPart = reasoningPart;
       }
       const thoughtSignature = standardReasoningThoughtSignature(item);
       if (thoughtSignature) {
@@ -508,6 +571,7 @@ function standardContentToGeminiParts(
         state.pendingThoughtSignature ||
         readCachedGeminiThoughtSignature(state.thoughtSignatureCacheScope, item.id);
       state.pendingThoughtSignature = undefined;
+      state.pendingThoughtPart = undefined;
       const part: Record<string, unknown> = {
         functionCall
       };
@@ -548,6 +612,21 @@ function standardContentToGeminiParts(
   }
 
   flushText();
+
+  if (
+    state.pendingThoughtSignature &&
+    state.pendingThoughtPart &&
+    state.pendingThoughtPart.thoughtSignature === undefined
+  ) {
+    state.pendingThoughtPart.thoughtSignature = state.pendingThoughtSignature;
+  } else if (state.pendingThoughtSignature) {
+    parts.push({
+      thought: true,
+      thoughtSignature: state.pendingThoughtSignature
+    });
+  }
+  state.pendingThoughtSignature = undefined;
+  state.pendingThoughtPart = undefined;
 
   return parts.length > 0 ? parts : [{ text: '' }];
 }
@@ -651,12 +730,17 @@ function standardReasoningThoughtSignature(
     if (!isObject(detail)) {
       continue;
     }
-    const signature = asString(detail.signature);
+    const signature =
+      asString(detail.signature) ||
+      asString(detail.thoughtSignature) ||
+      asString(detail.thought_signature) ||
+      asString(detail.data) ||
+      asString(detail.encrypted_content);
     if (signature) {
       return signature;
     }
   }
-  return undefined;
+  return item.encrypted_content;
 }
 
 function standardReasoningText(

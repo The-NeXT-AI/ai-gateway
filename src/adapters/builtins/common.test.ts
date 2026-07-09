@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { buildGeminiUrl, buildOpenAIHeaders, normalizeOpenAIResponsesUsage } from './common';
+import {
+  buildAnthropicHeaders,
+  buildGeminiUrl,
+  buildOpenAIHeaders,
+  normalizeOpenAIResponsesUsage
+} from './common';
 
 describe('buildOpenAIHeaders', () => {
   it('uses x-api-key when authorization header is missing', () => {
@@ -123,6 +128,54 @@ describe('buildOpenAIHeaders', () => {
         process.env.OPENAI_API_KEY = previousOpenAIKey;
       }
     }
+  });
+});
+
+describe('buildAnthropicHeaders', () => {
+  it('preserves incoming user-agent for Anthropic upstream requests', () => {
+    const result = buildAnthropicHeaders(
+      {
+        'x-api-key': 'x-api-key-token',
+        'anthropic-beta': 'claude-code-20250219',
+        'user-agent': 'claude-cli/2.1.205 (external, cli)'
+      } as never,
+      {
+        auth: {
+          enabled: false,
+          mode: 'trusted_header'
+        }
+      } as never
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value['x-api-key']).toBe('x-api-key-token');
+    expect(result.value['anthropic-beta']).toBe('claude-code-20250219');
+    expect(result.value['user-agent']).toBe('claude-cli/2.1.205 (external, cli)');
+  });
+
+  it('does not add a user-agent when one is not provided', () => {
+    const result = buildAnthropicHeaders(
+      {
+        'x-api-key': 'x-api-key-token'
+      } as never,
+      {
+        auth: {
+          enabled: false,
+          mode: 'trusted_header'
+        }
+      } as never
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value).not.toHaveProperty('user-agent');
   });
 });
 

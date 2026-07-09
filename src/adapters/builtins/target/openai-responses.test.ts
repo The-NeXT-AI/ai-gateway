@@ -949,6 +949,56 @@ describe('openAIResponsesTargetAdapter', () => {
     expect(body.messages).toEqual(expectedInterleavedThinkingToolMessages(false));
   });
 
+  it('converts Anthropic thinking/tool_use history per OpenAI chat provider', () => {
+    const cases = [
+      {
+        baseurl: 'https://api.deepseek.com',
+        expectedReasoningSplit: undefined,
+        expectedThinking: { type: 'enabled' },
+        expectedReasoningEffort: 'high',
+        expectedMessages: expectedAnthropicInterleavedThinkingToolMessages(true)
+      },
+      {
+        baseurl: 'https://api.xiaomimimo.com/v1',
+        expectedReasoningSplit: undefined,
+        expectedThinking: { type: 'enabled' },
+        expectedReasoningEffort: undefined,
+        expectedMessages: expectedXiaomiMimoAnthropicInterleavedThinkingToolMessages()
+      },
+      {
+        baseurl: 'https://open.bigmodel.cn/api/paas/v4',
+        expectedReasoningSplit: undefined,
+        expectedThinking: { type: 'enabled' },
+        expectedReasoningEffort: 'medium',
+        expectedMessages: expectedAnthropicInterleavedThinkingToolMessages(false)
+      },
+      {
+        baseurl: 'https://api.minimax.io/v1',
+        expectedReasoningSplit: true,
+        expectedThinking: undefined,
+        expectedReasoningEffort: undefined,
+        expectedMessages: expectedAnthropicInterleavedThinkingToolMessages(true)
+      }
+    ];
+
+    for (const testCase of cases) {
+      const body = buildAnthropicInterleavedThinkingOpenAIChatBody({
+        name: 'generic-openai-compatible',
+        models: ['interleaved-thinking-model'],
+        type: 'openai_chat_completions',
+        baseurl: testCase.baseurl
+      });
+
+      expect(body.reasoning_split).toBe(testCase.expectedReasoningSplit);
+      expect(body.interleaved_thinking).toBeUndefined();
+      expect(body.interleavedThinking).toBeUndefined();
+      expect(body.thinking).toEqual(testCase.expectedThinking);
+      expect(body.reasoning_effort).toBe(testCase.expectedReasoningEffort);
+      expect(body.output_config).toBeUndefined();
+      expect(body.messages).toEqual(testCase.expectedMessages);
+    }
+  });
+
   it('enables reasoning_split automatically for Minimax OpenAI chat/completions targets', () => {
     const parsed = parseOpenAIResponsesRequest({
       model: 'MiniMax-M2.7',
@@ -1191,6 +1241,44 @@ describe('openAIResponsesTargetAdapter', () => {
 
     const body = built.value.body as Record<string, unknown>;
     expect(body.reasoning_split).toBe(true);
+  });
+
+  it('normalizes interleaved_thinking aliases when targeting OpenAI chat/completions', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'MiniMax-M2.7',
+      interleaved_thinking: true,
+      input: 'hello'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        type: 'openai_chat_completions'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(parsed.value.reasoning_split).toBe(true);
+    expect(body.reasoning_split).toBe(true);
+    expect(body.interleaved_thinking).toBeUndefined();
+    expect(body.interleavedThinking).toBeUndefined();
   });
 
   it('can disable reasoning_split for incompatible OpenAI chat/completions targets', () => {
@@ -1643,6 +1731,83 @@ function buildInterleavedThinkingOpenAIChatBody(
   return built.value.body as Record<string, unknown>;
 }
 
+function buildAnthropicInterleavedThinkingOpenAIChatBody(
+  targetProviderConfig: Record<string, unknown>
+): Record<string, unknown> {
+  const parsed = parseAnthropicMessagesRequest({
+    model: 'interleaved-thinking-model',
+    max_tokens: 128,
+    thinking: {
+      type: 'enabled'
+    },
+    output_config: {
+      effort: 'medium'
+    },
+    messages: [
+      {
+        role: 'user',
+        content: 'Use a tool'
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'Need to call the weather tool before answering.',
+            signature: 'sig_123'
+          },
+          {
+            type: 'tool_use',
+            id: 'call_weather',
+            name: 'get_weather',
+            input: {
+              city: 'Shanghai'
+            }
+          }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'call_weather',
+            content: '{"temperature":22}'
+          },
+          {
+            type: 'text',
+            text: 'continue'
+          }
+        ]
+      }
+    ]
+  });
+
+  expect(parsed.ok).toBe(true);
+  if (!parsed.ok) {
+    throw new Error(parsed.error);
+  }
+
+  const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+    request: {
+      headers: {}
+    } as never,
+    standardRequest: parsed.value,
+    config: {
+      openaiApiKey: 'sk-test',
+      openaiBaseUrl: 'https://mock.local/v1'
+    } as never,
+    targetProviderConfig: targetProviderConfig as never
+  });
+
+  expect(built.ok).toBe(true);
+  if (!built.ok) {
+    throw new Error(built.error);
+  }
+
+  return built.value.body as Record<string, unknown>;
+}
+
 function expectedInterleavedThinkingToolMessages(includeReasoning: boolean): Array<Record<string, unknown>> {
   const assistantMessage: Record<string, unknown> = {
     role: 'assistant',
@@ -1688,5 +1853,58 @@ function expectedInterleavedThinkingToolMessages(includeReasoning: boolean): Arr
 function expectedXiaomiMimoInterleavedThinkingToolMessages(): Array<Record<string, unknown>> {
   const messages = expectedInterleavedThinkingToolMessages(true);
   delete messages[0].reasoning_details;
+  return messages;
+}
+
+function expectedAnthropicInterleavedThinkingToolMessages(includeReasoning: boolean): Array<Record<string, unknown>> {
+  const assistantMessage: Record<string, unknown> = {
+    role: 'assistant',
+    content: '',
+    tool_calls: [
+      {
+        id: 'call_weather',
+        type: 'function',
+        function: {
+          name: 'get_weather',
+          arguments: '{"city":"Shanghai"}'
+        }
+      }
+    ]
+  };
+
+  if (includeReasoning) {
+    assistantMessage.reasoning_content = 'Need to call the weather tool before answering.';
+    assistantMessage.reasoning_details = [
+      {
+        type: 'reasoning.text',
+        text: 'Need to call the weather tool before answering.',
+        format: 'anthropic-claude-v1',
+        index: 0,
+        signature: 'sig_123'
+      }
+    ];
+  }
+
+  return [
+    {
+      role: 'user',
+      content: 'Use a tool'
+    },
+    assistantMessage,
+    {
+      role: 'tool',
+      tool_call_id: 'call_weather',
+      content: '{"temperature":22}'
+    },
+    {
+      role: 'user',
+      content: 'continue'
+    }
+  ];
+}
+
+function expectedXiaomiMimoAnthropicInterleavedThinkingToolMessages(): Array<Record<string, unknown>> {
+  const messages = expectedAnthropicInterleavedThinkingToolMessages(true);
+  delete messages[1].reasoning_details;
   return messages;
 }

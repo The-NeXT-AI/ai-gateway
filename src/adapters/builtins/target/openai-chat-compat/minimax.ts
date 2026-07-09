@@ -7,6 +7,8 @@ export const minimaxOpenAIChatProviderThinkingAdapter: OpenAIChatProviderThinkin
   },
   rewriteRequest(input) {
     input.body.reasoning_split = true;
+    delete input.body.interleaved_thinking;
+    delete input.body.interleavedThinking;
     delete input.body.thinking;
     delete input.body.output_config;
     delete input.body.reasoning_effort;

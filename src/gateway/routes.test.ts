@@ -1859,7 +1859,7 @@ describe('gateway routes protocol conversion', () => {
                 content: 'continue'
               }
             ],
-            reasoning_split: true,
+            interleaved_thinking: true,
             thinking: {
               type: 'enabled'
             },
@@ -1873,6 +1873,8 @@ describe('gateway routes protocol conversion', () => {
         const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
         const upstreamBody = JSON.parse(String(upstreamInit.body));
         expect(upstreamBody.reasoning_split).toBe(testCase.expectedReasoningSplit);
+        expect(upstreamBody.interleaved_thinking).toBeUndefined();
+        expect(upstreamBody.interleavedThinking).toBeUndefined();
         expect(upstreamBody.thinking).toEqual(testCase.expectedThinking);
         expect(upstreamBody.reasoning_effort).toBe(testCase.expectedReasoningEffort);
         expect(upstreamBody.output_config).toBeUndefined();
@@ -1966,6 +1968,60 @@ describe('gateway routes protocol conversion', () => {
       const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.reasoning_split).toBeUndefined();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('normalizes passthrough interleaved_thinking aliases for generic chat/completions targets', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_generic_interleaved_alias',
+          object: 'chat.completion',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: 'ok' },
+              finish_reason: 'stop'
+            }
+          ]
+        }),
+        { headers: { 'content-type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }],
+          interleavedThinking: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.reasoning_split).toBe(true);
+      expect(upstreamBody.interleaved_thinking).toBeUndefined();
+      expect(upstreamBody.interleavedThinking).toBeUndefined();
     } finally {
       await app.close();
     }

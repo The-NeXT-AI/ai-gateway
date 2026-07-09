@@ -61,15 +61,20 @@ function rewriteGenericOpenAIChatCompatibleRequest(
   let nextBody = body;
   const reasoningSplitMode = targetProviderConfig.openaiChatReasoningSplit ?? 'auto';
   const thinkingOptionsMode = targetProviderConfig.openaiChatThinkingOptions ?? 'auto';
-  const requestedReasoningSplit = Boolean(options.standardRequest?.reasoning_split ?? asBoolean(nextBody.reasoning_split));
+  const requestedReasoningSplit = Boolean(
+    options.standardRequest?.reasoning_split ?? readOpenAIChatReasoningSplitOption(nextBody)
+  );
 
   if (reasoningSplitMode === 'enabled' || requestedReasoningSplit) {
     nextBody = {
       ...nextBody,
       reasoning_split: true
     };
+    nextBody = omitOpenAIChatReasoningSplitAliases(nextBody);
   } else if (options.generatedReasoningMessageFields) {
     nextBody = omitOpenAIChatMessageReasoningFieldsFromBody(nextBody);
+  } else {
+    nextBody = omitOpenAIChatReasoningSplitAliases(nextBody);
   }
 
   if (thinkingOptionsMode === 'enabled' && options.standardRequest) {
@@ -111,6 +116,28 @@ function omitOpenAIChatReasoningSplitFields(body: Record<string, unknown>): Reco
   if (strippedMessages !== body.messages) {
     rest.messages = strippedMessages;
   }
+  return rest;
+}
+
+function readOpenAIChatReasoningSplitOption(body: Record<string, unknown>): boolean | undefined {
+  return (
+    asBoolean(body.reasoning_split) ??
+    asBoolean(body.interleaved_thinking) ??
+    asBoolean(body.interleavedThinking)
+  );
+}
+
+function omitOpenAIChatReasoningSplitAliases(body: Record<string, unknown>): Record<string, unknown> {
+  if (
+    !Object.prototype.hasOwnProperty.call(body, 'interleaved_thinking') &&
+    !Object.prototype.hasOwnProperty.call(body, 'interleavedThinking')
+  ) {
+    return body;
+  }
+
+  const rest = { ...body };
+  delete rest.interleaved_thinking;
+  delete rest.interleavedThinking;
   return rest;
 }
 

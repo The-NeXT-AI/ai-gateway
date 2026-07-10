@@ -426,6 +426,7 @@ function buildOpenAIResponsesUsageFromStandardUsage(usage: StandardUsage): Recor
     inputDetails.cached_tokens = usage.cache_read_tokens;
   }
   if (usage.cache_write_tokens !== undefined) {
+    inputDetails.cache_write_tokens = usage.cache_write_tokens;
     inputDetails.cache_creation_tokens = usage.cache_write_tokens;
   }
 
@@ -1153,6 +1154,7 @@ function mergeAnthropicUsageSnapshot(
   }
 
   const cacheWriteTokens =
+    asNumber(isObject(usage.input_tokens_details) ? usage.input_tokens_details.cache_write_tokens : undefined) ??
     asNumber(usage.cache_creation_input_tokens) ??
     asNumber(usage.cache_creation_tokens) ??
     asNumber(usage.cache_write_tokens) ??
@@ -1179,6 +1181,7 @@ function buildOpenAIChatUsage(usage: StandardResponse['usage']): Record<string, 
     promptTokenDetails.cached_tokens = usage.cache_read_tokens;
   }
   if (usage.cache_write_tokens !== undefined) {
+    promptTokenDetails.cache_write_tokens = usage.cache_write_tokens;
     promptTokenDetails.cache_creation_tokens = usage.cache_write_tokens;
   }
   if (Object.keys(promptTokenDetails).length > 0) {
@@ -3103,6 +3106,7 @@ function finalizeOpenAIChatRelay(state: OpenAIChatRelayState): string[] {
       promptTokenDetails.cached_tokens = state.usage.cachedPromptTokens;
     }
     if (state.usage.cacheCreationPromptTokens !== undefined) {
+      promptTokenDetails.cache_write_tokens = state.usage.cacheCreationPromptTokens;
       promptTokenDetails.cache_creation_tokens = state.usage.cacheCreationPromptTokens;
     }
     usage.prompt_tokens_details = promptTokenDetails;
@@ -3163,6 +3167,7 @@ function updateOpenAIChatRelayUsageFromAnthropic(
   }
 
   const cacheCreationPromptTokens =
+    asNumber(isObject(usage.input_tokens_details) ? usage.input_tokens_details.cache_write_tokens : undefined) ??
     asNumber(usage.cache_creation_input_tokens) ??
     asNumber(usage.cache_creation_tokens) ??
     asNumber(usage.cache_write_tokens) ??
@@ -3229,6 +3234,7 @@ function updateOpenAIChatRelayUsageFromOpenAIResponses(
   }
 
   const cacheCreationPromptTokens =
+    asNumber(inputDetails?.cache_write_tokens) ??
     asNumber(inputDetails?.cache_creation_tokens) ??
     asNumber(usage.cache_creation_input_tokens) ??
     asNumber(usage.cache_creation_tokens) ??
@@ -4442,6 +4448,7 @@ function updateOpenAIResponsesRelayUsageFromChat(
   }
 
   const cacheCreationTokens =
+    asNumber(promptDetails?.cache_write_tokens) ??
     asNumber(promptDetails?.cache_creation_tokens) ??
     asNumber(usage.cache_creation_input_tokens) ??
     asNumber(usage.cache_creation_tokens) ??
@@ -4449,6 +4456,7 @@ function updateOpenAIResponsesRelayUsageFromChat(
   if (cacheCreationTokens !== undefined) {
     mappedUsage.input_tokens_details = {
       ...(isObject(mappedUsage.input_tokens_details) ? mappedUsage.input_tokens_details : {}),
+      cache_write_tokens: cacheCreationTokens,
       cache_creation_tokens: cacheCreationTokens
     };
   }
@@ -4965,6 +4973,7 @@ function updateAnthropicRelayUsage(
   }
 
   const cacheCreationInputTokens =
+    asNumber(inputDetails?.cache_write_tokens) ??
     asNumber(inputDetails?.cache_creation_tokens) ??
     asNumber(usage.cache_creation_input_tokens) ??
     asNumber(usage.cache_creation_tokens) ??

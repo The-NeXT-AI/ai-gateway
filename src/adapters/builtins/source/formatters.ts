@@ -18,6 +18,7 @@ export function formatOpenAIChatCompletionsResponse(response: StandardResponse):
       promptTokenDetails.cached_tokens = response.usage.cache_read_tokens;
     }
     if (response.usage.cache_write_tokens !== undefined) {
+      promptTokenDetails.cache_write_tokens = response.usage.cache_write_tokens;
       promptTokenDetails.cache_creation_tokens = response.usage.cache_write_tokens;
     }
     usage.prompt_tokens_details = promptTokenDetails;

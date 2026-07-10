@@ -224,6 +224,7 @@ describe('normalizeOpenAIResponsesUsage', () => {
       input_tokens: 10,
       input_tokens_details: {
         cached_tokens: 4,
+        cache_write_tokens: 2,
         cache_creation_tokens: 2
       },
       output_tokens: 3,
@@ -235,6 +236,32 @@ describe('normalizeOpenAIResponsesUsage', () => {
         web_search_requests: 1,
         web_fetch_requests: 0
       }
+    });
+  });
+
+  it('normalizes GPT-5.6 cache write counters from input token details', () => {
+    expect(
+      normalizeOpenAIResponsesUsage({
+        input_tokens: 10,
+        output_tokens: 3,
+        total_tokens: 13,
+        input_tokens_details: {
+          cached_tokens: 4,
+          cache_write_tokens: 2
+        }
+      })
+    ).toEqual({
+      input_tokens: 10,
+      input_tokens_details: {
+        cached_tokens: 4,
+        cache_write_tokens: 2,
+        cache_creation_tokens: 2
+      },
+      output_tokens: 3,
+      output_tokens_details: {
+        reasoning_tokens: 0
+      },
+      total_tokens: 13
     });
   });
 });

@@ -213,6 +213,7 @@ export function normalizeOpenAIResponsesUsage(usageRaw: unknown): Record<string,
       ? usage.completion_tokens_details
       : {};
   const cacheCreationTokens =
+    asTokenCount(inputDetails.cache_write_tokens) ??
     asTokenCount(inputDetails.cache_creation_tokens) ??
     asTokenCount(usage.cache_creation_input_tokens) ??
     asTokenCount(usage.cache_creation_tokens) ??
@@ -228,7 +229,9 @@ export function normalizeOpenAIResponsesUsage(usageRaw: unknown): Record<string,
         asTokenCount(usage.cache_read_input_tokens) ??
         asTokenCount(usage.cache_read_tokens) ??
         0,
-      ...(cacheCreationTokens !== undefined ? { cache_creation_tokens: cacheCreationTokens } : {})
+      ...(cacheCreationTokens !== undefined
+        ? { cache_write_tokens: cacheCreationTokens, cache_creation_tokens: cacheCreationTokens }
+        : {})
     },
     output_tokens: outputTokens,
     output_tokens_details: {

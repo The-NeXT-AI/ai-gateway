@@ -30,6 +30,66 @@ describe('openAIResponsesTargetAdapter', () => {
     });
   });
 
+  it('parses GPT-5.6 cache write counters from OpenAI usage details', () => {
+    const parsed = openAIResponsesTargetAdapter.toStandardResponse({
+      id: 'resp_cache_write',
+      model: 'gpt-5.6',
+      output_text: 'cached',
+      usage: {
+        input_tokens: 120,
+        output_tokens: 8,
+        total_tokens: 128,
+        input_tokens_details: {
+          cached_tokens: 32,
+          cache_write_tokens: 16
+        }
+      }
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    expect(parsed.value.usage.cache_read_tokens).toBe(32);
+    expect(parsed.value.usage.cache_write_tokens).toBe(16);
+  });
+
+  it('parses GPT-5.6 cache write counters from chat usage details', () => {
+    const parsed = openAIResponsesTargetAdapter.toStandardResponse({
+      id: 'chatcmpl_cache_write',
+      object: 'chat.completion',
+      model: 'gpt-5.6',
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: 'cached'
+          },
+          finish_reason: 'stop'
+        }
+      ],
+      usage: {
+        prompt_tokens: 120,
+        completion_tokens: 8,
+        total_tokens: 128,
+        prompt_tokens_details: {
+          cached_tokens: 32,
+          cache_write_tokens: 16
+        }
+      }
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    expect(parsed.value.usage.cache_read_tokens).toBe(32);
+    expect(parsed.value.usage.cache_write_tokens).toBe(16);
+  });
+
   it('converts anthropic tool_use/tool_result history into OpenAI chat tool messages', () => {
     const parsed = parseAnthropicMessagesRequest({
       model: 'claude-3-5-sonnet-latest',

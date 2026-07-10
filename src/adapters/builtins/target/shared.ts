@@ -315,6 +315,7 @@ export function parseOpenAIToStandardResponse(payload: unknown): Result<Standard
     total_tokens: asNumber(usageRaw?.total_tokens),
     cache_read_tokens: asNumber(inputDetails?.cached_tokens) ?? asNumber(usageRaw?.cache_read_tokens),
     cache_write_tokens:
+      asNumber(inputDetails?.cache_write_tokens) ??
       asNumber(inputDetails?.cache_creation_tokens) ??
       asNumber(usageRaw?.cache_creation_tokens) ??
       asNumber(usageRaw?.cache_write_tokens),

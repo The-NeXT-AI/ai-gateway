@@ -57,7 +57,7 @@ describe('resolveBillingResponseSnapshot', () => {
   it('recovers openai usage when the response only exposes usage fields', () => {
     const result = resolveBillingResponseSnapshot('openai', openAIResponsesTargetAdapter, {
       id: 'resp_123',
-      model: 'gpt-5.4',
+      model: 'gpt-5.6',
       output: [],
       usage: {
         input_tokens: 55,
@@ -65,7 +65,7 @@ describe('resolveBillingResponseSnapshot', () => {
         total_tokens: 66,
         input_tokens_details: {
           cached_tokens: 9,
-          cache_creation_tokens: 7,
+          cache_write_tokens: 7,
           cache_duration_ms: 2500
         }
       }
@@ -74,7 +74,7 @@ describe('resolveBillingResponseSnapshot', () => {
     expect(result).toEqual({
       ok: true,
       value: {
-        model: 'gpt-5.4',
+        model: 'gpt-5.6',
         recovered: true,
         usage: {
           input_tokens: 55,

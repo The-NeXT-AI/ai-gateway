@@ -393,7 +393,7 @@ function isTruthy(value: string | undefined): boolean {
   return ['1', 'true', 'yes', 'on'].includes((value || '').trim().toLowerCase());
 }
 
-function parseJsonBody(body: BodyInit | null | undefined): Record<string, unknown> | undefined {
+function parseJsonBody(body: unknown): Record<string, unknown> | undefined {
   if (typeof body !== 'string') {
     return undefined;
   }

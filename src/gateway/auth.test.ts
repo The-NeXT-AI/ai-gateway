@@ -355,6 +355,9 @@ describe('gateway auth', () => {
     });
 
     expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
     expect(result.apiKeyRestrictions).toEqual({
       ipWhitelist: ['203.0.113.0/24'],
       allowedOrigins: ['https://app.example'],
@@ -363,7 +366,8 @@ describe('gateway auth', () => {
       costLimitUsd: 1.25
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const fetchBody = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    const fetchOptions = (fetchMock.mock.calls[0] as unknown as [string, RequestInit] | undefined)?.[1];
+    const fetchBody = JSON.parse(fetchOptions?.body as string);
     expect(fetchBody).toMatchObject({
       token: 'token-123',
       clientIp: '203.0.113.42',

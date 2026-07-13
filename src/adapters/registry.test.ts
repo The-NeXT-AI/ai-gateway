@@ -44,10 +44,18 @@ function createTargetAdapter(
         }
       };
     },
-    toStandardResponse(payload) {
+    toStandardResponse() {
       return {
         ok: true,
-        value: payload
+        value: {
+          id: 'resp_test',
+          object: 'response',
+          status: 'completed',
+          model: 'acme-test',
+          output_text: '',
+          output: [],
+          usage: {}
+        }
       };
     }
   };

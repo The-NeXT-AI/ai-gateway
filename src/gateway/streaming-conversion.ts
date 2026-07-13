@@ -26,6 +26,8 @@ import type {
 import { asNumber, asString, extractTextFromPart, isObject } from '../utils';
 
 interface OpenAIResponsesRelayState {
+  createdAt: number;
+  nextSequenceNumber: number;
   started: boolean;
   finished: boolean;
   responseId: string;
@@ -308,6 +310,7 @@ export function createOptimisticOpenAIChatStreamRelay(
       sourceAdapterKey: 'openai_responses',
       tools: standardRequest?.tools,
       state: {
+        ...createOpenAIResponsesSseMetadataState(),
         started: false,
         finished: false,
         responseId: `resp_${randomUUID()}`,
@@ -384,7 +387,9 @@ export async function* relayOptimisticOpenAIChatStreamTurn(
         ? emitOpenAIResponsesFramesFromChatChunk(relay.state, sanitizedPayload, relay.tools)
         : emitAnthropicFramesFromOpenAIChatChunk(relay.state, sanitizedPayload);
     for (const frame of frames) {
-      yield frame;
+      yield relay.sourceAdapterKey === 'openai_responses'
+        ? normalizeOpenAIResponsesSseFrame(relay.state, frame)
+        : frame;
     }
   }
 
@@ -408,7 +413,9 @@ export function finalizeOptimisticOpenAIChatStreamRelay(
     if (finishReason) {
       relay.state.finishReason = finishReason;
     }
-    return [...finalizeOpenAIResponsesRelay(relay.state), 'data: [DONE]\n\n'];
+    return [...finalizeOpenAIResponsesRelay(relay.state), 'data: [DONE]\n\n'].map((frame) =>
+      normalizeOpenAIResponsesSseFrame(relay.state, frame)
+    );
   }
 
   if (usage) {
@@ -1366,6 +1373,7 @@ function buildOpenAIChatStreamFrames(standardResponse: StandardResponse): string
 }
 
 function buildOpenAIResponsesStreamFrames(standardResponse: StandardResponse): string[] {
+  const sseState = createOpenAIResponsesSseMetadataState();
   const frames: string[] = [];
   frames.push(
     encodeSseData({
@@ -1406,7 +1414,7 @@ function buildOpenAIResponsesStreamFrames(standardResponse: StandardResponse): s
     })
   );
   frames.push('data: [DONE]\n\n');
-  return frames;
+  return frames.map((frame) => normalizeOpenAIResponsesSseFrame(sseState, frame));
 }
 
 function buildOpenAIResponsesMessageStreamFrames(
@@ -2270,6 +2278,7 @@ async function* relayOpenAIResponsesFromOpenAIStream(
   tools?: unknown[]
 ): AsyncGenerator<string> {
   const state: OpenAIResponsesRelayState = {
+    ...createOpenAIResponsesSseMetadataState(),
     started: false,
     finished: false,
     responseId: `resp_${randomUUID()}`,
@@ -2298,7 +2307,9 @@ async function* relayOpenAIResponsesFromOpenAIStream(
 
     if (data === '[DONE]') {
       if (!state.finished) {
-        yield* finalizeOpenAIResponsesRelay(state);
+        for (const frame of finalizeOpenAIResponsesRelay(state)) {
+          yield normalizeOpenAIResponsesSseFrame(state, frame);
+        }
       }
       yield 'data: [DONE]\n\n';
       return;
@@ -2321,12 +2332,14 @@ async function* relayOpenAIResponsesFromOpenAIStream(
         ? emitOpenAIResponsesFramesFromResponsesEvent(state, payload)
         : emitOpenAIResponsesFramesFromChatChunk(state, payload, tools);
     for (const frame of emittedFrames) {
-      yield frame;
+      yield normalizeOpenAIResponsesSseFrame(state, frame);
     }
   }
 
   if (!state.finished) {
-    yield* finalizeOpenAIResponsesRelay(state);
+    for (const frame of finalizeOpenAIResponsesRelay(state)) {
+      yield normalizeOpenAIResponsesSseFrame(state, frame);
+    }
     yield 'data: [DONE]\n\n';
   }
 }
@@ -6275,6 +6288,65 @@ function extractOpenAIResponsesOutputText(output: unknown): string {
 
 function encodeSseEvent(eventName: string, data: unknown): string {
   return `event: ${eventName}\n${encodeSseDataLines(data)}\n\n`;
+}
+
+interface OpenAIResponsesSseMetadataState {
+  createdAt: number;
+  nextSequenceNumber: number;
+}
+
+function createOpenAIResponsesSseMetadataState(): OpenAIResponsesSseMetadataState {
+  return {
+    createdAt: Math.floor(Date.now() / 1000),
+    nextSequenceNumber: 0
+  };
+}
+
+function normalizeOpenAIResponsesSseFrame(
+  state: OpenAIResponsesSseMetadataState,
+  frame: string
+): string {
+  const data = frame
+    .split('\n')
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice('data:'.length).trimStart())
+    .join('\n')
+    .trim();
+
+  if (!data || data === '[DONE]') {
+    return frame;
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(data);
+  } catch {
+    return frame;
+  }
+
+  if (!isObject(payload)) {
+    return frame;
+  }
+
+  const eventType = asString(payload.type);
+  if (!eventType) {
+    return frame;
+  }
+
+  const response = isObject(payload.response)
+    ? {
+        ...payload.response,
+        created_at: state.createdAt
+      }
+    : undefined;
+  const normalizedPayload = {
+    ...payload,
+    ...(response ? { response } : {}),
+    sequence_number: state.nextSequenceNumber
+  };
+  state.nextSequenceNumber += 1;
+
+  return encodeSseEvent(eventType, normalizedPayload);
 }
 
 function encodeSseData(data: unknown): string {

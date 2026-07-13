@@ -1784,6 +1784,23 @@ describe('gateway routes protocol conversion', () => {
       expect(response.body).toContain('"type":"response.output_text.done","text":"hello world"');
       expect(response.body).toContain('"type":"response.completed"');
       expect(response.body).toContain('data: [DONE]');
+
+      const events = parseJsonSseEvents(response.body);
+      expect(events.map((entry) => entry.event)).toEqual(
+        events.map((entry) => entry.data.type)
+      );
+      expect(events.map((entry) => entry.data.sequence_number)).toEqual(
+        events.map((_, index) => index)
+      );
+
+      const created = events.find((entry) => entry.event === 'response.created');
+      const completed = events.find((entry) => entry.event === 'response.completed');
+      expect(created?.data.response).toMatchObject({
+        created_at: expect.any(Number)
+      });
+      expect(completed?.data.response).toMatchObject({
+        created_at: created?.data.response.created_at
+      });
     } finally {
       await app.close();
     }
@@ -8622,6 +8639,14 @@ export function createGatewayPlugin() {
       expect(response.body).toContain('"type":"response.completed"');
       expect(response.body).toContain('data: [DONE]');
       expect(response.body).not.toContain('search_web');
+
+      const events = parseJsonSseEvents(response.body);
+      expect(events.map((entry) => entry.event)).toEqual(
+        events.map((entry) => entry.data.type)
+      );
+      expect(events.map((entry) => entry.data.sequence_number)).toEqual(
+        events.map((_, index) => index)
+      );
     } finally {
       await app.close();
     }
@@ -9422,6 +9447,29 @@ function createSseResponse(chunks: string[]): Response {
       'content-type': 'text/event-stream; charset=utf-8'
     }
   });
+}
+
+function parseJsonSseEvents(body: string): Array<{
+  event?: string;
+  data: Record<string, any>;
+}> {
+  const events: Array<{ event?: string; data: Record<string, any> }> = [];
+  for (const block of body.split(/\r?\n\r?\n/)) {
+    const lines = block.split(/\r?\n/);
+    const event = lines.find((line) => line.startsWith('event:'))?.slice('event:'.length).trim();
+    const data = lines
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice('data:'.length).trimStart())
+      .join('\n');
+    if (!data || data === '[DONE]') {
+      continue;
+    }
+    events.push({
+      event,
+      data: JSON.parse(data) as Record<string, any>
+    });
+  }
+  return events;
 }
 
 function createTrackedJsonResponse(payload: unknown, status: number, onCancel: () => void): Response {

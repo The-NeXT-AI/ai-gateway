@@ -636,6 +636,48 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('includes the upstream error cause chain in 502 response details', async () => {
+    const cause = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:443'), {
+      code: 'ECONNREFUSED'
+    });
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError('fetch failed', { cause });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig([createProviderConfig('openai-main', 'openai_responses', ['glm-5'])]);
+    config.upstreamRetry.enabled = false;
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'hello'
+        }
+      });
+
+      expect(response.statusCode).toBe(502);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(response.body).error.attempts[0]).toMatchObject({
+        stage: 'upstream_connect',
+        status: 502,
+        message: 'Failed to reach upstream provider.',
+        details: 'fetch failed => connect ECONNREFUSED 127.0.0.1:443 (ECONNREFUSED)'
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
   it('opens the upstream circuit breaker after a provider failure and rejects the next request', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(

@@ -39,6 +39,7 @@ import {
   asNumber,
   asString,
   collectStandardInputMessages,
+  formatErrorWithCause,
   isObject,
   normalizeMessageRole,
   parseProvider,
@@ -6153,7 +6154,7 @@ async function callUpstreamWithFailureCapture(
       stage: 'upstream_connect',
       status: 502,
       message: 'Failed to reach upstream provider.',
-      details: error instanceof Error ? error.message : String(error)
+      details: formatErrorWithCause(error)
     };
   } finally {
     slot.release();

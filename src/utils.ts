@@ -1,5 +1,7 @@
 import type { Provider, ProviderType, StandardRequestInputMessage } from './types';
 
+const maxErrorCauseDepth = 8;
+
 export function parseProvider(value: string | undefined): Provider | undefined {
   if (!value) {
     return undefined;
@@ -147,6 +149,39 @@ export function asStop(value: unknown): string | string[] | undefined {
 
 export function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+export function formatErrorWithCause(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+
+  const messages: string[] = [];
+  const seen = new Set<Error>();
+  let current: Error | undefined = error;
+
+  for (let depth = 0; current && depth < maxErrorCauseDepth; depth += 1) {
+    if (seen.has(current)) {
+      messages.push('[circular cause]');
+      return messages.join(' => ');
+    }
+
+    seen.add(current);
+    messages.push(formatSingleError(current));
+    current = current.cause instanceof Error ? current.cause : undefined;
+  }
+
+  if (current) {
+    messages.push('[cause chain truncated]');
+  }
+
+  return messages.join(' => ');
+}
+
+function formatSingleError(error: Error): string {
+  const message = error.message || error.name || 'Error';
+  const code = (error as Error & { code?: unknown }).code;
+  return typeof code === 'string' && code ? `${message} (${code})` : message;
 }
 
 export function extractTextFromPart(part: unknown): string {

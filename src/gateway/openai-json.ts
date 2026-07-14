@@ -15,6 +15,7 @@ import type {
 import { callUpstream, cancelResponseBody, cancelResponseBodyOnAbort, readUpstreamPayload } from '../upstream/client';
 import {
   asNumber,
+  formatErrorWithCause,
   isObject,
   parseProvider,
   providerFromProviderType,
@@ -658,7 +659,7 @@ async function callOpenAIJsonUpstream(
       stage: 'upstream_connect',
       status: 502,
       message: 'Failed to reach upstream provider.',
-      details: error instanceof Error ? error.message : String(error)
+      details: formatErrorWithCause(error)
     };
   } finally {
     slot.release();

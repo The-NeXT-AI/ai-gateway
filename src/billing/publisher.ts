@@ -19,6 +19,7 @@ export interface BillingQueueEvent {
   eventId: string;
   emittedAt: string;
   requestId: string;
+  clientIp?: string;
   attempt?: {
     kind?: 'upstream_attempt';
     sequence?: number;

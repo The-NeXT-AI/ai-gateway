@@ -86,6 +86,9 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.GATEWAY_SCHEDULING_FALLBACK_PRESERVE_CACHE;
     delete process.env.GATEWAY_SCHEDULING_FALLBACK_MAX_CACHE_WAIT_MS;
     delete process.env.GATEWAY_SCHEDULING_FALLBACK_MAX_CACHE_WAIT_SECONDS;
+    delete process.env.GATEWAY_TRUSTED_PROXY_CIDRS;
+    delete process.env.TRUSTED_PROXY_CIDRS;
+    delete process.env.GATEWAY_TRUSTED_PROXY_HEADER;
     delete process.env.GATEWAY_TRANSPARENT_TOOL_EXECUTION_ENABLED;
     delete process.env.GATEWAY_TRANSPARENT_TOOL_EXECUTION_MAX_TURNS;
     delete process.env.GATEWAY_TRANSPARENT_TOOL_EXECUTION_MAX_TOOL_CALLS;
@@ -174,6 +177,36 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.PROVIDER_EXTERNAL_STDIO_COMMAND;
     delete process.env.PROVIDER_EXTERNAL_STDIO_ARGS;
     delete process.env.PROVIDER_EXTERNAL_STDIO_CWD;
+  });
+
+  it('parses trusted reverse proxy settings from config and env', () => {
+    expect(
+      parseGatewayConfigFromRaw({
+        trustedProxyCidrs: ['10.0.0.0/8', '198.51.100.10'],
+        trustedProxyHeader: 'forwarded'
+      })
+    ).toMatchObject({
+      trustedProxyCidrs: ['10.0.0.0/8', '198.51.100.10'],
+      trustedProxyHeader: 'forwarded'
+    });
+
+    process.env.GATEWAY_TRUSTED_PROXY_CIDRS = '203.0.113.0/24, 2001:db8::/32';
+    process.env.GATEWAY_TRUSTED_PROXY_HEADER = 'x_real_ip';
+    expect(
+      parseGatewayConfigFromRaw({
+        trustedProxyCidrs: ['10.0.0.0/8'],
+        trustedProxyHeader: 'forwarded'
+      })
+    ).toMatchObject({
+      trustedProxyCidrs: ['203.0.113.0/24', '2001:db8::/32'],
+      trustedProxyHeader: 'x-real-ip'
+    });
+  });
+
+  it('rejects unsupported trusted reverse proxy headers', () => {
+    expect(() =>
+      parseGatewayConfigFromRaw({ trustedProxyHeader: 'x-arbitrary-client-ip' })
+    ).toThrow(/trustedProxyHeader must be one of/);
   });
 
   it('resolves provider api keys from apiKeyEnv', () => {

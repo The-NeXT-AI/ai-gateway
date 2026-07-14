@@ -76,6 +76,7 @@ import {
   recordProviderCircuitBreakerResponse
 } from './upstream-circuit-breaker';
 import { acquireProviderConcurrencySlot } from './upstream-concurrency';
+import { resolveGatewayClientIp } from './client-ip';
 import {
   recordGatewayStreamConversion,
   recordGatewayToolExecution
@@ -6148,13 +6149,21 @@ async function callUpstreamWithFailureCapture(
         model: context.model,
         error: true
       });
+      context.request.log.warn(
+        {
+          requestId: context.request.id,
+          provider: context.targetProvider,
+          providerName: context.targetProviderConfig?.name,
+          details: formatErrorWithCause(error)
+        },
+        'Failed to reach upstream provider.'
+      );
     }
     return {
       ok: false,
       stage: 'upstream_connect',
       status: 502,
-      message: 'Failed to reach upstream provider.',
-      details: formatErrorWithCause(error)
+      message: 'Failed to reach upstream provider.'
     };
   } finally {
     slot.release();
@@ -7266,6 +7275,7 @@ function publishBillingEventSafe(
     eventId: randomUUID(),
     emittedAt: new Date().toISOString(),
     requestId: request.id,
+    clientIp: resolveGatewayClientIp(request, config),
     attempt,
     route: {
       method: request.method,
@@ -7363,6 +7373,7 @@ function publishRequestFailureEventSafe(
     eventId: randomUUID(),
     emittedAt: new Date().toISOString(),
     requestId: request.id,
+    clientIp: resolveGatewayClientIp(request, config),
     route: {
       method: request.method,
       url: sanitizeRequestUrlForEvent(request.url)

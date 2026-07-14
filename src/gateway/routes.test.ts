@@ -636,7 +636,7 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
-  it('includes the upstream error cause chain in 502 response details', async () => {
+  it('does not expose the upstream error cause chain in 502 response details', async () => {
     const cause = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:443'), {
       code: 'ECONNREFUSED'
     });
@@ -667,12 +667,13 @@ describe('gateway routes protocol conversion', () => {
 
       expect(response.statusCode).toBe(502);
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(JSON.parse(response.body).error.attempts[0]).toMatchObject({
+      const attempt = JSON.parse(response.body).error.attempts[0];
+      expect(attempt).toMatchObject({
         stage: 'upstream_connect',
         status: 502,
-        message: 'Failed to reach upstream provider.',
-        details: 'fetch failed => connect ECONNREFUSED 127.0.0.1:443 (ECONNREFUSED)'
+        message: 'Failed to reach upstream provider.'
       });
+      expect(attempt).not.toHaveProperty('details');
     } finally {
       await app.close();
     }
@@ -7050,6 +7051,7 @@ export function createGatewayPlugin() {
         headers: {
           'content-type': 'application/json',
           'x-target-provider': 'openai-main',
+          'x-forwarded-for': '203.0.113.42, 127.0.0.1',
         },
         payload: {
           model: 'glm-5',
@@ -7075,6 +7077,7 @@ export function createGatewayPlugin() {
         status: 'success',
         statusCode: 200,
       });
+      expect(billingPayload.clientIp).toBe('203.0.113.42');
       expect(billingPayload.attempt).toBeUndefined();
       expect(billingPayload.billing.usage.total_tokens).toBe(20);
     } finally {

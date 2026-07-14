@@ -225,7 +225,7 @@ describe('openai embeddings gateway route', () => {
     }
   });
 
-  it('includes the upstream error cause chain in OpenAI JSON 502 response details', async () => {
+  it('does not expose the upstream error cause chain in OpenAI JSON 502 response details', async () => {
     const cause = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:443'), {
       code: 'ECONNREFUSED'
     });
@@ -260,12 +260,13 @@ describe('openai embeddings gateway route', () => {
 
       expect(response.statusCode).toBe(502);
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(JSON.parse(response.body).error.attempts[0]).toMatchObject({
+      const attempt = JSON.parse(response.body).error.attempts[0];
+      expect(attempt).toMatchObject({
         stage: 'upstream_connect',
         status: 502,
-        message: 'Failed to reach upstream provider.',
-        details: 'fetch failed => connect ECONNREFUSED 127.0.0.1:443 (ECONNREFUSED)'
+        message: 'Failed to reach upstream provider.'
       });
+      expect(attempt).not.toHaveProperty('details');
     } finally {
       await app.close();
     }

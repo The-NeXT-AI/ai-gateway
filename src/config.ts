@@ -39,6 +39,7 @@ import type {
   GatewaySchedulingConfig,
   GatewayTransparentToolExecutionConfig,
   GatewayTransparentToolUnknownPolicy,
+  GatewayTrustedProxyHeader,
   GatewayPluginConfig,
   GatewayPluginProviderHookConfig,
   GatewayUpstreamCircuitBreakerConfig,
@@ -566,6 +567,9 @@ interface GatewayJsonConfig {
   provider?: unknown;
   defaultTargetProvider?: unknown;
   defaultTargetProviders?: unknown;
+  trustedProxyCidrs?: unknown;
+  trustedProxies?: unknown;
+  trustedProxyHeader?: unknown;
   modelList?: unknown;
   openaiApiKey?: unknown;
   anthropicApiKey?: unknown;
@@ -948,6 +952,15 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
     defaultTargetProviders: resolveDefaultTargetProviders(
       process.env.DEFAULT_TARGET_PROVIDERS,
       providers
+    ),
+    trustedProxyCidrs: resolveStringList(
+      process.env.GATEWAY_TRUSTED_PROXY_CIDRS ?? process.env.TRUSTED_PROXY_CIDRS,
+      jsonConfig.trustedProxyCidrs ?? jsonConfig.trustedProxies,
+      []
+    ),
+    trustedProxyHeader: resolveTrustedProxyHeader(
+      process.env.GATEWAY_TRUSTED_PROXY_HEADER,
+      jsonConfig.trustedProxyHeader
     ),
     routing: parseGatewayRoutingConfig(routingSettings),
     scheduling: parseGatewaySchedulingConfig(jsonConfig.scheduling),
@@ -4207,6 +4220,30 @@ function resolveStringList(envValue: unknown, fileValue: unknown, fallback: stri
   }
 
   return [...fallback];
+}
+
+function resolveTrustedProxyHeader(
+  envValue: unknown,
+  fileValue: unknown
+): GatewayTrustedProxyHeader {
+  const raw = readString(envValue) || readString(fileValue);
+  if (!raw) {
+    return 'x-forwarded-for';
+  }
+
+  const normalized = raw.trim().toLowerCase().replaceAll('_', '-');
+  if (
+    normalized === 'forwarded' ||
+    normalized === 'x-forwarded-for' ||
+    normalized === 'x-real-ip' ||
+    normalized === 'x-client-ip'
+  ) {
+    return normalized;
+  }
+
+  throw new Error(
+    'trustedProxyHeader must be one of: forwarded, x-forwarded-for, x-real-ip, x-client-ip.'
+  );
 }
 
 function parseProviderTypeToken(value: string | undefined): ProviderType | undefined {

@@ -201,7 +201,7 @@ Default gRPC path:
 /gateway.events.v1.EventSink/Publish
 ```
 
-Billing events include request identity, route, target provider/model, fallback attempts, outcome, trace metadata, and calculated usage/cost.
+Billing events include request identity, client IP, route, target provider/model, fallback attempts, outcome, trace metadata, and calculated usage/cost.
 
 Agent events include:
 

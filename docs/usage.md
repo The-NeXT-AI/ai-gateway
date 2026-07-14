@@ -262,6 +262,7 @@ docker compose up --build
 - `providerExternal` 用于通过 HTTP/WebSocket/gRPC/stdio 从外部服务动态加载 provider、plugins、providerPlugins 与 virtualModelProfiles。
 - `billing` 支持 `cacheReadPerMillionUsd` / `cacheWritePerMillionUsd` 与 `tiers`（阶梯计费）
 - `configExternal` 用于从外部服务动态获取完整 gateway 配置（`enabled`、`transport=http|websocket|grpc|stdio`、`endpoint`、`command`、`args`、`cwd`、`env`、`method`、`timeoutMs`、`intervalMs|intervalSeconds`、`apiKeyHeader`、`apiKey|apiKeyEnv`、`headers`）；外部返回体可为完整配置对象、`{"config": {...}}` 或 `{"gatewayConfig": {...}}`。gRPC 使用 JSON unary，默认 path 为 `/gateway.config.v1.ConfigService/GetConfig`。
+- `trustedProxyCidrs` 用于配置可信反向代理来源网段；`trustedProxyHeader` 用于选择唯一可信的客户端 IP 转发头（`forwarded|x-forwarded-for|x-real-ip|x-client-ip`，默认 `x-forwarded-for`）。billing webhook 事件的 `clientIp` 仅在直连来源为 loopback 或命中可信网段时解析该头，并从右向左剔除可信代理；其他转发头会被忽略。
 - `billingWebhook` 用于配置事件上报（`enabled`、`transport=http|websocket|grpc|stdio`、`endpoint`、`command`、`args`、`cwd`、`env`、`timeoutMs`、`maxAttempts`、`baseDelayMs`、`maxDelayMs`、`requireAck`、`headers`）；gRPC 使用 JSON unary，默认 path 为 `/gateway.events.v1.EventSink/Publish`。
 - `billingQueue` 为历史兼容字段；gateway 不会创建队列连接，开启后也只记录禁用日志。需要队列时请通过 `billingWebhook` 或外部协议适配服务实现。
 - `rawTrace` 用于捕获原始请求/上游链路包；gateway 只写本地 spool bundle，`rawTrace.sync` 通过 HTTP/WebSocket/gRPC/stdio 上报 manifest，支持失败重试，由外部服务负责持久化、索引和归档。
@@ -347,6 +348,8 @@ docker compose up --build
 - `DEFAULT_TARGET_PROVIDER`：默认目标 provider（`openai|anthropic|gemini`）
 - `DEFAULT_TARGET_PROVIDERS`：默认目标 provider 列表（逗号分隔，如 `openai,anthropic,gemini`）
 - `UPSTREAM_TIMEOUT_MS`：兼容旧配置字段；当前不再对模型上游请求设置网关侧固定超时
+- `GATEWAY_TRUSTED_PROXY_CIDRS`：可信反向代理来源网段（逗号分隔）；用于解析 usage/billing 上报事件中的 `clientIp`
+- `GATEWAY_TRUSTED_PROXY_HEADER`：唯一可信的客户端 IP 转发头，默认 `x-forwarded-for`
 
 ### 客户 Auth（Header / Introspection / Static API Key）
 
@@ -728,6 +731,7 @@ curl -s http://localhost:3000/agent/sessions/demo/events?limit=20
   "eventId": "c5af7a5c-7d5b-4a2c-8be9-2d3830a58e8b",
   "emittedAt": "2026-03-09T12:34:56.789Z",
   "requestId": "req-123",
+  "clientIp": "203.0.113.42",
   "route": { "method": "POST", "url": "/v1/chat/completions" },
   "source": { "provider": "openai", "adapterKey": "openai_chat" },
   "target": { "provider": "anthropic", "model": "claude-3-5-sonnet-latest", "providerName": "anthropic-main" },

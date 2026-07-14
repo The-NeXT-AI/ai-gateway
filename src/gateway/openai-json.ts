@@ -34,6 +34,7 @@ import {
   recordProviderCircuitBreakerResponse
 } from './upstream-circuit-breaker';
 import { acquireProviderConcurrencySlot } from './upstream-concurrency';
+import { resolveGatewayClientIp } from './client-ip';
 
 interface TargetProviderRoute {
   provider: Provider;
@@ -653,13 +654,21 @@ async function callOpenAIJsonUpstream(
         context.targetProvider,
         context.targetProviderConfig
       );
+      context.request.log.warn(
+        {
+          requestId: context.request.id,
+          provider: context.targetProvider,
+          providerName: context.targetProviderConfig?.name,
+          details: formatErrorWithCause(error)
+        },
+        'Failed to reach upstream provider.'
+      );
     }
     return {
       ok: false,
       stage: 'upstream_connect',
       status: 502,
-      message: 'Failed to reach upstream provider.',
-      details: formatErrorWithCause(error)
+      message: 'Failed to reach upstream provider.'
     };
   } finally {
     slot.release();
@@ -1158,6 +1167,7 @@ function attachOpenAIJsonBillingHeaders(
     eventId: randomUUID(),
     emittedAt: new Date().toISOString(),
     requestId: request.id,
+    clientIp: resolveGatewayClientIp(request, config),
     route: {
       method: request.method,
       url: request.url

@@ -752,6 +752,12 @@ export interface VirtualModelProfileConfig {
   metadata?: Record<string, unknown>;
 }
 
+export type GatewayTrustedProxyHeader =
+  | 'forwarded'
+  | 'x-forwarded-for'
+  | 'x-real-ip'
+  | 'x-client-ip';
+
 export interface GatewayConfig {
   host: string;
   port: number;
@@ -763,6 +769,8 @@ export interface GatewayConfig {
   configExternal?: GatewayConfigExternalSourceConfig;
   defaultTargetProvider?: Provider;
   defaultTargetProviders: Provider[];
+  trustedProxyCidrs?: string[];
+  trustedProxyHeader?: GatewayTrustedProxyHeader;
   routing?: GatewayRoutingConfig;
   scheduling: GatewaySchedulingConfig;
   modelList?: GatewayModelListConfig;

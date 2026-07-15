@@ -6074,12 +6074,17 @@ export function createGatewayPlugin() {
           providerName: 'openai-main',
           codexOauth: {
             enabled: true,
+            tokenEndpoint: 'https://auth.openai.com/oauth/token',
+            clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+            scope:
+              'openid profile email offline_access api.connectors.read api.connectors.invoke',
             accessToken: {
               from: 'request.headers.x-codex-access-token'
             },
             refreshIfMissingAccessToken: true,
             forceRefresh: false,
             required: true,
+            timeoutMs: 3000,
             authHeader: 'authorization',
             authScheme: 'Bearer'
           }

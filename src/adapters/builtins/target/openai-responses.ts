@@ -113,7 +113,8 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
     temperature: standardRequest.temperature,
     top_p: standardRequest.top_p,
     max_output_tokens: standardRequest.max_output_tokens,
-    stop: standardRequest.stop
+    stop: standardRequest.stop,
+    text: standardRequest.text
   };
 
   const tools = mapStandardToolsToOpenAIResponsesTools(standardRequest.tools);
@@ -133,7 +134,7 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
     body.stream = true;
   }
 
-  applyOpenAIResponsesReasoningOptions(body, standardRequest);
+  applyOpenAIResponsesOutputOptions(body, standardRequest);
 
   return body;
 }
@@ -146,7 +147,7 @@ function resolveOpenAITargetProtocol(providerConfig: ProviderConfig | undefined)
   return 'openai_responses';
 }
 
-function applyOpenAIResponsesReasoningOptions(body: Record<string, unknown>, standardRequest: StandardRequest): void {
+function applyOpenAIResponsesOutputOptions(body: Record<string, unknown>, standardRequest: StandardRequest): void {
   if (standardRequest.reasoning !== undefined) {
     body.reasoning = standardRequest.reasoning;
   }
@@ -156,6 +157,13 @@ function applyOpenAIResponsesReasoningOptions(body: Record<string, unknown>, sta
       body.reasoning = {
         effort,
         ...(isObject(body.reasoning) ? body.reasoning : {})
+      };
+    }
+    const verbosity = asString(standardRequest.output_config.verbosity);
+    if (verbosity) {
+      body.text = {
+        verbosity,
+        ...(isObject(body.text) ? body.text : {})
       };
     }
   }

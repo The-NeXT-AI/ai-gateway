@@ -161,6 +161,94 @@ describe('openAIResponsesTargetAdapter', () => {
     expect(built.value.body).not.toHaveProperty('output_config');
   });
 
+  it('maps source verbosity while preserving explicit Responses reasoning', () => {
+    const parsed = parseAnthropicMessagesRequest({
+      model: 'source-model',
+      max_tokens: 64,
+      output_config: {
+        verbosity: 'low'
+      },
+      reasoning: {
+        effort: 'high'
+      },
+      messages: [{ role: 'user', content: 'hello' }]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect(built.value.body).not.toHaveProperty('output_config');
+    expect((built.value.body as Record<string, unknown>).reasoning).toEqual({
+      effort: 'high'
+    });
+    expect((built.value.body as Record<string, unknown>).text).toEqual({
+      verbosity: 'low'
+    });
+  });
+
+  it('preserves native Responses text options over source aliases', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'target-model',
+      text: {
+        format: {
+          type: 'text'
+        },
+        verbosity: 'high'
+      },
+      output_config: {
+        verbosity: 'low'
+      },
+      input: 'hello'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect(built.value.body).not.toHaveProperty('output_config');
+    expect((built.value.body as Record<string, unknown>).text).toEqual({
+      format: {
+        type: 'text'
+      },
+      verbosity: 'high'
+    });
+  });
+
   it('converts anthropic tool_use/tool_result history into OpenAI chat tool messages', () => {
     const parsed = parseAnthropicMessagesRequest({
       model: 'claude-3-5-sonnet-latest',

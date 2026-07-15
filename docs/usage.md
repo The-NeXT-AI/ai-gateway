@@ -254,10 +254,10 @@ docker compose up --build
 - `openaiChatThinkingOptions` 仅对 `openai_chat_completions` 生效，用于控制非官方兼容字段 `thinking` / `output_config`：默认 `auto` 只会对 Zhipu/BigModel 等已知需要该字段的 provider/model 自动添加；可设为 `true` / `enabled` 强制添加，或 `false` / `disabled` 强制移除。
 - `providerPlugins` 的 `auth/request/response` 支持声明式规则：`headers`、`query`、`bodySet`、`bodyMerge`、`bodyRemove`
 - `providerPlugins` 支持值引用：`{"from":"env.XXX"}`、`{"from":"request.headers.x-foo"}`、`{"from":"request.body.user.id"}`、`{"from":"upstreamPayload.data.id"}`、`{"from":"target.providerName"}`
-- `providerPlugins.codexOauth` 字段：`accessToken`、`refreshToken`、`tokenEndpoint`、`clientId`、`scope`、`refreshIfMissingAccessToken`、`forceRefresh`、`required`、`timeoutMs`、`authHeader`、`authScheme`
+- `providerPlugins.codexOauth` 字段：`accessToken`、`refreshToken`、`tokenEndpoint`、`clientId`、`scope`、`requiredScopes`、`refreshIfMissingAccessToken`、`forceRefresh`、`required`、`timeoutMs`、`authHeader`、`authScheme`；`requiredScopes` 默认要求 Codex connector scopes，只有显式设为 `[]` 才会禁用 scope 预检，且不会放宽 `required`；无效的非空值会回退到默认要求
 - `plugins[].providerHooks` / `providerPlugins` 的 `auth/request/response` 支持声明式规则：`headers`、`query`、`bodySet`、`bodyMerge`、`bodyRemove`
 - `plugins[].providerHooks` / `providerPlugins` 支持值引用：`{"from":"env.XXX"}`、`{"from":"request.headers.x-foo"}`、`{"from":"request.body.user.id"}`、`{"from":"upstreamPayload.data.id"}`、`{"from":"target.providerName"}`
-- `plugins[].providerHooks.codexOauth` / `providerPlugins.codexOauth` 字段：`accessToken`、`refreshToken`、`tokenEndpoint`、`clientId`、`scope`、`refreshIfMissingAccessToken`、`forceRefresh`、`required`、`timeoutMs`、`authHeader`、`authScheme`
+- `plugins[].providerHooks.codexOauth` / `providerPlugins.codexOauth` 字段：`accessToken`、`refreshToken`、`tokenEndpoint`、`clientId`、`scope`、`requiredScopes`、`refreshIfMissingAccessToken`、`forceRefresh`、`required`、`timeoutMs`、`authHeader`、`authScheme`
 - `virtualModelProfiles[].execution.streamMode` 默认为 `buffered`；设为 `optimistic` 时，OpenAI Chat Completions 上游 SSE 会边转发 reasoning/text，边拦截 internal tools，并在工具结果回填后继续同一个下游流。该模式仅在没有 client-visible tools 且无 response transform plugin 时启用，否则回退为 buffered。
 - `providerExternal` 用于通过 HTTP/WebSocket/gRPC/stdio 从外部服务动态加载 provider、plugins、providerPlugins 与 virtualModelProfiles。
 - `billing` 支持 `cacheReadPerMillionUsd` / `cacheWritePerMillionUsd` 与 `tiers`（阶梯计费）

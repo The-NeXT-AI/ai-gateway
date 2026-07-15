@@ -785,6 +785,11 @@ function normalizeCodexOauthUpstreamRequestBody(
     ...body
   };
 
+  if (Object.prototype.hasOwnProperty.call(nextBody, 'output_config')) {
+    delete nextBody.output_config;
+    changed = true;
+  }
+
   if (nextBody.store !== false) {
     nextBody.store = false;
     changed = true;

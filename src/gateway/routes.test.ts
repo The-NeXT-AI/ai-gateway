@@ -6043,6 +6043,103 @@ export function createGatewayPlugin() {
     }
   });
 
+  it('normalizes unsupported codex oauth Responses fields without refreshing credentials', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      expect(String(url)).toBe('https://chatgpt.com/backend-api/codex/responses');
+      const headers = (init?.headers || {}) as Record<string, string>;
+      const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          object: 'response',
+          output_text: 'codex-oauth-upstream',
+          authorization: headers.authorization,
+          upstream_body: body
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_responses', ['glm-5'])],
+      [
+        {
+          key: 'openai-main-codex-oauth',
+          enabled: true,
+          providerName: 'openai-main',
+          codexOauth: {
+            enabled: true,
+            accessToken: {
+              from: 'request.headers.x-codex-access-token'
+            },
+            refreshIfMissingAccessToken: true,
+            forceRefresh: false,
+            required: true,
+            authHeader: 'authorization',
+            authScheme: 'Bearer'
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main',
+          'x-codex-access-token': 'atk-from-request'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'hello codex oauth',
+          reasoning: {
+            effort: 'medium'
+          },
+          temperature: 0.25,
+          top_p: 0.8,
+          output_config: {
+            effort: 'high'
+          }
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body)) as Record<string, unknown>;
+      expect(upstreamBody).toMatchObject({
+        model: 'glm-5',
+        input: 'hello codex oauth',
+        reasoning: {
+          effort: 'medium'
+        },
+        temperature: 0.25,
+        top_p: 0.8,
+        store: false,
+        stream: true,
+        instructions: 'You are a helpful assistant.'
+      });
+      expect(upstreamBody).not.toHaveProperty('output_config');
+
+      const payload = JSON.parse(response.body);
+      expect(payload.authorization).toBe('Bearer atk-from-request');
+      expect(payload.upstream_body).toEqual(upstreamBody);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('injects default instructions and forces store=false for chat/completions requests via codex oauth', async () => {
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       const urlString = String(url);

@@ -142,6 +142,7 @@ runtime.providerPlugins.register(openAIMainPlugin);
 - 对纯流式透传（event-stream）响应不会强制做 payload 级改写
 - 也支持在 `gateway.config.json` 中通过 `providerPlugins` 声明式加载（进程启动自动注册，manager/webhook 热更新后自动重载）
 - `providerPlugins[].codexOauth` 可启用 Codex OAuth refresh token 流程（`client_id + grant_type=refresh_token + refresh_token`），并自动写入上游鉴权头
+- Codex OAuth 转发到 Responses 上游时，除既有的 `store` / `stream` / `instructions` 规范化外，还会移除不受支持的 `output_config`；其他字段保持不变
 
 ## 能力说明
 

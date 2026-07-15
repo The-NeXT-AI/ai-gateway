@@ -90,6 +90,77 @@ describe('openAIResponsesTargetAdapter', () => {
     expect(parsed.value.usage.cache_write_tokens).toBe(16);
   });
 
+  it('maps Messages output effort to Responses reasoning effort', () => {
+    const parsed = parseAnthropicMessagesRequest({
+      model: 'source-model',
+      max_tokens: 64,
+      output_config: {
+        effort: 'high'
+      },
+      messages: [{ role: 'user', content: 'hello' }]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).reasoning).toEqual({
+      effort: 'high'
+    });
+  });
+
+  it('omits Messages output configuration from Responses requests', () => {
+    const parsed = parseAnthropicMessagesRequest({
+      model: 'source-model',
+      max_tokens: 64,
+      output_config: {
+        effort: 'high',
+        task_budget: 512
+      },
+      messages: [{ role: 'user', content: 'hello' }]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect(built.value.body).not.toHaveProperty('output_config');
+  });
+
   it('converts anthropic tool_use/tool_result history into OpenAI chat tool messages', () => {
     const parsed = parseAnthropicMessagesRequest({
       model: 'claude-3-5-sonnet-latest',

@@ -150,11 +150,17 @@ function applyOpenAIResponsesReasoningOptions(body: Record<string, unknown>, sta
   if (standardRequest.reasoning !== undefined) {
     body.reasoning = standardRequest.reasoning;
   }
+  if (isObject(standardRequest.output_config)) {
+    const effort = asString(standardRequest.output_config.effort);
+    if (effort) {
+      body.reasoning = {
+        effort,
+        ...(isObject(body.reasoning) ? body.reasoning : {})
+      };
+    }
+  }
   if (standardRequest.thinking !== undefined) {
     body.thinking = standardRequest.thinking;
-  }
-  if (standardRequest.output_config !== undefined) {
-    body.output_config = standardRequest.output_config;
   }
 }
 

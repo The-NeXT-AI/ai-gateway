@@ -33,7 +33,7 @@ docker compose up --build
 
 ## Features
 
-- OpenAI `chat/completions`, `responses`, `embeddings`, `moderations`, and `images/generations`
+- OpenAI `chat/completions`, `responses`, `embeddings`, `moderations`, `images/generations`, `images/edits`, `videos/generations`, and `videos/:id`
 - Anthropic `messages`
 - Gemini `generateContent` / `streamGenerateContent`
 - Cross-protocol conversion, provider fallback, provider plugins, health checks, metrics, idempotency, concurrency isolation, circuit breaking, and retries

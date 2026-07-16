@@ -961,7 +961,8 @@ describe('openai image generations gateway route', () => {
     const config = createConfig([
       createProviderConfig('openai-image', ['gpt-image-1'], {
         apikey: 'provider-key',
-        baseurl: 'https://images.example/v1'
+        baseurl: 'https://images.example/v1',
+        type: 'openai_image_generations'
       })
     ]);
     config.defaultOpenAIModel = 'not-an-image-model';
@@ -1031,6 +1032,134 @@ describe('openai image generations gateway route', () => {
         stage: 'gateway_policy',
         status: 403
       });
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe('openai media gateway routes', () => {
+  afterEach(async () => {
+    resetGatewayPrecheckStateForTests();
+    resetProviderCircuitBreakerForTests();
+    resetProviderConcurrencyForTests();
+    await closeBillingPublisher();
+    vi.restoreAllMocks();
+  });
+
+  it('routes JSON and multipart image edits without changing multipart bytes', async () => {
+    const upstreamBodies: Array<RequestInit['body']> = [];
+    const fetchMock = vi.fn(async (url: string, init: RequestInit) => {
+      expect(url).toBe('https://images.example/v1/images/edits');
+      expect(init.headers).toMatchObject({ authorization: 'Bearer provider-key' });
+      upstreamBodies.push(init.body);
+      return jsonResponse({ data: [{ url: 'https://example.test/edited.png' }] });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig([
+      createProviderConfig('openai-image', ['gpt-image-1'], {
+        apikey: 'provider-key',
+        baseurl: 'https://images.example/v1'
+      })
+    ]);
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const jsonResponseResult = await app.inject({
+        method: 'POST',
+        url: '/v1/images/edits',
+        headers: { 'content-type': 'application/json' },
+        payload: {
+          model: 'openai-image/gpt-image-1',
+          prompt: 'Add a blue frame',
+          image: { url: 'data:image/png;base64,abc123' }
+        }
+      });
+      expect(jsonResponseResult.statusCode).toBe(200);
+      expect(JSON.parse(String(upstreamBodies[0]))).toMatchObject({
+        model: 'gpt-image-1',
+        prompt: 'Add a blue frame'
+      });
+
+      const boundary = 'gateway-media-test-boundary';
+      const multipartPayload = Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="prompt"\r\n\r\nAdd a red frame\r\n--${boundary}--\r\n`
+      );
+      const multipartResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/images/edits',
+        headers: {
+          'content-type': `multipart/form-data; boundary=${boundary}`,
+          'x-target-model': 'openai-image/gpt-image-1'
+        },
+        payload: multipartPayload
+      });
+      expect(multipartResponse.statusCode).toBe(200);
+      expect(Buffer.from(upstreamBodies[1] as ArrayBuffer)).toEqual(multipartPayload);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('routes video generation and stateless status requests to the selected provider', async () => {
+    const fetchMock = vi.fn(async (url: string, init: RequestInit) => {
+      if (url.endsWith('/videos/generations')) {
+        expect(init.method).toBe('POST');
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          model: 'grok-imagine-video',
+          prompt: 'A paper boat sailing'
+        });
+        return jsonResponse({ request_id: 'video-request-1', status: 'pending' });
+      }
+      expect(url).toBe('https://videos.example/v1/videos/video-request-1');
+      expect(init.method).toBe('GET');
+      expect(init.body).toBeUndefined();
+      return jsonResponse({
+        id: 'video-request-1',
+        status: 'completed',
+        video: { url: 'https://example.test/video.mp4' }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig([
+      createProviderConfig('openai-video', ['grok-imagine-video'], {
+        apikey: 'provider-key',
+        baseurl: 'https://videos.example/v1',
+        type: 'openai_video_generations'
+      })
+    ]);
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const startResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/videos/generations',
+        headers: { 'content-type': 'application/json' },
+        payload: {
+          model: 'openai-video/grok-imagine-video',
+          prompt: 'A paper boat sailing'
+        }
+      });
+      expect(startResponse.statusCode).toBe(200);
+      expect(startResponse.headers['x-gateway-target-provider-name']).toBe('openai-video');
+
+      const statusResponse = await app.inject({
+        method: 'GET',
+        url: '/v1/videos/video-request-1',
+        headers: { 'x-target-provider': 'openai-video' }
+      });
+      expect(statusResponse.statusCode).toBe(200);
+      expect(JSON.parse(statusResponse.body)).toMatchObject({
+        id: 'video-request-1',
+        status: 'completed'
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     } finally {
       await app.close();
     }
@@ -1249,11 +1378,12 @@ function createProviderConfig(
   options: {
     apikey?: string;
     baseurl?: string;
+    type?: ProviderConfig['type'];
   } = {}
 ): ProviderConfig {
   return {
     name,
-    type: 'openai_responses',
+    type: options.type ?? 'openai_responses',
     apikey: options.apikey,
     baseurl: options.baseurl,
     models,

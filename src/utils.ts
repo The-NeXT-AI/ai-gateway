@@ -48,7 +48,12 @@ export function parseProviderList(value: string | undefined): Provider[] {
 }
 
 export function providerFromProviderType(type: ProviderType): Provider {
-  if (type === 'openai_chat_completions' || type === 'openai_responses') {
+  if (
+    type === 'openai_chat_completions' ||
+    type === 'openai_responses' ||
+    type === 'openai_image_generations' ||
+    type === 'openai_video_generations'
+  ) {
     return 'openai';
   }
 

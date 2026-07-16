@@ -1,4 +1,4 @@
-import type { FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { randomUUID } from 'node:crypto';
 import { buildBillingHeaders, calculateUsageBilling, publishBillingEvent } from '../billing';
 import { buildOpenAIHeaders } from '../adapters/builtins/common';
@@ -104,6 +104,9 @@ interface OpenAIJsonEndpointConfig {
   modelRequired: boolean;
   useDefaultOpenAIModel: boolean;
   billingUsageOptional: boolean;
+  bodyMode?: 'json' | 'json-or-multipart' | 'none';
+  method?: 'GET' | 'POST';
+  precheck?: boolean;
 }
 
 const embeddingsEndpoint: OpenAIJsonEndpointConfig = {
@@ -134,6 +137,40 @@ const imageGenerationsEndpoint: OpenAIJsonEndpointConfig = {
   modelRequired: false,
   useDefaultOpenAIModel: false,
   billingUsageOptional: true
+};
+
+const imageEditsEndpoint: OpenAIJsonEndpointConfig = {
+  endpointPath: 'images/edits',
+  sourceAdapterKey: 'openai_image_generations',
+  displayName: 'Image edits',
+  inputField: 'prompt',
+  modelRequired: false,
+  useDefaultOpenAIModel: false,
+  billingUsageOptional: true,
+  bodyMode: 'json-or-multipart'
+};
+
+const videoGenerationsEndpoint: OpenAIJsonEndpointConfig = {
+  endpointPath: 'videos/generations',
+  sourceAdapterKey: 'openai_video_generations',
+  displayName: 'Video generations',
+  inputField: 'prompt',
+  modelRequired: false,
+  useDefaultOpenAIModel: false,
+  billingUsageOptional: true
+};
+
+const videoStatusEndpoint: OpenAIJsonEndpointConfig = {
+  endpointPath: 'videos',
+  sourceAdapterKey: 'openai_video_generations',
+  displayName: 'Video status',
+  inputField: 'id',
+  modelRequired: false,
+  useDefaultOpenAIModel: false,
+  billingUsageOptional: true,
+  bodyMode: 'none',
+  method: 'GET',
+  precheck: false
 };
 
 const hopByHopResponseHeaders = new Set([
@@ -177,6 +214,61 @@ export async function handleOpenAIImageGenerationsRequest(
   return handleOpenAIJsonRequest(request, reply, config, runtime, imageGenerationsEndpoint);
 }
 
+export async function handleOpenAIImageEditsRequest(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  config: GatewayConfig,
+  runtime: GatewayRuntime
+) {
+  return handleOpenAIJsonRequest(request, reply, config, runtime, imageEditsEndpoint);
+}
+
+export async function handleOpenAIVideoGenerationRequest(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  config: GatewayConfig,
+  runtime: GatewayRuntime
+) {
+  return handleOpenAIJsonRequest(request, reply, config, runtime, videoGenerationsEndpoint);
+}
+
+export async function handleOpenAIVideoStatusRequest(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  config: GatewayConfig,
+  runtime: GatewayRuntime,
+  requestId: string
+) {
+  const normalizedRequestId = requestId.trim();
+  if (!normalizedRequestId) {
+    return sendBadRequest(reply, 'Video request id is required.');
+  }
+  return handleOpenAIJsonRequest(
+    request,
+    reply,
+    config,
+    runtime,
+    {
+      ...videoStatusEndpoint,
+      endpointPath: `videos/${encodeURIComponent(normalizedRequestId)}`
+    }
+  );
+}
+
+export function registerOpenAIMediaBodyParsers(
+  fastify: FastifyInstance,
+  bodyLimitBytes: number
+): void {
+  if (fastify.hasContentTypeParser('multipart/form-data')) {
+    return;
+  }
+  fastify.addContentTypeParser(
+    'multipart/form-data',
+    { parseAs: 'buffer', bodyLimit: bodyLimitBytes },
+    (_request, body, done) => done(null, body)
+  );
+}
+
 async function handleOpenAIJsonRequest(
   request: FastifyRequest,
   reply: FastifyReply,
@@ -186,11 +278,17 @@ async function handleOpenAIJsonRequest(
 ) {
   const clientAbortSignal = createClientDisconnectSignal(request, reply);
   const body = request.body;
-  if (!isObject(body)) {
+  const bodyMode = endpoint.bodyMode ?? 'json';
+  const jsonBody = isObject(body) ? body : undefined;
+  const multipartBody = Buffer.isBuffer(body) ? body : undefined;
+  if (bodyMode === 'json' && !jsonBody) {
     return sendBadRequest(reply, 'Request body must be a JSON object.');
   }
+  if (bodyMode === 'json-or-multipart' && !jsonBody && !multipartBody) {
+    return sendBadRequest(reply, 'Request body must be JSON or multipart/form-data.');
+  }
 
-  const requestedModel = readHeader(request.headers['x-target-model']) || readBodyModel(body);
+  const requestedModel = readHeader(request.headers['x-target-model']) || readBodyModel(jsonBody);
   const targetProvidersResult = resolveTargetProviders(request, config, requestedModel);
   if (!targetProvidersResult.ok) {
     return sendBadRequest(reply, targetProvidersResult.error);
@@ -218,7 +316,7 @@ async function handleOpenAIJsonRequest(
       continue;
     }
 
-    const modelResult = resolveTargetModel(request, target, readBodyModel(body), config, endpoint);
+    const modelResult = resolveTargetModel(request, target, readBodyModel(jsonBody), config, endpoint);
     if (!modelResult.ok) {
       attempts.push({
         provider: targetProvider,
@@ -265,8 +363,8 @@ async function handleOpenAIJsonRequest(
       continue;
     }
 
-    const standardRequest = buildOpenAIJsonPrecheckStandardRequest(endpoint, model, body);
-    if (!precheckApplied) {
+    const standardRequest = buildOpenAIJsonPrecheckStandardRequest(endpoint, model, jsonBody ?? {});
+    if (endpoint.precheck !== false && !precheckApplied) {
       const precheckResult = await evaluateGatewayPrecheck({
         request,
         config,
@@ -274,7 +372,7 @@ async function handleOpenAIJsonRequest(
         targetProviderConfig,
         model,
         standardRequest,
-        requestBody: body
+        requestBody: jsonBody ?? {}
       });
       if (!precheckResult.ok) {
         return reply.code(precheckResult.statusCode).send({
@@ -294,7 +392,7 @@ async function handleOpenAIJsonRequest(
       config,
       target,
       model,
-      body
+      bodyMode === 'none' ? undefined : multipartBody ?? jsonBody ?? {}
     );
     if (!upstreamRequestResult.ok) {
       attempts.push({
@@ -434,7 +532,7 @@ function buildOpenAIJsonUpstreamRequest(
   config: GatewayConfig,
   target: TargetProviderRoute,
   model: string | undefined,
-  body: Record<string, unknown>
+  body: unknown
 ): { ok: true; value: UpstreamRequest } | { ok: false; error: string } {
   const providerConfig = resolveProviderConfig(config, target);
   const headersResult = buildOpenAIHeaders(request.headers, {
@@ -448,7 +546,7 @@ function buildOpenAIJsonUpstreamRequest(
   const extraHeaders = resolveScopedHeaders(providerConfig, model);
   const extraBody = resolveScopedBody(providerConfig, model);
   let url = `${trimRightSlash(config.openaiBaseUrl)}/${endpoint.endpointPath}`;
-  let headers = {
+  let headers: Record<string, string> = {
     ...headersResult.value,
     ...extraHeaders
   };
@@ -462,16 +560,40 @@ function buildOpenAIJsonUpstreamRequest(
     };
   }
 
+  const isMultipart = Buffer.isBuffer(body);
+  if (isMultipart) {
+    const contentType = readHeader(request.headers['content-type']);
+    if (!contentType?.toLowerCase().startsWith('multipart/form-data')) {
+      return { ok: false, error: 'Multipart image edits require a multipart/form-data content type.' };
+    }
+    headers['content-type'] = contentType;
+  }
+  if ((endpoint.bodyMode ?? 'json') === 'none') {
+    delete headers['content-type'];
+  }
+
+  const jsonBody = isObject(body) ? body : undefined;
+
   return {
     ok: true,
     value: {
+      method: endpoint.method ?? 'POST',
       url,
       headers,
-      body: {
-        ...body,
-        ...extraBody,
-        ...(model ? { model } : {})
-      }
+      body: isMultipart
+        ? body
+        : (endpoint.bodyMode ?? 'json') === 'none'
+          ? undefined
+          : {
+              ...(jsonBody ?? {}),
+              ...extraBody,
+              ...(model ? { model } : {})
+            },
+      bodyEncoding: isMultipart
+        ? 'bytes'
+        : (endpoint.bodyMode ?? 'json') === 'none'
+          ? 'none'
+          : 'json'
     }
   };
 }
@@ -1396,8 +1518,8 @@ function resolveProviderBillingRate(
   return (model ? providerConfig?.billing.byModel[model] : undefined) || providerConfig?.billing.default;
 }
 
-function readBodyModel(body: Record<string, unknown>): string | undefined {
-  return typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined;
+function readBodyModel(body: Record<string, unknown> | undefined): string | undefined {
+  return typeof body?.model === 'string' && body.model.trim() ? body.model.trim() : undefined;
 }
 
 function formatTargetProviderLabel(route: TargetProviderRoute): string {

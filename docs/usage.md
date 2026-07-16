@@ -8,7 +8,7 @@
 - OpenAI `POST /v1/responses`
 - OpenAI `POST /v1/embeddings`
 - OpenAI `POST /v1/moderations`
-- OpenAI `POST /v1/images/generations`
+- OpenAI `POST /v1/images/generations`、`POST /v1/images/edits`、`POST /v1/videos/generations`、`GET /v1/videos/:id`
 - Anthropic Claude `POST /v1/messages`
 - Google Gemini `POST /v1beta/models/{model}:generateContent`（同时支持 `/v1/models/*`）
 
@@ -151,7 +151,7 @@ runtime.providerPlugins.register(openAIMainPlugin);
 - 多供应商管理：支持 `x-target-providers`（逗号分隔）定义目标供应商优先级链路。
 - 支持按供应商名称路由：`x-target-provider` / `x-target-providers` 可使用 provider `type` 或 `name`（如 `openai-main`）。
 - 支持模型内联路由：`x-target-model` 或请求体 `model` 可写成 `providerName/modelName`（如 `openai-main/GPT-5.3`）。
-- 支持 OpenAI 兼容 JSON 端点透传：`/v1/embeddings`、`/v1/moderations`、`/v1/images/generations` 复用命名 provider、fallback、插件、precheck、policy、health 与用量计费。
+- 支持 OpenAI 兼容媒体端点透传：`/v1/images/generations`、`/v1/images/edits`、`/v1/videos/generations`、`/v1/videos/:id` 复用命名 provider、fallback、插件、precheck、policy、health 与用量计费；图片编辑同时支持 JSON 和原始 multipart 转发。
 - 请求失败自动 fallback：按供应商顺序逐个尝试，直到成功或全部失败。
 - 主动健康检查：manager API 可触发 provider 探测，也可通过 `providerHealthCheck.enabled=true` 启用定时探测并更新运行态 health，用于 health-aware routing。
 - 运行指标导出：可通过 `metrics.enabled=true` 开启 `GET /metrics`，输出 Prometheus 文本格式的请求计数、耗时与 provider health 指标。
@@ -543,6 +543,9 @@ docker compose up --build
 - `POST /v1/embeddings`
 - `POST /v1/moderations`
 - `POST /v1/images/generations`
+- `POST /v1/images/edits`
+- `POST /v1/videos/generations`
+- `GET /v1/videos/:id`
 - `WS /v1/responses`
 - `WS /v1/responses` 支持将 `chat/completions`、`messages`、`gemini generateContent/streamGenerateContent` 请求体自动转换为 Codex `response.create`；可通过 `?source_adapter=` 显式指定（如 `openai_chat`、`anthropic_messages`、`gemini_generate`、`gemini_stream`）。
 - `POST /v1/messages`

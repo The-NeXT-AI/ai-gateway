@@ -3,7 +3,14 @@ import type { GatewayConfig, ProviderConfig, VirtualModelProfileConfig } from '.
 import { providerFromProviderType, readHeader } from '../utils';
 import { createGatewayAuthPreHandler } from './auth';
 import { handleOpenAIEmbeddingsRequest } from './embeddings';
-import { handleOpenAIImageGenerationsRequest, handleOpenAIModerationsRequest } from './openai-json';
+import {
+  handleOpenAIImageEditsRequest,
+  handleOpenAIImageGenerationsRequest,
+  handleOpenAIModerationsRequest,
+  handleOpenAIVideoGenerationRequest,
+  handleOpenAIVideoStatusRequest,
+  registerOpenAIMediaBodyParsers
+} from './openai-json';
 import { handleGatewayRequest, parseGeminiTail } from './handler';
 import { createGatewayIdempotencyPreHandler } from './idempotency';
 import type { GatewayRuntime } from './runtime';
@@ -47,6 +54,7 @@ export function registerGatewayRoutes(
   const gatewayAuthPreHandler = createGatewayAuthPreHandler(config.auth);
   const gatewayIdempotencyPreHandler = createGatewayIdempotencyPreHandler(config);
   const gatewayWritePreHandlers = [gatewayAuthPreHandler, gatewayIdempotencyPreHandler];
+  registerOpenAIMediaBodyParsers(fastify, config.bodyLimitBytes);
 
   fastify.get<{ Querystring: ModelListQuery }>(
     '/v1/models',
@@ -114,6 +122,22 @@ export function registerGatewayRoutes(
   fastify.post('/v1/images/generations', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
     return handleOpenAIImageGenerationsRequest(request, reply, config, runtime);
   });
+
+  fastify.post('/v1/images/edits', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+    return handleOpenAIImageEditsRequest(request, reply, config, runtime);
+  });
+
+  fastify.post('/v1/videos/generations', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+    return handleOpenAIVideoGenerationRequest(request, reply, config, runtime);
+  });
+
+  fastify.get<{ Params: { id: string } }>(
+    '/v1/videos/:id',
+    { preHandler: gatewayAuthPreHandler },
+    async (request, reply) => {
+      return handleOpenAIVideoStatusRequest(request, reply, config, runtime, request.params.id);
+    }
+  );
 
   fastify.post('/v1/messages', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
     return handleGatewayRequest(

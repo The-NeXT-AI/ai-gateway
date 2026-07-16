@@ -5,6 +5,8 @@ export type Provider = BuiltinProvider | (string & {});
 export type BuiltinProviderType =
   | 'openai_responses'
   | 'openai_chat_completions'
+  | 'openai_image_generations'
+  | 'openai_video_generations'
   | 'anthropic_messages'
   | 'gemini_generate_content'
   | 'gemini_interactions';

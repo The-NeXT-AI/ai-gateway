@@ -25,6 +25,22 @@ import {
   splitNamespacedToolCallName
 } from './tools';
 
+const openAIResponsesReasoningEffortOrder = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max'
+] as const;
+
+type OpenAIResponsesReasoningEffort = (typeof openAIResponsesReasoningEffortOrder)[number];
+
+const defaultOpenAIResponsesReasoningEfforts = new Set<OpenAIResponsesReasoningEffort>(
+  openAIResponsesReasoningEffortOrder.filter((effort) => effort !== 'max')
+);
+
 export const openAIResponsesTargetAdapter: TargetAdapter = {
   provider: 'openai',
   providerTypes: ['openai_responses', 'openai_chat_completions'],
@@ -90,7 +106,10 @@ export const openAIResponsesTargetAdapter: TargetAdapter = {
       });
     }
 
-    const body = buildOpenAIResponsesBodyFromStandardRequest(input.standardRequest);
+    const body = buildOpenAIResponsesBodyFromStandardRequest(
+      input.standardRequest,
+      input.targetProviderConfig
+    );
 
     return ok({
       url: `${input.config.openaiBaseUrl}/responses`,
@@ -104,7 +123,8 @@ export const openAIResponsesTargetAdapter: TargetAdapter = {
 };
 
 export function buildOpenAIResponsesBodyFromStandardRequest(
-  standardRequest: StandardRequest
+  standardRequest: StandardRequest,
+  targetProviderConfig?: ProviderConfig
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
     model: standardRequest.model,
@@ -133,7 +153,7 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
     body.stream = true;
   }
 
-  applyOpenAIResponsesReasoningOptions(body, standardRequest);
+  applyOpenAIResponsesReasoningOptions(body, standardRequest, targetProviderConfig);
 
   return body;
 }
@@ -146,16 +166,111 @@ function resolveOpenAITargetProtocol(providerConfig: ProviderConfig | undefined)
   return 'openai_responses';
 }
 
-function applyOpenAIResponsesReasoningOptions(body: Record<string, unknown>, standardRequest: StandardRequest): void {
+function applyOpenAIResponsesReasoningOptions(
+  body: Record<string, unknown>,
+  standardRequest: StandardRequest,
+  targetProviderConfig?: ProviderConfig
+): void {
   if (standardRequest.reasoning !== undefined) {
-    body.reasoning = standardRequest.reasoning;
+    if (!isObject(standardRequest.reasoning) || Array.isArray(standardRequest.reasoning)) {
+      body.reasoning = standardRequest.reasoning;
+      return;
+    }
+
+    const effort = asString(standardRequest.reasoning.effort)?.trim();
+    const translatedEffort = openAIResponsesReasoningEffort(
+      standardRequest.output_config,
+      standardRequest.model,
+      targetProviderConfig
+    );
+    body.reasoning =
+      effort || !translatedEffort
+        ? standardRequest.reasoning
+        : {
+            ...standardRequest.reasoning,
+            effort: translatedEffort
+          };
+    return;
   }
-  if (standardRequest.thinking !== undefined) {
-    body.thinking = standardRequest.thinking;
+
+  const effort = openAIResponsesReasoningEffort(
+    standardRequest.output_config,
+    standardRequest.model,
+    targetProviderConfig
+  );
+  if (effort) {
+    body.reasoning = { effort };
   }
-  if (standardRequest.output_config !== undefined) {
-    body.output_config = standardRequest.output_config;
+}
+
+function openAIResponsesReasoningEffort(
+  outputConfig: unknown,
+  model: string | undefined,
+  targetProviderConfig: ProviderConfig | undefined
+): OpenAIResponsesReasoningEffort | undefined {
+  const requestedEffort = readOpenAIResponsesReasoningEffort(outputConfig);
+  if (!requestedEffort) {
+    return undefined;
   }
+
+  const supportedEfforts = providerModelReasoningEfforts(targetProviderConfig, model);
+  if (supportedEfforts.has(requestedEffort)) {
+    return requestedEffort;
+  }
+
+  const requestedIndex = openAIResponsesReasoningEffortOrder.indexOf(requestedEffort);
+  for (let index = requestedIndex - 1; index >= 0; index -= 1) {
+    const effort = openAIResponsesReasoningEffortOrder[index];
+    if (supportedEfforts.has(effort)) {
+      return effort;
+    }
+  }
+
+  for (let index = requestedIndex + 1; index < openAIResponsesReasoningEffortOrder.length; index += 1) {
+    const effort = openAIResponsesReasoningEffortOrder[index];
+    if (supportedEfforts.has(effort)) {
+      return effort;
+    }
+  }
+
+  return undefined;
+}
+
+function providerModelReasoningEfforts(
+  targetProviderConfig: ProviderConfig | undefined,
+  model: string | undefined
+): ReadonlySet<OpenAIResponsesReasoningEffort> {
+  const normalizedModel = model?.trim().toLowerCase();
+  if (!normalizedModel || !targetProviderConfig?.modelMetadata) {
+    return defaultOpenAIResponsesReasoningEfforts;
+  }
+
+  const matchingMetadata = Object.entries(targetProviderConfig.modelMetadata).find(
+    ([configuredModel]) => configuredModel.trim().toLowerCase() === normalizedModel
+  )?.[1];
+  if (matchingMetadata?.supportedReasoningLevels === undefined) {
+    return defaultOpenAIResponsesReasoningEfforts;
+  }
+
+  const supportedEfforts = new Set<OpenAIResponsesReasoningEffort>();
+  for (const level of matchingMetadata.supportedReasoningLevels) {
+    const effort = readOpenAIResponsesReasoningEffort(level);
+    if (effort) {
+      supportedEfforts.add(effort);
+    }
+  }
+  return supportedEfforts;
+}
+
+function readOpenAIResponsesReasoningEffort(
+  value: unknown
+): OpenAIResponsesReasoningEffort | undefined {
+  if (!isObject(value) || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const effort = asString(value.effort)?.trim().toLowerCase();
+  return openAIResponsesReasoningEffortOrder.find((candidate) => candidate === effort);
 }
 
 function standardInputToOpenAIChatMessages(

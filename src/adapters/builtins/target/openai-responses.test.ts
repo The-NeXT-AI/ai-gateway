@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { parseAnthropicMessagesRequest, parseOpenAIResponsesRequest } from '../source/parsers';
-import { openAIResponsesTargetAdapter } from './openai-responses';
+import {
+  buildOpenAIResponsesBodyFromStandardRequest,
+  openAIResponsesTargetAdapter
+} from './openai-responses';
 
 describe('openAIResponsesTargetAdapter', () => {
   it('preserves OpenAI server tool usage counters in standard responses', () => {
@@ -88,6 +91,175 @@ describe('openAIResponsesTargetAdapter', () => {
 
     expect(parsed.value.usage.cache_read_tokens).toBe(32);
     expect(parsed.value.usage.cache_write_tokens).toBe(16);
+  });
+
+  it('translates Anthropic output_config effort for OpenAI Responses targets', () => {
+    const body = buildAnthropicOpenAIResponsesBody(
+      {
+        model: 'gpt-reasoning',
+        max_tokens: 128,
+        thinking: {
+          type: 'enabled',
+          budget_tokens: 1024
+        },
+        output_config: {
+          effort: 'xhigh'
+        },
+        messages: [{ role: 'user', content: 'Think carefully' }]
+      },
+      {
+        name: 'openai-main',
+        type: 'openai_responses',
+        models: ['gpt-reasoning'],
+        modelMetadata: {
+          'GPT-REASONING': {
+            supportedReasoningLevels: [
+              { effort: 'low' },
+              { effort: 'high' },
+              { effort: 'xhigh' }
+            ]
+          }
+        }
+      }
+    );
+
+    expect(body.reasoning).toEqual({ effort: 'xhigh' });
+    expect(body.thinking).toBeUndefined();
+    expect(body.output_config).toBeUndefined();
+  });
+
+  it('keeps supported reasoning efforts and selects the closest supported fallback', () => {
+    const allLevelsProvider = {
+      modelMetadata: {
+        'gpt-all': {
+          supportedReasoningLevels: [
+            { effort: 'low' },
+            { effort: 'medium' },
+            { effort: 'high' },
+            { effort: 'xhigh' },
+            { effort: 'max' }
+          ]
+        }
+      }
+    } as never;
+
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+      const body = buildOpenAIResponsesBodyFromStandardRequest(
+        {
+          model: 'gpt-all',
+          input: 'hello',
+          output_config: { effort }
+        },
+        allLevelsProvider
+      );
+      expect(body.reasoning).toEqual({ effort });
+    }
+
+    const sparseProvider = {
+      modelMetadata: {
+        'GPT-SPARSE': {
+          supportedReasoningLevels: [{ effort: 'low' }, { effort: 'high' }]
+        }
+      }
+    } as never;
+
+    expect(
+      buildOpenAIResponsesBodyFromStandardRequest(
+        {
+          model: 'gpt-sparse',
+          input: 'hello',
+          output_config: { effort: 'xhigh' }
+        },
+        sparseProvider
+      ).reasoning
+    ).toEqual({ effort: 'high' });
+    expect(
+      buildOpenAIResponsesBodyFromStandardRequest(
+        {
+          model: 'gpt-sparse',
+          input: 'hello',
+          output_config: { effort: 'medium' }
+        },
+        sparseProvider
+      ).reasoning
+    ).toEqual({ effort: 'low' });
+    expect(
+      buildOpenAIResponsesBodyFromStandardRequest(
+        {
+          model: 'gpt-sparse',
+          input: 'hello',
+          output_config: { effort: 'minimal' }
+        },
+        sparseProvider
+      ).reasoning
+    ).toEqual({ effort: 'low' });
+  });
+
+  it('defaults OpenAI Responses reasoning support to xhigh and ignores unknown efforts', () => {
+    const maxBody = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'gpt-default',
+      input: 'hello',
+      output_config: { effort: 'max' }
+    });
+    expect(maxBody.reasoning).toEqual({ effort: 'xhigh' });
+    expect(maxBody.output_config).toBeUndefined();
+
+    const unknownBody = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'gpt-default',
+      input: 'hello',
+      output_config: { effort: 'extreme' }
+    });
+    expect(unknownBody.reasoning).toBeUndefined();
+    expect(unknownBody.output_config).toBeUndefined();
+  });
+
+  it('respects explicit Responses reasoning and can fill a missing effort', () => {
+    const explicitBody = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'gpt-default',
+      input: 'hello',
+      reasoning: {
+        effort: 'high',
+        summary: 'auto'
+      },
+      output_config: { effort: 'low' }
+    });
+    expect(explicitBody.reasoning).toEqual({
+      effort: 'high',
+      summary: 'auto'
+    });
+
+    const supplementedBody = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'gpt-default',
+      input: 'hello',
+      reasoning: {
+        summary: 'auto'
+      },
+      output_config: { effort: 'high' }
+    });
+    expect(supplementedBody.reasoning).toEqual({
+      effort: 'high',
+      summary: 'auto'
+    });
+  });
+
+  it('does not add reasoning when model metadata explicitly supports no effort levels', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest(
+      {
+        model: 'gpt-no-effort',
+        input: 'hello',
+        output_config: { effort: 'high' }
+      },
+      {
+        modelMetadata: {
+          'gpt-no-effort': {
+            supportedReasoningLevels: []
+          }
+        }
+      } as never
+    );
+
+    expect(body.reasoning).toBeUndefined();
+    expect(body.output_config).toBeUndefined();
   });
 
   it('converts anthropic tool_use/tool_result history into OpenAI chat tool messages', () => {
@@ -1721,6 +1893,36 @@ describe('openAIResponsesTargetAdapter', () => {
     ]);
   });
 });
+
+function buildAnthropicOpenAIResponsesBody(
+  requestBody: Record<string, unknown>,
+  targetProviderConfig: Record<string, unknown>
+): Record<string, unknown> {
+  const parsed = parseAnthropicMessagesRequest(requestBody);
+  expect(parsed.ok).toBe(true);
+  if (!parsed.ok) {
+    throw new Error(parsed.error);
+  }
+
+  const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+    request: {
+      headers: {}
+    } as never,
+    standardRequest: parsed.value,
+    config: {
+      openaiApiKey: 'sk-test',
+      openaiBaseUrl: 'https://mock.local/v1'
+    } as never,
+    targetProviderConfig: targetProviderConfig as never
+  });
+
+  expect(built.ok).toBe(true);
+  if (!built.ok) {
+    throw new Error(built.error);
+  }
+
+  return built.value.body as Record<string, unknown>;
+}
 
 function buildInterleavedThinkingOpenAIChatBody(
   targetProviderConfig: Record<string, unknown>

@@ -571,6 +571,56 @@ describe('Gateway config providerPlugins', () => {
     expect(config.providers[2]?.openaiChatThinkingOptions).toBe('disabled');
   });
 
+  it('parses per-model reasoning metadata for provider effort translation', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'openai-main',
+          type: 'openai_responses',
+          models: ['gpt-all', 'gpt-empty'],
+          modelMetadata: {
+            'GPT-ALL': {
+              supportedReasoningLevels: [
+                {
+                  effort: ' low ',
+                  description: ' Low reasoning '
+                },
+                'high',
+                {},
+                {
+                  effort: 42
+                }
+              ]
+            },
+            'gpt-empty': {
+              supportedReasoningLevels: []
+            },
+            'gpt-ignored': {
+              supportedReasoningLevels: ['max']
+            }
+          }
+        }
+      ]
+    });
+
+    expect(config.providers[0]?.modelMetadata).toEqual({
+      'GPT-ALL': {
+        supportedReasoningLevels: [
+          {
+            effort: 'low',
+            description: 'Low reasoning'
+          },
+          {
+            effort: 'high'
+          }
+        ]
+      },
+      'gpt-empty': {
+        supportedReasoningLevels: []
+      }
+    });
+  });
+
   it('parses gateway logging config from file and environment', () => {
     expect(parseGatewayConfigFromRaw({}).logging).toEqual({
       enabled: false,

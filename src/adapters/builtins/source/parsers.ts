@@ -629,7 +629,9 @@ function shouldCoalesceResponsesAssistantMessages(
 }
 
 function hasToolUseContent(content: StandardRequestInputContent[]): boolean {
-  return content.some((item) => item.type === 'tool_use');
+  return content.some(
+    (item) => item.type === 'tool_use' || item.type === 'tool_search_call'
+  );
 }
 
 function normalizeResponsesInputItem(item: unknown): StandardRequestInputMessage | null {
@@ -649,6 +651,24 @@ function normalizeResponsesInputItem(item: unknown): StandardRequestInputMessage
   }
   if (type === 'reasoning') {
     return null;
+  }
+
+  const toolSearchCallContent = normalizeOpenAIResponsesToolSearchCallItem(item);
+  if (toolSearchCallContent) {
+    return {
+      type: 'message',
+      role: 'assistant',
+      content: [toolSearchCallContent]
+    };
+  }
+
+  const toolSearchOutputContent = normalizeOpenAIResponsesToolSearchOutputItem(item);
+  if (toolSearchOutputContent) {
+    return {
+      type: 'message',
+      role: 'user',
+      content: [toolSearchOutputContent]
+    };
   }
 
   const functionCallContent = normalizeOpenAIResponsesFunctionCallItem(item);
@@ -727,6 +747,54 @@ function normalizeResponsesInputItem(item: unknown): StandardRequestInputMessage
     type: 'message',
     role: 'user',
     content: [{ type: 'input_text', text: serialized }]
+  };
+}
+
+function normalizeOpenAIResponsesToolSearchCallItem(
+  item: Record<string, unknown>
+): StandardRequestInputContent | null {
+  if (
+    asString(item.type) !== 'tool_search_call' ||
+    (item.execution !== undefined && item.execution !== 'client')
+  ) {
+    return null;
+  }
+
+  const callId = asString(item.call_id);
+  if (!callId) {
+    return null;
+  }
+
+  return {
+    type: 'tool_search_call',
+    execution: 'client',
+    call_id: callId,
+    status: asString(item.status),
+    arguments: normalizeFunctionArgumentsInput(item.arguments)
+  };
+}
+
+function normalizeOpenAIResponsesToolSearchOutputItem(
+  item: Record<string, unknown>
+): StandardRequestInputContent | null {
+  if (
+    asString(item.type) !== 'tool_search_output' ||
+    (item.execution !== undefined && item.execution !== 'client')
+  ) {
+    return null;
+  }
+
+  const callId = asString(item.call_id);
+  if (!callId || !Array.isArray(item.tools)) {
+    return null;
+  }
+
+  return {
+    type: 'tool_search_output',
+    execution: 'client',
+    call_id: callId,
+    status: asString(item.status),
+    tools: item.tools
   };
 }
 
@@ -1289,6 +1357,10 @@ function extractAnthropicMessageContent(
         tool_use_id: toolUseId,
         content: normalizeAnthropicToolResultContent(block.content)
       };
+      const toolReferences = extractAnthropicToolReferences(block.content);
+      if (toolReferences.length > 0) {
+        toolResult.tool_references = toolReferences;
+      }
       const isError = asBoolean(block.is_error);
       if (isError !== undefined) {
         toolResult.is_error = isError;
@@ -1374,13 +1446,20 @@ function normalizeAnthropicToolResultContent(content: unknown): string {
   }
 
   if (Array.isArray(content)) {
-    const text = content.map(extractTextFromPart).filter(Boolean).join('\n').trim();
+    const residualContent = content.filter(
+      (item) => !isObject(item) || asString(item.type) !== 'tool_reference'
+    );
+    const text = residualContent.map(extractTextFromPart).filter(Boolean).join('\n').trim();
     if (text) {
       return text;
     }
 
+    if (residualContent.length === 0) {
+      return '';
+    }
+
     try {
-      return JSON.stringify(content);
+      return JSON.stringify(residualContent);
     } catch {
       return '';
     }
@@ -1404,6 +1483,21 @@ function normalizeAnthropicToolResultContent(content: unknown): string {
   }
 
   return '';
+}
+
+function extractAnthropicToolReferences(content: unknown): string[] {
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  const names = content
+    .map((item) =>
+      isObject(item) && asString(item.type) === 'tool_reference'
+        ? asString(item.tool_name)
+        : undefined
+    )
+    .filter((name): name is string => Boolean(name));
+  return [...new Set(names)];
 }
 
 function extractGeminiSystemInstruction(systemInstruction: unknown): string | undefined {

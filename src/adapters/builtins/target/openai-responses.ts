@@ -198,24 +198,37 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
   targetProviderConfig?: ProviderConfig
 ): Record<string, unknown> {
   // The Responses API does not accept `stop`; Chat Completions handles it above.
+  const deferredToolSearch = buildDeferredToolSearchPlan(
+    standardRequest.input,
+    standardRequest.tools,
+    standardRequest.tool_choice
+  );
   const body: Record<string, unknown> = {
     model: standardRequest.model,
     instructions: standardRequest.instructions,
-    input: standardInputToOpenAIResponsesInput(standardRequest.input, standardRequest.tools),
+    input: standardInputToOpenAIResponsesInput(
+      standardRequest.input,
+      standardRequest.tools,
+      deferredToolSearch
+    ),
     temperature: standardRequest.temperature,
     top_p: standardRequest.top_p,
     max_output_tokens: standardRequest.max_output_tokens,
     text: standardRequest.text
   };
 
-  const tools = mapStandardToolsToOpenAIResponsesTools(standardRequest.tools);
+  const tools = mapStandardToolsToOpenAIResponsesTools(
+    standardRequest.tools,
+    deferredToolSearch
+  );
   if (tools) {
     body.tools = tools;
   }
 
   const toolChoice = mapStandardToolChoiceToOpenAIResponsesToolChoice(
     standardRequest.tool_choice,
-    standardRequest.tools
+    standardRequest.tools,
+    deferredToolSearch
   );
   if (toolChoice !== undefined) {
     body.tool_choice = toolChoice;
@@ -449,7 +462,8 @@ function standardInputToOpenAIChatMessages(
 
 function standardInputToOpenAIResponsesInput(
   input: string | StandardRequestInputMessage[],
-  tools?: unknown[]
+  tools?: unknown[],
+  deferredToolSearch?: DeferredToolSearchPlan
 ): string | Array<Record<string, unknown>> {
   if (typeof input === 'string') {
     return input;
@@ -502,7 +516,32 @@ function standardInputToOpenAIResponsesInput(
       }
 
       for (const item of message.content) {
+        if (item.type === 'tool_search_call') {
+          items.push({
+            type: 'tool_search_call',
+            execution: item.execution,
+            call_id: item.call_id,
+            ...(item.status ? { status: item.status } : {}),
+            arguments: item.arguments
+          });
+          continue;
+        }
         if (item.type !== 'tool_use') {
+          continue;
+        }
+
+        const discovery =
+          item.name === 'ToolSearch'
+            ? deferredToolSearch?.discoveries.get(item.id)
+            : undefined;
+        if (discovery) {
+          items.push({
+            type: 'tool_search_call',
+            execution: 'client',
+            call_id: item.id,
+            status: 'completed',
+            arguments: normalizeToolSearchArguments(item.input)
+          });
           continue;
         }
 
@@ -518,8 +557,43 @@ function standardInputToOpenAIResponsesInput(
       continue;
     }
 
+    for (const item of message.content) {
+      if (item.type !== 'tool_search_output') {
+        continue;
+      }
+      items.push({
+        type: 'tool_search_output',
+        execution: item.execution,
+        call_id: item.call_id,
+        ...(item.status ? { status: item.status } : {}),
+        tools: item.tools
+      });
+    }
+
     const toolResults = collectUserToolResults(message.content);
     for (const toolResult of toolResults) {
+      const discovery = deferredToolSearch?.discoveries.get(toolResult.tool_call_id);
+      if (discovery && deferredToolSearch) {
+        items.push({
+          type: 'tool_search_output',
+          execution: 'client',
+          call_id: toolResult.tool_call_id,
+          status: 'completed',
+          tools: discovery.toolNames
+            .map((name) => deferredToolSearch.deferredToolsByName.get(name))
+            .map((tool) => mapStandardToolToOpenAIResponsesTool(tool, true))
+            .filter((tool): tool is Record<string, unknown> => Boolean(tool))
+        });
+        if (toolResult.content) {
+          items.push({
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: toolResult.content }]
+          });
+        }
+        continue;
+      }
+
       if (toolResult.result_format === 'web_search') {
         items.push({
           type: 'web_search_call',
@@ -618,8 +692,20 @@ function collectAssistantReasoning(content: StandardRequestInputContent[]):
 
 function collectUserToolResults(
   content: StandardRequestInputContent[]
-): Array<{ tool_call_id: string; content: string; result_format?: 'function' | 'web_search' }> {
-  const toolResults: Array<{ tool_call_id: string; content: string; result_format?: 'function' | 'web_search' }> = [];
+): Array<{
+  tool_call_id: string;
+  content: string;
+  is_error?: boolean;
+  result_format?: 'function' | 'web_search';
+  tool_references?: string[];
+}> {
+  const toolResults: Array<{
+    tool_call_id: string;
+    content: string;
+    is_error?: boolean;
+    result_format?: 'function' | 'web_search';
+    tool_references?: string[];
+  }> = [];
   for (const item of content) {
     if (item.type !== 'tool_result') {
       continue;
@@ -628,7 +714,9 @@ function collectUserToolResults(
     toolResults.push({
       tool_call_id: item.tool_use_id,
       content: item.content,
-      result_format: item.result_format
+      is_error: item.is_error,
+      result_format: item.result_format,
+      tool_references: item.tool_references
     });
   }
 
@@ -645,6 +733,25 @@ function normalizeFunctionArguments(value: unknown): string {
   } catch {
     return '{}';
   }
+}
+
+function normalizeToolSearchArguments(value: unknown): Record<string, unknown> {
+  if (isObject(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (isObject(parsed)) {
+        return parsed;
+      }
+    } catch {
+      return {};
+    }
+  }
+
+  return {};
 }
 
 function formatWebSearchResultText(content: string): string {
@@ -706,20 +813,39 @@ function mapStandardToolsToOpenAIChatTools(
   return mapped.length > 0 ? mapped : undefined;
 }
 
-function mapStandardToolsToOpenAIResponsesTools(tools: unknown[] | undefined): Record<string, unknown>[] | undefined {
+function mapStandardToolsToOpenAIResponsesTools(
+  tools: unknown[] | undefined,
+  deferredToolSearch?: DeferredToolSearchPlan
+): Record<string, unknown>[] | undefined {
   if (!tools || tools.length === 0) {
     return undefined;
   }
 
+  const toolSearchPlan = deferredToolSearch;
   const mapped = tools
-    .map((tool) => mapStandardToolToOpenAIResponsesTool(tool))
+    .map((tool) => {
+      if (toolSearchPlan && toolSearchPlan.searchTool === tool) {
+        return mapStandardToolSearchToOpenAIResponsesTool(toolSearchPlan.searchTool);
+      }
+      if (toolSearchPlan && isObject(tool) && toolSearchPlan.deferredTools.has(tool)) {
+        return null;
+      }
+      return mapStandardToolToOpenAIResponsesTool(tool);
+    })
     .filter((tool): tool is Record<string, unknown> => Boolean(tool));
   return mapped.length > 0 ? mapped : undefined;
 }
 
-function mapStandardToolToOpenAIResponsesTool(tool: unknown): Record<string, unknown> | null {
+function mapStandardToolToOpenAIResponsesTool(
+  tool: unknown,
+  preserveDeferredLoading = false
+): Record<string, unknown> | null {
   if (!isObject(tool)) {
     return null;
+  }
+
+  if (asString(tool.type) === 'tool_search') {
+    return { ...tool };
   }
 
   if (isOpenAIWebSearchTool(tool)) {
@@ -755,8 +881,151 @@ function mapStandardToolToOpenAIResponsesTool(tool: unknown): Record<string, unk
   } else if (typeof functionPayload?.strict === 'boolean') {
     mapped.strict = functionPayload.strict;
   }
+  if (preserveDeferredLoading && tool.defer_loading === true) {
+    mapped.defer_loading = true;
+  }
 
   return mapped;
+}
+
+function mapStandardToolSearchToOpenAIResponsesTool(
+  tool: Record<string, unknown>
+): Record<string, unknown> {
+  const functionPayload = isObject(tool.function) ? tool.function : undefined;
+  const mapped: Record<string, unknown> = {
+    type: 'tool_search',
+    execution: 'client',
+    parameters: ensureJsonSchema(
+      tool.parameters ?? tool.input_schema ?? functionPayload?.parameters
+    )
+  };
+  const description = asString(tool.description) || asString(functionPayload?.description);
+  if (description) {
+    mapped.description = description;
+  }
+  return mapped;
+}
+
+interface DeferredToolSearchPlan {
+  searchTool: Record<string, unknown>;
+  deferredTools: Set<Record<string, unknown>>;
+  deferredToolsByName: Map<string, Record<string, unknown>>;
+  discoveries: Map<string, { toolNames: string[] }>;
+}
+
+function buildDeferredToolSearchPlan(
+  input: string | StandardRequestInputMessage[],
+  tools: unknown[] | undefined,
+  toolChoice: unknown
+): DeferredToolSearchPlan | undefined {
+  if (typeof input === 'string' || !tools) {
+    return undefined;
+  }
+
+  let searchTool: Record<string, unknown> | undefined;
+  const deferredTools = new Set<Record<string, unknown>>();
+  const deferredToolsByName = new Map<string, Record<string, unknown>>();
+  const discoverableToolNames = new Set<string>();
+  const seenToolNames = new Set<string>();
+  for (const tool of tools) {
+    if (!isObject(tool)) {
+      continue;
+    }
+
+    const functionPayload = isObject(tool.function) ? tool.function : undefined;
+    const name = asString(tool.name) || asString(functionPayload?.name);
+    const mappedTool = mapStandardToolToOpenAIResponsesTool(tool);
+    const isFunctionTool = asString(mappedTool?.type) === 'function';
+    if (name) {
+      if (seenToolNames.has(name)) {
+        return undefined;
+      }
+      seenToolNames.add(name);
+    }
+    if (name === 'ToolSearch') {
+      if (searchTool || !isFunctionTool) {
+        return undefined;
+      }
+      searchTool = tool;
+      continue;
+    }
+    if (name && tool.defer_loading === true) {
+      discoverableToolNames.add(name);
+      if (isFunctionTool) {
+        deferredTools.add(tool);
+        deferredToolsByName.set(name, tool);
+      }
+    }
+  }
+
+  if (!searchTool || discoverableToolNames.size === 0) {
+    return undefined;
+  }
+
+  const forcedToolName = readToolChoiceFunctionName(toolChoice);
+  if (
+    forcedToolName &&
+    forcedToolName !== 'ToolSearch' &&
+    discoverableToolNames.has(forcedToolName)
+  ) {
+    return undefined;
+  }
+
+  const callCounts = new Map<string, number>();
+  const searchCallCounts = new Map<string, number>();
+  const results = new Map<string, StandardRequestInputContent & { type: 'tool_result' }>();
+  const resultCounts = new Map<string, number>();
+  const callPositions = new Map<string, number>();
+  const resultPositions = new Map<string, number>();
+  let position = 0;
+  for (const message of collectStandardInputMessages(input)) {
+    for (const item of message.content) {
+      position += 1;
+      if (item.type === 'tool_use') {
+        callCounts.set(item.id, (callCounts.get(item.id) ?? 0) + 1);
+        callPositions.set(item.id, position);
+        if (item.name === 'ToolSearch') {
+          searchCallCounts.set(item.id, (searchCallCounts.get(item.id) ?? 0) + 1);
+        }
+      } else if (item.type === 'tool_result') {
+        results.set(item.tool_use_id, item);
+        resultCounts.set(
+          item.tool_use_id,
+          (resultCounts.get(item.tool_use_id) ?? 0) + 1
+        );
+        resultPositions.set(item.tool_use_id, position);
+      }
+    }
+  }
+
+  const discoveries = new Map<string, { toolNames: string[] }>();
+  for (const [callId, searchCallCount] of searchCallCounts) {
+    const result = results.get(callId);
+    if (
+      searchCallCount !== 1 ||
+      callCounts.get(callId) !== 1 ||
+      resultCounts.get(callId) !== 1 ||
+      !result ||
+      (callPositions.get(callId) ?? Number.POSITIVE_INFINITY) >=
+        (resultPositions.get(callId) ?? Number.NEGATIVE_INFINITY) ||
+      result.is_error === true
+    ) {
+      return undefined;
+    }
+
+    const toolNames = result.tool_references ?? [];
+    if (toolNames.some((name) => !discoverableToolNames.has(name))) {
+      return undefined;
+    }
+    discoveries.set(callId, { toolNames });
+  }
+
+  return {
+    searchTool,
+    deferredTools,
+    deferredToolsByName,
+    discoveries
+  };
 }
 
 function mapOpenAIWebSearchToolToOpenAIResponsesTool(
@@ -900,7 +1169,8 @@ function mapStandardToolChoiceToOpenAIChatToolChoice(
 
 function mapStandardToolChoiceToOpenAIResponsesToolChoice(
   toolChoice: unknown,
-  tools?: unknown[]
+  tools?: unknown[],
+  deferredToolSearch?: DeferredToolSearchPlan
 ): unknown {
   if (toolChoice === undefined) {
     return undefined;
@@ -924,6 +1194,15 @@ function mapStandardToolChoiceToOpenAIResponsesToolChoice(
   }
 
   const rawName = readToolChoiceFunctionName(toolChoice);
+  if (deferredToolSearch && rawName === 'ToolSearch') {
+    return { type: 'tool_search' };
+  }
+  const hostedToolChoice = rawName
+    ? mapForcedHostedToolChoiceToOpenAIResponses(rawName, tools)
+    : undefined;
+  if (hostedToolChoice) {
+    return hostedToolChoice;
+  }
   const splitName = rawName ? splitNamespacedToolCallName(rawName, tools) : undefined;
   const name = splitName?.name;
   if (name) {
@@ -935,4 +1214,42 @@ function mapStandardToolChoiceToOpenAIResponsesToolChoice(
   }
 
   return toolChoice;
+}
+
+function mapForcedHostedToolChoiceToOpenAIResponses(
+  name: string,
+  tools: unknown[] | undefined
+): Record<string, unknown> | undefined {
+  if (!tools) {
+    return undefined;
+  }
+
+  for (const tool of tools) {
+    if (!isObject(tool)) {
+      continue;
+    }
+
+    const functionPayload = isObject(tool.function) ? tool.function : undefined;
+    const toolName = asString(tool.name) || asString(functionPayload?.name);
+    if (
+      toolName !== name ||
+      (!isOpenAIWebSearchTool(tool) && !isAnthropicWebSearchTool(tool))
+    ) {
+      continue;
+    }
+
+    const mappedTool = mapStandardToolToOpenAIResponsesTool(tool);
+    const type = asString(mappedTool?.type);
+    if (!type) {
+      return undefined;
+    }
+
+    return {
+      type: 'allowed_tools',
+      mode: 'required',
+      tools: [{ type }]
+    };
+  }
+
+  return undefined;
 }

@@ -1050,6 +1050,14 @@ function countContentCharacters(item: StandardRequestInputContent): number {
     );
   }
 
+  if (item.type === 'tool_search_call') {
+    return 'ToolSearch'.length + countUnknownCharacters(item.arguments);
+  }
+
+  if (item.type === 'tool_search_output') {
+    return countUnknownCharacters(item.tools);
+  }
+
   return item.name.length + countUnknownCharacters(item.input);
 }
 

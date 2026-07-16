@@ -229,6 +229,90 @@ describe('parseOpenAIResponsesRequest', () => {
       }
     ]);
   });
+
+  it('preserves tool search input when execution is omitted but rejects explicit server execution', () => {
+    const result = parseOpenAIResponsesRequest({
+      input: [
+        {
+          type: 'tool_search_call',
+          call_id: 'search_123',
+          status: 'completed',
+          arguments: { query: 'calendar' }
+        },
+        {
+          type: 'tool_search_output',
+          call_id: 'search_123',
+          status: 'completed',
+          tools: [
+            {
+              type: 'function',
+              name: 'calendar_create',
+              defer_loading: true,
+              parameters: { type: 'object', properties: {} }
+            }
+          ]
+        },
+        {
+          type: 'tool_search_call',
+          execution: 'server',
+          call_id: 'search_server',
+          status: 'completed',
+          arguments: { query: 'weather' }
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value.input).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool_search_call',
+            execution: 'client',
+            call_id: 'search_123',
+            status: 'completed',
+            arguments: { query: 'calendar' }
+          }
+        ]
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'tool_search_output',
+            execution: 'client',
+            call_id: 'search_123',
+            status: 'completed',
+            tools: [
+              {
+                type: 'function',
+                name: 'calendar_create',
+                defer_loading: true,
+                parameters: { type: 'object', properties: {} }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: '{"type":"tool_search_call","execution":"server","call_id":"search_server","status":"completed","arguments":{"query":"weather"}}'
+          }
+        ]
+      }
+    ]);
+  });
 });
 
 describe('parseAnthropicMessagesRequest', () => {
@@ -346,6 +430,54 @@ describe('parseAnthropicMessagesRequest', () => {
     expect(result.value.output_config).toEqual({
       effort: 'medium'
     });
+  });
+
+  it('preserves deferred tool references separately from residual result text', () => {
+    const result = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'toolu_search',
+              name: 'ToolSearch',
+              input: { query: 'calendar create' }
+            }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_search',
+              content: [
+                { type: 'text', text: 'matched one tool' },
+                { type: 'tool_reference', tool_name: 'calendar_create' },
+                { type: 'text', text: 'ready to call' }
+              ]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    expect(result.value.input[1]?.content).toEqual([
+      {
+        type: 'tool_result',
+        tool_use_id: 'toolu_search',
+        content: 'matched one tool\nready to call',
+        tool_references: ['calendar_create']
+      }
+    ]);
   });
 });
 

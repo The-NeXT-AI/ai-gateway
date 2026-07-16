@@ -195,17 +195,92 @@ describe('openAIResponsesTargetAdapter', () => {
     ).toEqual({ effort: 'low' });
   });
 
-  it('defaults OpenAI Responses reasoning support to xhigh and ignores unknown efforts', () => {
+  it('uses the built-in OpenAI model reasoning capability table', () => {
+    const cases = [
+      ['gpt-5.6', 'max', 'max'],
+      ['gpt-5.6-sol', 'max', 'max'],
+      ['gpt-5.6-terra', 'max', 'max'],
+      ['gpt-5.6-luna', 'max', 'max'],
+      ['gpt-5.5', 'max', 'xhigh'],
+      ['gpt-5.5-pro', 'low', 'medium'],
+      ['gpt-5.4', 'max', 'xhigh'],
+      ['gpt-5.4-mini', 'max', 'xhigh'],
+      ['gpt-5.4-nano', 'max', 'xhigh'],
+      ['gpt-5.4-pro', 'low', 'medium'],
+      ['gpt-5.3-codex', 'max', 'xhigh'],
+      ['gpt-5.3-codex-spark', 'none', 'low'],
+      ['gpt-5.2', 'max', 'xhigh'],
+      ['gpt-5.2-codex', 'none', 'low'],
+      ['gpt-5.1', 'max', 'high'],
+      ['gpt-5.1-codex-max', 'max', 'xhigh'],
+      ['gpt-5.1-codex', 'max', 'high'],
+      ['gpt-5.1-codex-mini', 'none', 'low'],
+      ['gpt-5', 'none', 'minimal'],
+      ['gpt-5-mini', 'none', 'minimal'],
+      ['gpt-5-nano', 'max', 'high'],
+      ['gpt-5-pro', 'low', 'high'],
+      ['gpt-5-codex', 'max', 'high'],
+      ['o3', 'minimal', 'low'],
+      ['o3-mini', 'max', 'high'],
+      ['o4-mini', 'none', 'low']
+    ] as const;
+
+    for (const [model, requestedEffort, expectedEffort] of cases) {
+      const body = buildOpenAIResponsesBodyFromStandardRequest({
+        model,
+        input: 'hello',
+        output_config: { effort: requestedEffort }
+      });
+      expect(body.reasoning, model).toEqual({ effort: expectedEffort });
+    }
+  });
+
+  it('matches dated model snapshots without matching longer model-name prefixes', () => {
+    const snapshotBody = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'gpt-5.4-pro-2026-03-05',
+      input: 'hello',
+      output_config: { effort: 'low' }
+    });
+    expect(snapshotBody.reasoning).toEqual({ effort: 'medium' });
+
+    const longerUnknownModelBody = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'gpt-5.4-proxy',
+      input: 'hello',
+      output_config: { effort: 'low' }
+    });
+    expect(longerUnknownModelBody.reasoning).toEqual({ effort: 'low' });
+  });
+
+  it('lets provider metadata override built-in OpenAI model capabilities', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest(
+      {
+        model: 'gpt-5.4',
+        input: 'hello',
+        output_config: { effort: 'xhigh' }
+      },
+      {
+        modelMetadata: {
+          'GPT-5.4': {
+            supportedReasoningLevels: [{ effort: 'low' }, { effort: 'high' }]
+          }
+        }
+      } as never
+    );
+
+    expect(body.reasoning).toEqual({ effort: 'high' });
+  });
+
+  it('passes valid efforts through for unknown models and ignores invalid efforts', () => {
     const maxBody = buildOpenAIResponsesBodyFromStandardRequest({
-      model: 'gpt-default',
+      model: 'future-reasoning-model',
       input: 'hello',
       output_config: { effort: 'max' }
     });
-    expect(maxBody.reasoning).toEqual({ effort: 'xhigh' });
+    expect(maxBody.reasoning).toEqual({ effort: 'max' });
     expect(maxBody.output_config).toBeUndefined();
 
     const unknownBody = buildOpenAIResponsesBodyFromStandardRequest({
-      model: 'gpt-default',
+      model: 'future-reasoning-model',
       input: 'hello',
       output_config: { effort: 'extreme' }
     });
@@ -215,29 +290,29 @@ describe('openAIResponsesTargetAdapter', () => {
 
   it('respects explicit Responses reasoning and can fill a missing effort', () => {
     const explicitBody = buildOpenAIResponsesBodyFromStandardRequest({
-      model: 'gpt-default',
+      model: 'gpt-5-pro',
       input: 'hello',
       reasoning: {
-        effort: 'high',
-        summary: 'auto'
-      },
-      output_config: { effort: 'low' }
-    });
-    expect(explicitBody.reasoning).toEqual({
-      effort: 'high',
-      summary: 'auto'
-    });
-
-    const supplementedBody = buildOpenAIResponsesBodyFromStandardRequest({
-      model: 'gpt-default',
-      input: 'hello',
-      reasoning: {
+        effort: 'low',
         summary: 'auto'
       },
       output_config: { effort: 'high' }
     });
+    expect(explicitBody.reasoning).toEqual({
+      effort: 'low',
+      summary: 'auto'
+    });
+
+    const supplementedBody = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'gpt-5.4-pro',
+      input: 'hello',
+      reasoning: {
+        summary: 'auto'
+      },
+      output_config: { effort: 'low' }
+    });
     expect(supplementedBody.reasoning).toEqual({
-      effort: 'high',
+      effort: 'medium',
       summary: 'auto'
     });
   });
@@ -245,13 +320,13 @@ describe('openAIResponsesTargetAdapter', () => {
   it('does not add reasoning when model metadata explicitly supports no effort levels', () => {
     const body = buildOpenAIResponsesBodyFromStandardRequest(
       {
-        model: 'gpt-no-effort',
+        model: 'gpt-5.4',
         input: 'hello',
         output_config: { effort: 'high' }
       },
       {
         modelMetadata: {
-          'gpt-no-effort': {
+          'gpt-5.4': {
             supportedReasoningLevels: []
           }
         }

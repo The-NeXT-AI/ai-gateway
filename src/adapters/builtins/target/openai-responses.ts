@@ -37,9 +37,80 @@ const openAIResponsesReasoningEffortOrder = [
 
 type OpenAIResponsesReasoningEffort = (typeof openAIResponsesReasoningEffortOrder)[number];
 
-const defaultOpenAIResponsesReasoningEfforts = new Set<OpenAIResponsesReasoningEffort>(
-  openAIResponsesReasoningEffortOrder.filter((effort) => effort !== 'max')
-);
+interface OpenAIModelReasoningCapability {
+  pattern: RegExp;
+  supportedEfforts: readonly OpenAIResponsesReasoningEffort[];
+}
+
+// Keep this table aligned with the effort values documented on OpenAI's model pages.
+// Unknown models intentionally pass valid effort values through instead of inheriting
+// capabilities from a different model family.
+const knownOpenAIModelReasoningCapabilities = [
+  {
+    pattern: /^gpt-5\.6(?:-(?:sol|terra|luna))?(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max']
+  },
+  {
+    pattern: /^gpt-5\.5-pro(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.5(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['none', 'low', 'medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.4-pro(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.4(?:-(?:mini|nano))?(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['none', 'low', 'medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.3-codex(?:-spark)?(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.2-codex(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.2(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['none', 'low', 'medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.1-codex-max(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.1-codex(?:-mini)?(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high']
+  },
+  {
+    pattern: /^gpt-5\.1(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['none', 'low', 'medium', 'high']
+  },
+  {
+    pattern: /^gpt-5-pro(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['high']
+  },
+  {
+    pattern: /^gpt-5-codex(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high']
+  },
+  {
+    pattern: /^gpt-5(?:-(?:mini|nano))?(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['minimal', 'low', 'medium', 'high']
+  },
+  {
+    pattern: /^o3(?:-mini)?(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high']
+  },
+  {
+    pattern: /^o4-mini(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high']
+  }
+] satisfies readonly OpenAIModelReasoningCapability[];
 
 export const openAIResponsesTargetAdapter: TargetAdapter = {
   provider: 'openai',
@@ -214,6 +285,10 @@ function openAIResponsesReasoningEffort(
   }
 
   const supportedEfforts = providerModelReasoningEfforts(targetProviderConfig, model);
+  if (!supportedEfforts) {
+    return requestedEffort;
+  }
+
   if (supportedEfforts.has(requestedEffort)) {
     return requestedEffort;
   }
@@ -239,27 +314,32 @@ function openAIResponsesReasoningEffort(
 function providerModelReasoningEfforts(
   targetProviderConfig: ProviderConfig | undefined,
   model: string | undefined
-): ReadonlySet<OpenAIResponsesReasoningEffort> {
+): ReadonlySet<OpenAIResponsesReasoningEffort> | undefined {
   const normalizedModel = model?.trim().toLowerCase();
-  if (!normalizedModel || !targetProviderConfig?.modelMetadata) {
-    return defaultOpenAIResponsesReasoningEfforts;
+  if (!normalizedModel) {
+    return undefined;
   }
 
-  const matchingMetadata = Object.entries(targetProviderConfig.modelMetadata).find(
-    ([configuredModel]) => configuredModel.trim().toLowerCase() === normalizedModel
-  )?.[1];
-  if (matchingMetadata?.supportedReasoningLevels === undefined) {
-    return defaultOpenAIResponsesReasoningEfforts;
-  }
-
-  const supportedEfforts = new Set<OpenAIResponsesReasoningEffort>();
-  for (const level of matchingMetadata.supportedReasoningLevels) {
-    const effort = readOpenAIResponsesReasoningEffort(level);
-    if (effort) {
-      supportedEfforts.add(effort);
+  if (targetProviderConfig?.modelMetadata) {
+    const matchingMetadata = Object.entries(targetProviderConfig.modelMetadata).find(
+      ([configuredModel]) => configuredModel.trim().toLowerCase() === normalizedModel
+    )?.[1];
+    if (matchingMetadata?.supportedReasoningLevels !== undefined) {
+      const supportedEfforts = new Set<OpenAIResponsesReasoningEffort>();
+      for (const level of matchingMetadata.supportedReasoningLevels) {
+        const effort = readOpenAIResponsesReasoningEffort(level);
+        if (effort) {
+          supportedEfforts.add(effort);
+        }
+      }
+      return supportedEfforts;
     }
   }
-  return supportedEfforts;
+
+  const knownCapability = knownOpenAIModelReasoningCapabilities.find(({ pattern }) =>
+    pattern.test(normalizedModel)
+  );
+  return knownCapability ? new Set(knownCapability.supportedEfforts) : undefined;
 }
 
 function readOpenAIResponsesReasoningEffort(

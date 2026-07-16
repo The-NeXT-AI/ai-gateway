@@ -44,7 +44,8 @@ export function parseOpenAIResponsesRequest(body: Record<string, unknown>): Resu
     reasoning_split: readReasoningSplitOption(body),
     reasoning: readReasoningOption(body),
     thinking: readOptionalRequestOption(body.thinking),
-    output_config: readOptionalRequestOption(body.output_config)
+    output_config: readOptionalRequestOption(body.output_config),
+    text: readOptionalRequestOption(body.text)
   });
 }
 

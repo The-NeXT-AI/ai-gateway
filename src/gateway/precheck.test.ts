@@ -275,6 +275,45 @@ describe('evaluateGatewayPrecheck', () => {
     }
   });
 
+  it('includes Responses text options in estimated token usage', async () => {
+    const config = createConfig({
+      enabled: true,
+      rateLimit: disabledRateLimit(),
+      quota: {
+        enabled: true,
+        windowMs: 60_000,
+        maxTokens: 20,
+        subject: 'global',
+        scope: 'model'
+      },
+      budget: disabledBudget(),
+      estimation: {
+        charsPerToken: 1,
+        defaultMaxOutputTokens: 0
+      }
+    });
+    const standardRequest = createStandardRequest('123456');
+    standardRequest.text = {
+      verbosity: 'low'
+    };
+
+    const result = await evaluateGatewayPrecheck({
+      request: createRequest(),
+      config,
+      targetProvider: 'openai',
+      model: 'gpt-test',
+      standardRequest
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe('quota_exceeded');
+      expect(result.details.scope).toBe('model:gpt-test');
+      expect(result.details.requested).toBe(33);
+      expect(result.details.estimated?.inputTokens).toBe(33);
+    }
+  });
+
   it('rejects requests whose estimated cost exceeds budget', async () => {
     const config = createConfig({
       enabled: true,

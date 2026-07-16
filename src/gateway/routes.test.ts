@@ -336,6 +336,137 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('encodes Anthropic assistant history as output_text on the second OpenAI Responses turn', async () => {
+    const upstreamBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const upstreamBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+      upstreamBodies.push(upstreamBody);
+      const turn = upstreamBodies.length;
+      const text = turn === 1 ? 'Hello from the first turn.' : 'Hello from the second turn.';
+
+      return new Response(
+        JSON.stringify({
+          id: `resp_anthropic_history_${turn}`,
+          object: 'response',
+          status: 'completed',
+          model: 'gpt-5.6-sol',
+          output_text: text,
+          output: [
+            {
+              id: `msg_anthropic_history_${turn}`,
+              type: 'message',
+              role: 'assistant',
+              status: 'completed',
+              content: [
+                {
+                  type: 'output_text',
+                  text,
+                  annotations: []
+                }
+              ]
+            }
+          ],
+          usage: {
+            input_tokens: 4,
+            output_tokens: 3,
+            total_tokens: 7
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6-sol'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    const sendTurn = (messages: Array<{ role: string; content: unknown }>) =>
+      app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'gpt-5.6-sol',
+          max_tokens: 128,
+          output_config: {
+            effort: 'xhigh'
+          },
+          messages
+        }
+      });
+
+    try {
+      const firstResponse = await sendTurn([{ role: 'user', content: 'First turn' }]);
+      expect(firstResponse.statusCode).toBe(200);
+      const firstBody = JSON.parse(firstResponse.body) as { content: unknown };
+      expect(firstBody.content).toEqual([
+        {
+          type: 'text',
+          text: 'Hello from the first turn.'
+        }
+      ]);
+
+      const secondResponse = await sendTurn([
+        {
+          role: 'user',
+          content: 'First turn'
+        },
+        {
+          role: 'assistant',
+          content: firstBody.content
+        },
+        {
+          role: 'user',
+          content: 'Second turn'
+        }
+      ]);
+
+      expect(secondResponse.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const [secondUpstreamUrl] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+      expect(secondUpstreamUrl).toBe('https://api.openai.com/v1/responses');
+      expect(upstreamBodies[1]).toMatchObject({
+        model: 'gpt-5.6-sol',
+        reasoning: {
+          effort: 'xhigh'
+        },
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'First turn' }]
+          },
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Hello from the first turn.' }]
+          },
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Second turn' }]
+          }
+        ]
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
   it('converts /v1/responses to chat/completions for openai_chat_completions targets', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(

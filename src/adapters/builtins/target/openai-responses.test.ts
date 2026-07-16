@@ -128,6 +128,47 @@ describe('openAIResponsesTargetAdapter', () => {
     expect(body.output_config).toBeUndefined();
   });
 
+  it('encodes assistant history as output_text for OpenAI Responses targets', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'gpt-5.6-sol',
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '你好' }]
+        },
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'input_text', text: '你好！很高兴见到你。' }]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'hello' }]
+        }
+      ]
+    });
+
+    expect(body.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: '你好' }]
+      },
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: '你好！很高兴见到你。' }]
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'hello' }]
+      }
+    ]);
+  });
+
   it('keeps supported reasoning efforts and selects the closest supported fallback', () => {
     const allLevelsProvider = {
       modelMetadata: {

@@ -7027,6 +7027,279 @@ export function createGatewayPlugin() {
     }
   });
 
+  it('reuses a standard-scope codex oauth token when required scope checks are disabled', async () => {
+    const accessToken = [
+      Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url'),
+      Buffer.from(
+        JSON.stringify({
+          exp: Math.floor(Date.now() / 1000) + 3_600,
+          scp: ['openid', 'profile', 'email', 'offline_access']
+        })
+      ).toString('base64url'),
+      ''
+    ].join('.');
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url) === 'https://auth.openai.com/oauth/token') {
+        return new Response(JSON.stringify({ error: 'unexpected refresh' }), { status: 500 });
+      }
+      const headers = (init?.headers || {}) as Record<string, string>;
+      return new Response(
+        JSON.stringify({
+          object: 'response',
+          output_text: 'scope-policy-ok',
+          authorization: headers.authorization
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_responses', ['glm-5'])],
+      [
+        {
+          key: 'openai-main-codex-oauth',
+          enabled: true,
+          providerName: 'openai-main',
+          codexOauth: {
+            enabled: true,
+            tokenEndpoint: 'https://auth.openai.com/oauth/token',
+            clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+            scope: 'openid profile email offline_access',
+            requiredScopes: [],
+            accessToken,
+            refreshToken: 'refresh-token',
+            refreshIfMissingAccessToken: true,
+            forceRefresh: false,
+            required: true,
+            timeoutMs: 3000,
+            authHeader: 'authorization',
+            authScheme: 'Bearer'
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      for (const input of ['first', 'second']) {
+        const response = await app.inject({
+          method: 'POST',
+          url: '/v1/responses',
+          headers: {
+            'content-type': 'application/json',
+            'x-target-provider': 'openai-main'
+          },
+          payload: {
+            model: 'glm-5',
+            input
+          }
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(JSON.parse(response.body)).toMatchObject({
+          output_text: 'scope-policy-ok',
+          authorization: `Bearer ${accessToken}`
+        });
+      }
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(
+        fetchMock.mock.calls.every(
+          ([url]) => String(url) === 'https://chatgpt.com/backend-api/codex/responses'
+        )
+      ).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('refreshes an expired standard-scope token without requesting connector scopes', async () => {
+    const expiredAccessToken = [
+      Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url'),
+      Buffer.from(
+        JSON.stringify({
+          exp: Math.floor(Date.now() / 1000) - 60,
+          scp: ['openid', 'profile', 'email', 'offline_access']
+        })
+      ).toString('base64url'),
+      ''
+    ].join('.');
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url) === 'https://auth.openai.com/oauth/token') {
+        const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+        expect(body.scope).toBe('openid profile email offline_access');
+        expect(String(body.scope)).not.toContain('api.connectors.');
+        return new Response(
+          JSON.stringify({
+            access_token: 'refreshed-standard-scope-token',
+            scope: 'openid profile email offline_access'
+          }),
+          {
+            status: 200,
+            headers: {
+              'content-type': 'application/json'
+            }
+          }
+        );
+      }
+
+      const headers = (init?.headers || {}) as Record<string, string>;
+      return new Response(
+        JSON.stringify({
+          object: 'response',
+          output_text: 'refreshed-scope-policy-ok',
+          authorization: headers.authorization
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_responses', ['glm-5'])],
+      [
+        {
+          key: 'openai-main-codex-oauth',
+          enabled: true,
+          providerName: 'openai-main',
+          codexOauth: {
+            enabled: true,
+            tokenEndpoint: 'https://auth.openai.com/oauth/token',
+            clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+            scope: 'openid profile email offline_access',
+            requiredScopes: [],
+            accessToken: expiredAccessToken,
+            refreshToken: 'refresh-token',
+            refreshIfMissingAccessToken: true,
+            forceRefresh: false,
+            required: true,
+            timeoutMs: 3000,
+            authHeader: 'authorization',
+            authScheme: 'Bearer'
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'refresh standard scope token'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://auth.openai.com/oauth/token');
+      expect(String(fetchMock.mock.calls[1]?.[0])).toBe(
+        'https://chatgpt.com/backend-api/codex/responses'
+      );
+      expect(JSON.parse(response.body)).toMatchObject({
+        output_text: 'refreshed-scope-policy-ok',
+        authorization: 'Bearer refreshed-standard-scope-token'
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('keeps codex oauth credentials required when required scope checks are disabled', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url) === 'https://auth.openai.com/oauth/token') {
+        return new Response(JSON.stringify({ error: 'invalid_grant' }), {
+          status: 401,
+          headers: {
+            'content-type': 'application/json'
+          }
+        });
+      }
+      return new Response(JSON.stringify({ output_text: 'unexpected-upstream-call' }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json'
+        }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_responses', ['glm-5'])],
+      [
+        {
+          key: 'openai-main-codex-oauth',
+          enabled: true,
+          providerName: 'openai-main',
+          codexOauth: {
+            enabled: true,
+            tokenEndpoint: 'https://auth.openai.com/oauth/token',
+            clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+            scope: 'openid profile email offline_access',
+            requiredScopes: [],
+            refreshToken: 'invalid-refresh-token',
+            refreshIfMissingAccessToken: true,
+            forceRefresh: false,
+            required: true,
+            timeoutMs: 3000,
+            authHeader: 'authorization',
+            authScheme: 'Bearer'
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'missing credential'
+        }
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0]?.[0])).toBe('https://auth.openai.com/oauth/token');
+      const payload = JSON.parse(response.body);
+      expect(payload.error.attempts?.[0]?.stage).toBe('provider_auth');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('publishes a single request-level billing event for failed requests', async () => {
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       if (String(url) === 'http://billing.local/events') {

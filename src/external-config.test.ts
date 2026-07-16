@@ -9,6 +9,7 @@ import {
   startGatewayExternalConfigPoller
 } from './external-config';
 import { encodeGrpcJsonMessage } from './grpc-json';
+import { waitForLoopbackListener } from './__tests__/listener-readiness';
 
 describe('gateway external config source', () => {
   const servers: Server[] = [];
@@ -294,6 +295,7 @@ async function startConfigWebSocketServer(payload: unknown): Promise<{
   });
 
   const address = server.address() as AddressInfo;
+  await waitForLoopbackListener(address.port);
   return {
     server,
     webSocketServer,
@@ -344,6 +346,7 @@ async function startConfigGrpcJsonServer(payload: unknown): Promise<{
   });
 
   const address = server.address() as AddressInfo;
+  await waitForLoopbackListener(address.port);
   return {
     server,
     url: `grpc://127.0.0.1:${address.port}`,

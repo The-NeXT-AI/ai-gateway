@@ -1104,6 +1104,7 @@ export interface ProviderPluginCodexOAuthConfig {
   refreshIfMissingAccessToken: boolean;
   forceRefresh: boolean;
   required: boolean;
+  requiredScopes?: string[];
   timeoutMs: number;
   authHeader: string;
   authScheme: string;

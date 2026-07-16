@@ -87,8 +87,7 @@ import {
 const defaultConfigFileName = 'gateway.config.json';
 const defaultCodexOauthTokenEndpoint = 'https://auth.openai.com/oauth/token';
 const defaultCodexOauthClientId = 'app_EMoamEEZ73f0CkXaXp7hrann';
-const defaultCodexOauthScope =
-  'openid profile email offline_access api.connectors.read api.connectors.invoke';
+const defaultCodexOauthScope = 'openid profile email offline_access';
 const requiredCodexOauthScopes = ['api.connectors.read', 'api.connectors.invoke'];
 const defaultBodyLimitBytes = 50 * 1024 * 1024;
 const defaultCorsAllowedHeaders = [
@@ -756,6 +755,7 @@ interface ProviderPluginCodexOauthJsonConfig {
   refreshIfMissingAccessToken?: unknown;
   forceRefresh?: unknown;
   required?: unknown;
+  requiredScopes?: unknown;
   timeoutMs?: unknown;
   authHeader?: unknown;
   authScheme?: unknown;
@@ -4070,6 +4070,7 @@ function parseProviderPluginCodexOauth(value: unknown): ProviderPluginCodexOAuth
   if (!hasAccessToken && !hasRefreshToken) {
     return undefined;
   }
+  const requiredScopes = normalizeCodexOauthRequiredScopes(raw.requiredScopes);
 
   return {
     enabled: true,
@@ -4078,20 +4079,21 @@ function parseProviderPluginCodexOauth(value: unknown): ProviderPluginCodexOAuth
       readString(process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE) ||
       defaultCodexOauthTokenEndpoint,
     clientId: readString(raw.clientId) || defaultCodexOauthClientId,
-    scope: normalizeCodexOauthScope(readString(raw.scope)),
+    scope: normalizeCodexOauthScope(readString(raw.scope), requiredScopes),
     accessToken,
     refreshToken,
     accountId,
     refreshIfMissingAccessToken: readBoolean(raw.refreshIfMissingAccessToken) ?? true,
     forceRefresh: readBoolean(raw.forceRefresh) ?? false,
     required: readBoolean(raw.required) ?? true,
+    requiredScopes,
     timeoutMs: resolveInteger([raw.timeoutMs], 8000, 1),
     authHeader: normalizeHeaderName(readString(raw.authHeader), 'authorization'),
     authScheme: readString(raw.authScheme) || 'Bearer'
   };
 }
 
-function normalizeCodexOauthScope(scope: string | undefined): string {
+function normalizeCodexOauthScope(scope: string | undefined, requiredScopes: string[]): string {
   const ordered: string[] = [];
   const seen = new Set<string>();
 
@@ -4110,11 +4112,41 @@ function normalizeCodexOauthScope(scope: string | undefined): string {
   };
 
   pushTokens(scope || defaultCodexOauthScope);
-  for (const requiredScope of requiredCodexOauthScopes) {
+  for (const requiredScope of requiredScopes) {
     pushTokens(requiredScope);
   }
 
   return ordered.join(' ');
+}
+
+function normalizeCodexOauthRequiredScopes(value: unknown): string[] {
+  if (value === undefined) {
+    return [...requiredCodexOauthScopes];
+  }
+  if (!Array.isArray(value)) {
+    return [...requiredCodexOauthScopes];
+  }
+  if (value.length === 0) {
+    return [];
+  }
+
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== 'string' || item.trim().length === 0) {
+      return [...requiredCodexOauthScopes];
+    }
+    for (const token of item.split(/\s+/)) {
+      const scope = token.trim();
+      if (!scope || seen.has(scope)) {
+        continue;
+      }
+      seen.add(scope);
+      normalized.push(scope);
+    }
+  }
+
+  return normalized.length > 0 ? normalized : [...requiredCodexOauthScopes];
 }
 
 function parseProviderPluginMutation(value: unknown): ProviderPluginMutationConfig | undefined {

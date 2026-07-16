@@ -438,7 +438,7 @@ function standardInputToOpenAIChatMessages(
       continue;
     }
 
-    const toolResults = collectUserToolResults(message.content);
+    const toolResults = collectUserToolResults(message.content, true);
     for (const toolResult of toolResults) {
       messages.push({
         role: 'tool',
@@ -639,6 +639,18 @@ function collectAssistantToolCalls(
 ): Array<Record<string, unknown>> {
   const toolCalls: Array<Record<string, unknown>> = [];
   for (const item of content) {
+    if (item.type === 'tool_search_call') {
+      toolCalls.push({
+        id: item.call_id,
+        type: 'function',
+        function: {
+          name: 'ToolSearch',
+          arguments: normalizeFunctionArguments(item.arguments)
+        }
+      });
+      continue;
+    }
+
     if (item.type !== 'tool_use') {
       continue;
     }
@@ -691,7 +703,8 @@ function collectAssistantReasoning(content: StandardRequestInputContent[]):
 }
 
 function collectUserToolResults(
-  content: StandardRequestInputContent[]
+  content: StandardRequestInputContent[],
+  includeToolSearchOutputs = false
 ): Array<{
   tool_call_id: string;
   content: string;
@@ -707,6 +720,21 @@ function collectUserToolResults(
     tool_references?: string[];
   }> = [];
   for (const item of content) {
+    if (item.type === 'tool_search_output') {
+      if (includeToolSearchOutputs) {
+        toolResults.push({
+          tool_call_id: item.call_id,
+          content: normalizeFunctionArguments({
+            type: 'tool_search_output',
+            execution: item.execution,
+            ...(item.status ? { status: item.status } : {}),
+            tools: item.tools
+          })
+        });
+      }
+      continue;
+    }
+
     if (item.type !== 'tool_result') {
       continue;
     }
@@ -822,6 +850,9 @@ function mapStandardToolsToOpenAIResponsesTools(
   }
 
   const toolSearchPlan = deferredToolSearch;
+  const preserveDeferredLoading = tools.some(
+    (tool) => isObject(tool) && asString(tool.type) === 'tool_search'
+  );
   const mapped = tools
     .map((tool) => {
       if (toolSearchPlan && toolSearchPlan.searchTool === tool) {
@@ -830,7 +861,7 @@ function mapStandardToolsToOpenAIResponsesTools(
       if (toolSearchPlan && isObject(tool) && toolSearchPlan.deferredTools.has(tool)) {
         return null;
       }
-      return mapStandardToolToOpenAIResponsesTool(tool);
+      return mapStandardToolToOpenAIResponsesTool(tool, preserveDeferredLoading);
     })
     .filter((tool): tool is Record<string, unknown> => Boolean(tool));
   return mapped.length > 0 ? mapped : undefined;
@@ -857,7 +888,7 @@ function mapStandardToolToOpenAIResponsesTool(
   }
 
   if (asString(tool.type) === 'namespace') {
-    return mapStandardNamespaceToolToOpenAIResponsesTool(tool);
+    return mapStandardNamespaceToolToOpenAIResponsesTool(tool, preserveDeferredLoading);
   }
 
   const functionPayload = isObject(tool.function) ? tool.function : undefined;
@@ -977,6 +1008,7 @@ function buildDeferredToolSearchPlan(
   const resultCounts = new Map<string, number>();
   const callPositions = new Map<string, number>();
   const resultPositions = new Map<string, number>();
+  const deferredCallPositions = new Map<string, number[]>();
   let position = 0;
   for (const message of collectStandardInputMessages(input)) {
     for (const item of message.content) {
@@ -986,6 +1018,10 @@ function buildDeferredToolSearchPlan(
         callPositions.set(item.id, position);
         if (item.name === 'ToolSearch') {
           searchCallCounts.set(item.id, (searchCallCounts.get(item.id) ?? 0) + 1);
+        } else if (deferredToolsByName.has(item.name)) {
+          const positions = deferredCallPositions.get(item.name) ?? [];
+          positions.push(position);
+          deferredCallPositions.set(item.name, positions);
         }
       } else if (item.type === 'tool_result') {
         results.set(item.tool_use_id, item);
@@ -999,6 +1035,7 @@ function buildDeferredToolSearchPlan(
   }
 
   const discoveries = new Map<string, { toolNames: string[] }>();
+  const discoveryPositions = new Map<string, number[]>();
   for (const [callId, searchCallCount] of searchCallCounts) {
     const result = results.get(callId);
     if (
@@ -1017,7 +1054,30 @@ function buildDeferredToolSearchPlan(
     if (toolNames.some((name) => !discoverableToolNames.has(name))) {
       return undefined;
     }
+    const discoveryPosition = resultPositions.get(callId);
+    if (discoveryPosition === undefined) {
+      return undefined;
+    }
+    for (const toolName of toolNames) {
+      const positions = discoveryPositions.get(toolName) ?? [];
+      positions.push(discoveryPosition);
+      discoveryPositions.set(toolName, positions);
+    }
     discoveries.set(callId, { toolNames });
+  }
+
+  for (const [toolName, callPositionList] of deferredCallPositions) {
+    const matchingDiscoveryPositions = discoveryPositions.get(toolName) ?? [];
+    if (
+      callPositionList.some(
+        (callPosition) =>
+          !matchingDiscoveryPositions.some(
+            (discoveryPosition) => discoveryPosition < callPosition
+          )
+      )
+    ) {
+      return undefined;
+    }
   }
 
   return {
@@ -1102,7 +1162,10 @@ function readStringArray(value: unknown): string[] | undefined {
   return values.length > 0 ? values : undefined;
 }
 
-function mapStandardNamespaceToolToOpenAIResponsesTool(tool: Record<string, unknown>): Record<string, unknown> | null {
+function mapStandardNamespaceToolToOpenAIResponsesTool(
+  tool: Record<string, unknown>,
+  preserveDeferredLoading = false
+): Record<string, unknown> | null {
   const name = asString(tool.name);
   const nestedTools = Array.isArray(tool.tools) ? tool.tools : [];
   if (!name || nestedTools.length === 0) {
@@ -1110,7 +1173,9 @@ function mapStandardNamespaceToolToOpenAIResponsesTool(tool: Record<string, unkn
   }
 
   const mappedTools = nestedTools
-    .map((nestedTool) => mapStandardToolToOpenAIResponsesTool(nestedTool))
+    .map((nestedTool) =>
+      mapStandardToolToOpenAIResponsesTool(nestedTool, preserveDeferredLoading)
+    )
     .filter((nestedTool): nestedTool is Record<string, unknown> => Boolean(nestedTool));
   if (mappedTools.length === 0) {
     return null;

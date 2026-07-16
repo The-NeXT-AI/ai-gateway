@@ -147,7 +147,7 @@ runtime.providerPlugins.register(openAIMainPlugin);
 
 - 同协议透传：默认将请求透传到对应上游。
 - 跨协议转换：通过 `x-target-provider` 指定目标厂商，实现请求/响应格式转换。
-- 转换到 Responses 时，保留原生 `text` 配置，将 `output_config.effort` 映射为 `reasoning.effort`、`output_config.verbosity` 映射为 `text.verbosity`，且不转发源协议专用的 `output_config` 容器。
+- 转换到 Responses 时，保留原生 `text` 配置，将 `output_config.effort` 映射为目标模型支持的 `reasoning.effort`（必要时回退到最接近的可用等级）、将 `output_config.verbosity` 映射为 `text.verbosity`，且不转发源协议专用的 `thinking` / `output_config` 容器。
 - 多供应商管理：支持 `x-target-providers`（逗号分隔）定义目标供应商优先级链路。
 - 支持按供应商名称路由：`x-target-provider` / `x-target-providers` 可使用 provider `type` 或 `name`（如 `openai-main`）。
 - 支持模型内联路由：`x-target-model` 或请求体 `model` 可写成 `providerName/modelName`（如 `openai-main/GPT-5.3`）。

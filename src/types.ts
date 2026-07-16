@@ -45,6 +45,15 @@ export interface ModelScopedBillingConfig {
   byModel: Record<string, BillingRate>;
 }
 
+export interface ProviderModelReasoningLevel {
+  effort: string;
+  description?: string;
+}
+
+export interface ProviderModelMetadata {
+  supportedReasoningLevels?: ProviderModelReasoningLevel[];
+}
+
 export type ProviderHealthStatus = 'healthy' | 'degraded' | 'unknown' | 'down';
 
 export interface ProviderHealthConfig {
@@ -95,6 +104,7 @@ export interface ProviderConfig {
   openaiChatStreamUsage?: 'include_usage' | 'disabled';
   openaiChatReasoningSplit?: 'auto' | 'enabled' | 'disabled';
   openaiChatThinkingOptions?: 'auto' | 'enabled' | 'disabled';
+  modelMetadata?: Record<string, ProviderModelMetadata>;
   extraHeaders: ModelScopedHeadersConfig;
   extraBody: ModelScopedBodyConfig;
   billing: ModelScopedBillingConfig;

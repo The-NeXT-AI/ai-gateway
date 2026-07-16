@@ -25,6 +25,93 @@ import {
   splitNamespacedToolCallName
 } from './tools';
 
+const openAIResponsesReasoningEffortOrder = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max'
+] as const;
+
+type OpenAIResponsesReasoningEffort = (typeof openAIResponsesReasoningEffortOrder)[number];
+
+interface OpenAIModelReasoningCapability {
+  pattern: RegExp;
+  supportedEfforts: readonly OpenAIResponsesReasoningEffort[];
+}
+
+// Keep this table aligned with the effort values documented on OpenAI's model pages.
+// Unknown models intentionally pass valid effort values through instead of inheriting
+// capabilities from a different model family.
+const knownOpenAIModelReasoningCapabilities = [
+  {
+    pattern: /^gpt-5\.6(?:-(?:sol|terra|luna))?(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max']
+  },
+  {
+    pattern: /^gpt-5\.5-pro(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.5(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['none', 'low', 'medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.4-pro(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.4(?:-(?:mini|nano))?(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['none', 'low', 'medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.3-codex(?:-spark)?(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.2-codex(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.2(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['none', 'low', 'medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.1-codex-max(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high', 'xhigh']
+  },
+  {
+    pattern: /^gpt-5\.1-codex(?:-mini)?(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high']
+  },
+  {
+    pattern: /^gpt-5\.1(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['none', 'low', 'medium', 'high']
+  },
+  {
+    pattern: /^gpt-5-pro(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['high']
+  },
+  {
+    pattern: /^gpt-5-codex(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high']
+  },
+  {
+    pattern: /^gpt-5(?:-(?:mini|nano))?(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['minimal', 'low', 'medium', 'high']
+  },
+  {
+    pattern: /^o3(?:-mini)?(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high']
+  },
+  {
+    pattern: /^o4-mini(?:-\d{4}-\d{2}-\d{2})?$/,
+    supportedEfforts: ['low', 'medium', 'high']
+  }
+] satisfies readonly OpenAIModelReasoningCapability[];
+
 export const openAIResponsesTargetAdapter: TargetAdapter = {
   provider: 'openai',
   providerTypes: ['openai_responses', 'openai_chat_completions'],
@@ -90,7 +177,10 @@ export const openAIResponsesTargetAdapter: TargetAdapter = {
       });
     }
 
-    const body = buildOpenAIResponsesBodyFromStandardRequest(input.standardRequest);
+    const body = buildOpenAIResponsesBodyFromStandardRequest(
+      input.standardRequest,
+      input.targetProviderConfig
+    );
 
     return ok({
       url: `${input.config.openaiBaseUrl}/responses`,
@@ -104,7 +194,8 @@ export const openAIResponsesTargetAdapter: TargetAdapter = {
 };
 
 export function buildOpenAIResponsesBodyFromStandardRequest(
-  standardRequest: StandardRequest
+  standardRequest: StandardRequest,
+  targetProviderConfig?: ProviderConfig
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
     model: standardRequest.model,
@@ -134,7 +225,8 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
     body.stream = true;
   }
 
-  applyOpenAIResponsesOutputOptions(body, standardRequest);
+  applyOpenAIResponsesReasoningOptions(body, standardRequest, targetProviderConfig);
+  applyOpenAIResponsesTextOptions(body, standardRequest);
 
   return body;
 }
@@ -147,29 +239,139 @@ function resolveOpenAITargetProtocol(providerConfig: ProviderConfig | undefined)
   return 'openai_responses';
 }
 
-function applyOpenAIResponsesOutputOptions(body: Record<string, unknown>, standardRequest: StandardRequest): void {
+function applyOpenAIResponsesReasoningOptions(
+  body: Record<string, unknown>,
+  standardRequest: StandardRequest,
+  targetProviderConfig?: ProviderConfig
+): void {
   if (standardRequest.reasoning !== undefined) {
-    body.reasoning = standardRequest.reasoning;
-  }
-  if (isObject(standardRequest.output_config)) {
-    const effort = asString(standardRequest.output_config.effort);
-    if (effort) {
-      body.reasoning = {
-        effort,
-        ...(isObject(body.reasoning) ? body.reasoning : {})
-      };
+    if (!isObject(standardRequest.reasoning) || Array.isArray(standardRequest.reasoning)) {
+      body.reasoning = standardRequest.reasoning;
+      return;
     }
-    const verbosity = asString(standardRequest.output_config.verbosity);
-    if (verbosity) {
-      body.text = {
-        verbosity,
-        ...(isObject(body.text) ? body.text : {})
-      };
+
+    const effort = asString(standardRequest.reasoning.effort)?.trim();
+    const translatedEffort = openAIResponsesReasoningEffort(
+      standardRequest.output_config,
+      standardRequest.model,
+      targetProviderConfig
+    );
+    body.reasoning =
+      effort || !translatedEffort
+        ? standardRequest.reasoning
+        : {
+            ...standardRequest.reasoning,
+            effort: translatedEffort
+          };
+    return;
+  }
+
+  const effort = openAIResponsesReasoningEffort(
+    standardRequest.output_config,
+    standardRequest.model,
+    targetProviderConfig
+  );
+  if (effort) {
+    body.reasoning = { effort };
+  }
+}
+
+function openAIResponsesReasoningEffort(
+  outputConfig: unknown,
+  model: string | undefined,
+  targetProviderConfig: ProviderConfig | undefined
+): OpenAIResponsesReasoningEffort | undefined {
+  const requestedEffort = readOpenAIResponsesReasoningEffort(outputConfig);
+  if (!requestedEffort) {
+    return undefined;
+  }
+
+  const supportedEfforts = providerModelReasoningEfforts(targetProviderConfig, model);
+  if (!supportedEfforts) {
+    return requestedEffort;
+  }
+
+  if (supportedEfforts.has(requestedEffort)) {
+    return requestedEffort;
+  }
+
+  const requestedIndex = openAIResponsesReasoningEffortOrder.indexOf(requestedEffort);
+  for (let index = requestedIndex - 1; index >= 0; index -= 1) {
+    const effort = openAIResponsesReasoningEffortOrder[index];
+    if (supportedEfforts.has(effort)) {
+      return effort;
     }
   }
-  if (standardRequest.thinking !== undefined) {
-    body.thinking = standardRequest.thinking;
+
+  for (let index = requestedIndex + 1; index < openAIResponsesReasoningEffortOrder.length; index += 1) {
+    const effort = openAIResponsesReasoningEffortOrder[index];
+    if (supportedEfforts.has(effort)) {
+      return effort;
+    }
   }
+
+  return undefined;
+}
+
+function providerModelReasoningEfforts(
+  targetProviderConfig: ProviderConfig | undefined,
+  model: string | undefined
+): ReadonlySet<OpenAIResponsesReasoningEffort> | undefined {
+  const normalizedModel = model?.trim().toLowerCase();
+  if (!normalizedModel) {
+    return undefined;
+  }
+
+  if (targetProviderConfig?.modelMetadata) {
+    const matchingMetadata = Object.entries(targetProviderConfig.modelMetadata).find(
+      ([configuredModel]) => configuredModel.trim().toLowerCase() === normalizedModel
+    )?.[1];
+    if (matchingMetadata?.supportedReasoningLevels !== undefined) {
+      const supportedEfforts = new Set<OpenAIResponsesReasoningEffort>();
+      for (const level of matchingMetadata.supportedReasoningLevels) {
+        const effort = readOpenAIResponsesReasoningEffort(level);
+        if (effort) {
+          supportedEfforts.add(effort);
+        }
+      }
+      return supportedEfforts;
+    }
+  }
+
+  const knownCapability = knownOpenAIModelReasoningCapabilities.find(({ pattern }) =>
+    pattern.test(normalizedModel)
+  );
+  return knownCapability ? new Set(knownCapability.supportedEfforts) : undefined;
+}
+
+function readOpenAIResponsesReasoningEffort(
+  value: unknown
+): OpenAIResponsesReasoningEffort | undefined {
+  if (!isObject(value) || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const effort = asString(value.effort)?.trim().toLowerCase();
+  return openAIResponsesReasoningEffortOrder.find((candidate) => candidate === effort);
+}
+
+function applyOpenAIResponsesTextOptions(
+  body: Record<string, unknown>,
+  standardRequest: StandardRequest
+): void {
+  if (!isObject(standardRequest.output_config) || Array.isArray(standardRequest.output_config)) {
+    return;
+  }
+
+  const verbosity = asString(standardRequest.output_config.verbosity);
+  if (!verbosity) {
+    return;
+  }
+
+  body.text = {
+    verbosity,
+    ...(isObject(body.text) && !Array.isArray(body.text) ? body.text : {})
+  };
 }
 
 function standardInputToOpenAIChatMessages(
@@ -263,7 +465,7 @@ function standardInputToOpenAIResponsesInput(
         role,
         content: [
           {
-            type: 'input_text',
+            type: role === 'assistant' ? 'output_text' : 'input_text',
             text
           }
         ]

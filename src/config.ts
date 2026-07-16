@@ -152,6 +152,7 @@ interface ProviderJsonConfig {
   openaiChatReasoningOptions?: unknown;
   chatThinkingOptions?: unknown;
   thinkingOptions?: unknown;
+  modelMetadata?: unknown;
   extraHeaders?: unknown;
   extraBody?: unknown;
   billing?: unknown;
@@ -3584,6 +3585,7 @@ function parseProvidersConfig(value: unknown): ProviderConfig[] {
           item.chatThinkingOptions ??
           item.thinkingOptions
       ),
+      modelMetadata: parseProviderModelMetadata(item.modelMetadata, models),
       extraHeaders: parseModelScopedHeaders(item.extraHeaders, models),
       extraBody: parseModelScopedBody(item.extraBody, models),
       billing: parseModelScopedBilling(item.billing, models),
@@ -4488,6 +4490,61 @@ function parseModelScopedHeaders(value: unknown, models: string[]): ModelScopedH
     default: parseHeaderMap((value as Record<string, unknown>).default),
     byModel
   };
+}
+
+function parseProviderModelMetadata(
+  value: unknown,
+  models: string[]
+): ProviderConfig['modelMetadata'] {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+
+  const modelNames = new Set(models.map((model) => model.trim().toLowerCase()).filter(Boolean));
+  const metadata: NonNullable<ProviderConfig['modelMetadata']> = {};
+  for (const [rawModel, rawMetadata] of Object.entries(value)) {
+    const model = rawModel.trim();
+    if (
+      !model ||
+      !isPlainObject(rawMetadata) ||
+      (modelNames.size > 0 && !modelNames.has(model.toLowerCase()))
+    ) {
+      continue;
+    }
+
+    const supportedReasoningLevels = parseProviderReasoningLevels(
+      rawMetadata.supportedReasoningLevels
+    );
+    if (supportedReasoningLevels !== undefined) {
+      metadata[model] = {
+        supportedReasoningLevels
+      };
+    }
+  }
+
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
+}
+
+function parseProviderReasoningLevels(
+  value: unknown
+): NonNullable<ProviderConfig['modelMetadata']>[string]['supportedReasoningLevels'] {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const levels = value.flatMap((entry) => {
+    const effort = readString(isPlainObject(entry) ? entry.effort : entry);
+    if (!effort) {
+      return [];
+    }
+
+    const description = isPlainObject(entry) ? readString(entry.description) : undefined;
+    return [{
+      effort,
+      ...(description ? { description } : {})
+    }];
+  });
+  return levels;
 }
 
 function parseModelScopedBody(value: unknown, models: string[]): ModelScopedBodyConfig {

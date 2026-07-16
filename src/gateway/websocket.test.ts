@@ -3,6 +3,7 @@ import type { AddressInfo } from 'node:net';
 import Fastify from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket, WebSocketServer } from 'ws';
+import { waitForLoopbackListener } from '../__tests__/listener-readiness';
 import { ProviderPluginRegistry } from '../adapters/registry';
 import type { GatewayConfig } from '../types';
 import { registerGatewayResponsesWebSocketRoute } from './websocket';
@@ -39,6 +40,7 @@ describe('gateway responses websocket relay', () => {
     });
 
     const gatewayPort = (gateway.server.address() as AddressInfo).port;
+    await waitForLoopbackListener(gatewayPort);
     const receivedMessages: string[] = [];
 
     await new Promise<void>((resolve, reject) => {
@@ -132,6 +134,7 @@ describe('gateway responses websocket relay', () => {
     });
 
     const gatewayPort = (gateway.server.address() as AddressInfo).port;
+    await waitForLoopbackListener(gatewayPort);
 
     await waitForResponseCompleted(`ws://127.0.0.1:${gatewayPort}/v1/responses`, {
       'x-codex-access-token': 'atk-test-codex',
@@ -206,6 +209,7 @@ describe('gateway responses websocket relay', () => {
     });
 
     const gatewayPort = (gateway.server.address() as AddressInfo).port;
+    await waitForLoopbackListener(gatewayPort);
     await waitForResponseCompleted(`ws://127.0.0.1:${gatewayPort}/v1/responses`, {
       authorization: 'Bearer codex-access-token'
     }, {
@@ -236,6 +240,7 @@ describe('gateway responses websocket relay', () => {
     });
 
     const gatewayPort = (gateway.server.address() as AddressInfo).port;
+    await waitForLoopbackListener(gatewayPort);
     await waitForResponseCompleted(`ws://127.0.0.1:${gatewayPort}/v1/responses`, undefined, {
       type: 'response.create',
       model: 'gpt-5.4-mini',
@@ -304,6 +309,7 @@ describe('gateway responses websocket relay', () => {
     });
 
     const gatewayPort = (gateway.server.address() as AddressInfo).port;
+    await waitForLoopbackListener(gatewayPort);
     await waitForResponseCompleted(`ws://127.0.0.1:${gatewayPort}/v1/responses`, {
       authorization: 'Bearer gateway-token'
     }, {
@@ -363,6 +369,7 @@ describe('gateway responses websocket relay', () => {
     });
 
     const gatewayPort = (gateway.server.address() as AddressInfo).port;
+    await waitForLoopbackListener(gatewayPort);
     const errorPayload = await waitForWebSocketError(
       `ws://127.0.0.1:${gatewayPort}/v1/responses`,
       {
@@ -636,6 +643,8 @@ async function listen(server: Server): Promise<void> {
       resolve();
     });
   });
+  const address = server.address() as AddressInfo;
+  await waitForLoopbackListener(address.port);
 }
 
 async function closeWebSocketServer(server: WebSocketServer): Promise<void> {

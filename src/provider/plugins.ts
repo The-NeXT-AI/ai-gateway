@@ -306,6 +306,8 @@ async function applyCodexOauthAuthentication(
   codexOauth: ProviderPluginCodexOAuthConfig,
   context: PluginValueResolveContext
 ): Promise<Result<UpstreamRequest>> {
+  const requiredScopeExpression =
+    codexOauth.requiredScopes?.join(' ') ?? codexOauthRequiredScopeExpression;
   const rewrittenUpstreamRequest = rewriteCodexOauthUpstreamUrl(section, context.upstreamRequest, context);
   const normalizedUpstreamRequest = normalizeCodexOauthUpstreamRequestBody(
     section,
@@ -377,7 +379,7 @@ async function applyCodexOauthAuthentication(
   }
 
   const tokenAnalysis = accessToken
-    ? analyzeCodexAccessToken(accessToken, codexOauthRequiredScopeExpression)
+    ? analyzeCodexAccessToken(accessToken, requiredScopeExpression)
     : undefined;
   let refreshResponseScope: string | undefined;
   const refreshReasons: string[] = [];
@@ -414,7 +416,7 @@ async function applyCodexOauthAuthentication(
     required: codexOauth.required,
     token_endpoint: codexOauth.tokenEndpoint,
     scope: codexOauth.scope,
-    required_scope: codexOauthRequiredScopeExpression,
+    required_scope: requiredScopeExpression,
     loaded_from_cache: Boolean(storedState)
   });
 
@@ -476,9 +478,9 @@ async function applyCodexOauthAuthentication(
     return err(`${section}.accessToken is required but missing.`);
   }
 
-  const finalTokenAnalysis = analyzeCodexAccessToken(accessToken, codexOauthRequiredScopeExpression);
+  const finalTokenAnalysis = analyzeCodexAccessToken(accessToken, requiredScopeExpression);
   const finalScopeEvaluation = evaluateCodexScopeRequirements(
-    codexOauthRequiredScopeExpression,
+    requiredScopeExpression,
     finalTokenAnalysis,
     refreshResponseScope
   );
@@ -493,7 +495,7 @@ async function applyCodexOauthAuthentication(
       'Codex OAuth token is missing required scopes after auth flow.',
       {
         section,
-        required_scope: codexOauthRequiredScopeExpression,
+        required_scope: requiredScopeExpression,
         requested_scope: codexOauth.scope,
         scope_source: finalScopeEvaluation.source,
         granted_scopes: finalScopeEvaluation.scopes,

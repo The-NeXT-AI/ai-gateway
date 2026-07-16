@@ -674,6 +674,104 @@ describe('Gateway config providerPlugins', () => {
     expect(plugin?.codexOauth?.refreshIfMissingAccessToken).toBe(true);
     expect(plugin?.codexOauth?.forceRefresh).toBe(false);
     expect(plugin?.codexOauth?.required).toBe(true);
+    expect(plugin?.codexOauth?.requiredScopes).toEqual([
+      'api.connectors.read',
+      'api.connectors.invoke'
+    ]);
+  });
+
+  it('allows codexOauth scope requirements to be explicitly disabled', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'openai-main',
+          type: 'openai_responses',
+          apikey: 'provider-api-key',
+          models: ['glm-5']
+        }
+      ],
+      providerPlugins: [
+        {
+          key: 'openai-main-codex-oauth',
+          providerName: 'openai-main',
+          codexOauth: {
+            accessToken: 'access-token',
+            required: true,
+            requiredScopes: []
+          }
+        }
+      ]
+    });
+
+    expect(config.providerPlugins?.[0]?.codexOauth).toMatchObject({
+      required: true,
+      requiredScopes: [],
+      scope: 'openid profile email offline_access'
+    });
+  });
+
+  it.each([
+    ['a non-array value', ''],
+    ['an object', {}],
+    ['a numeric array item', [42]],
+    ['a null array item', [null]],
+    ['a blank array item', ['']],
+    ['a mixed valid and invalid array', ['custom.scope', 42]]
+  ])('keeps default codexOauth scope requirements for %s', (_label, requiredScopes) => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'openai-main',
+          type: 'openai_responses',
+          apikey: 'provider-api-key',
+          models: ['glm-5']
+        }
+      ],
+      providerPlugins: [
+        {
+          key: 'openai-main-codex-oauth',
+          providerName: 'openai-main',
+          codexOauth: {
+            accessToken: 'access-token',
+            requiredScopes
+          }
+        }
+      ]
+    });
+
+    expect(config.providerPlugins?.[0]?.codexOauth).toMatchObject({
+      requiredScopes: ['api.connectors.read', 'api.connectors.invoke'],
+      scope: 'openid profile email offline_access api.connectors.read api.connectors.invoke'
+    });
+  });
+
+  it('merges and deduplicates custom codexOauth scope requirements', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'openai-main',
+          type: 'openai_responses',
+          apikey: 'provider-api-key',
+          models: ['glm-5']
+        }
+      ],
+      providerPlugins: [
+        {
+          key: 'openai-main-codex-oauth',
+          providerName: 'openai-main',
+          codexOauth: {
+            accessToken: 'access-token',
+            scope: 'openid custom.base custom.read',
+            requiredScopes: ['custom.read', ' custom.write ', 'custom.read']
+          }
+        }
+      ]
+    });
+
+    expect(config.providerPlugins?.[0]?.codexOauth).toMatchObject({
+      requiredScopes: ['custom.read', 'custom.write'],
+      scope: 'openid custom.base custom.read custom.write'
+    });
   });
 
   it('parses HTTP external gateway config source', () => {

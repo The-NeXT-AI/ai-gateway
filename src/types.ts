@@ -1004,6 +1004,7 @@ export interface StandardRequest {
   reasoning?: unknown;
   thinking?: unknown;
   output_config?: unknown;
+  text?: unknown;
   gemini_interactions?: StandardGeminiInteractionsOptions;
 }
 

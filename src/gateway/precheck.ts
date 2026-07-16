@@ -1007,6 +1007,7 @@ function countStandardRequestInputCharacters(request: StandardRequest): number {
   count += countUnknownCharacters(request.reasoning);
   count += countUnknownCharacters(request.thinking);
   count += countUnknownCharacters(request.output_config);
+  count += countUnknownCharacters(request.text);
   return count;
 }
 

@@ -204,7 +204,8 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
     temperature: standardRequest.temperature,
     top_p: standardRequest.top_p,
     max_output_tokens: standardRequest.max_output_tokens,
-    stop: standardRequest.stop
+    stop: standardRequest.stop,
+    text: standardRequest.text
   };
 
   const tools = mapStandardToolsToOpenAIResponsesTools(standardRequest.tools);
@@ -225,6 +226,7 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
   }
 
   applyOpenAIResponsesReasoningOptions(body, standardRequest, targetProviderConfig);
+  applyOpenAIResponsesTextOptions(body, standardRequest);
 
   return body;
 }
@@ -351,6 +353,25 @@ function readOpenAIResponsesReasoningEffort(
 
   const effort = asString(value.effort)?.trim().toLowerCase();
   return openAIResponsesReasoningEffortOrder.find((candidate) => candidate === effort);
+}
+
+function applyOpenAIResponsesTextOptions(
+  body: Record<string, unknown>,
+  standardRequest: StandardRequest
+): void {
+  if (!isObject(standardRequest.output_config) || Array.isArray(standardRequest.output_config)) {
+    return;
+  }
+
+  const verbosity = asString(standardRequest.output_config.verbosity);
+  if (!verbosity) {
+    return;
+  }
+
+  body.text = {
+    verbosity,
+    ...(isObject(body.text) && !Array.isArray(body.text) ? body.text : {})
+  };
 }
 
 function standardInputToOpenAIChatMessages(

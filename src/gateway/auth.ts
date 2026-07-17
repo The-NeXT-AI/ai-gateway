@@ -9,6 +9,7 @@ import type {
   ProviderConfig
 } from '../types';
 import { readBearerToken, readHeader } from '../utils';
+import { readOpenAIMultipartRequestMetadata } from './multipart';
 
 const SDK_COMPATIBLE_TOKEN_HEADERS = [
   'authorization',
@@ -39,6 +40,21 @@ declare module 'fastify' {
   interface FastifyRequest {
     gatewayIdentity?: GatewayRequestIdentity;
     gatewayApiKeyRestrictions?: GatewayApiKeyRestrictions;
+    gatewayAuthModelCandidates?: string[];
+  }
+}
+
+export function addGatewayAuthModelCandidate(
+  request: FastifyRequest,
+  model: string | undefined
+): void {
+  const normalized = normalizeString(model);
+  if (!normalized) {
+    return;
+  }
+  request.gatewayAuthModelCandidates ||= [];
+  if (!request.gatewayAuthModelCandidates.includes(normalized)) {
+    request.gatewayAuthModelCandidates.push(normalized);
   }
 }
 
@@ -392,8 +408,21 @@ export function evaluateApiKeyModelRestriction(
 ): GatewayAuthResult {
   const restrictions = request.gatewayApiKeyRestrictions;
   const modelValue = normalizeString(model);
-  if (!restrictions || !modelValue) {
+  if (!restrictions) {
     return { ok: true };
+  }
+  if (!modelValue) {
+    const allowedModels = mergeRestrictionLists(
+      restrictions.allowedModels,
+      restrictions.modelWhitelist
+    );
+    return allowedModels.length > 0
+      ? {
+          ok: false,
+          statusCode: 403,
+          error: 'API key model restriction cannot be evaluated because the model is missing.'
+        }
+      : { ok: true };
   }
 
   return evaluateModelRestriction(
@@ -894,9 +923,16 @@ function mergeRestrictionLists(...values: Array<string[] | undefined>): string[]
 
 function collectRequestedModelsFromRequest(request: FastifyRequest): string[] {
   const models: string[] = [];
+  for (const model of request.gatewayAuthModelCandidates || []) {
+    pushUniqueString(models, normalizeString(model));
+  }
   pushUniqueString(models, readHeaderValue(request.headers, 'x-target-model'));
   if (isRecord(request.body)) {
     pushUniqueString(models, normalizeString(request.body.model));
+  }
+  const multipartMetadata = readOpenAIMultipartRequestMetadata(request);
+  if (multipartMetadata?.ok) {
+    pushUniqueString(models, normalizeString(multipartMetadata.value.fields.model));
   }
 
   pushUniqueString(models, readModelFromPath(request.url));

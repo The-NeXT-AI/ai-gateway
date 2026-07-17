@@ -17,7 +17,7 @@ import type {
   UpstreamRequest
 } from '../types';
 import { err, ok, type Result } from '../types';
-import { parseProvider, providerFromProviderType } from '../utils';
+import { findDefaultProviderConfig, parseProvider, providerFromProviderType } from '../utils';
 import { authenticateGatewayRequest, evaluateApiKeyModelRestriction } from './auth';
 import {
   parseGatewayCodexWsSourceAdapterKey,
@@ -753,9 +753,7 @@ function resolveResponsesWebSocketTarget(
     };
   }
 
-  const anyOpenAIProvider = providers.find(
-    (item) => providerFromProviderType(item.type) === 'openai'
-  );
+  const anyOpenAIProvider = findDefaultProviderConfig(providers, 'openai');
   if (anyOpenAIProvider) {
     return {
       baseUrl: anyOpenAIProvider.baseurl || config.openaiBaseUrl,
@@ -885,7 +883,7 @@ function findOpenAIProviderByHint(
 
   return (
     providers.find((item) => item.type === 'openai_responses') ||
-    providers.find((item) => providerFromProviderType(item.type) === 'openai')
+    findDefaultProviderConfig(providers, 'openai')
   );
 }
 

@@ -81,6 +81,67 @@ describe('gateway routing policy', () => {
       }
     });
   });
+
+  it('matches provider policies against the source provider after credential scheduling', () => {
+    const config = createConfig();
+    config.policy = createPolicyConfig({
+      enabled: true,
+      defaults: createPolicyRuleConfig({
+        denyProviderNames: ['openai-main'],
+        denyProviderModels: ['openai-main/gpt-4-*']
+      })
+    });
+    const scheduledProvider = createProviderConfig('openai-main::cred:account-a');
+    scheduledProvider.credentialSourceProviderName = 'openai-main';
+    scheduledProvider.credentialId = 'account-a';
+
+    expect(
+      evaluateGatewayPolicy({
+        request: createRequest(),
+        config,
+        targetProvider: 'openai',
+        targetProviderConfig: scheduledProvider,
+        model: 'gpt-4-mini'
+      })
+    ).toMatchObject({
+      ok: false,
+      statusCode: 403,
+      details: {
+        providerName: 'openai-main'
+      }
+    });
+
+    config.policy.defaults = createPolicyRuleConfig({
+      denyProviderModels: ['openai-main/gpt-4-*']
+    });
+    expect(
+      evaluateGatewayPolicy({
+        request: createRequest(),
+        config,
+        targetProvider: 'openai',
+        targetProviderConfig: scheduledProvider,
+        model: 'gpt-4-mini'
+      })
+    ).toMatchObject({ ok: false, statusCode: 403 });
+  });
+
+  it('fails closed when a model deny rule must be checked but the model is missing', () => {
+    const config = createConfig();
+    config.policy = createPolicyConfig({
+      enabled: true,
+      defaults: createPolicyRuleConfig({ denyModels: ['gpt-4-*'] })
+    });
+
+    expect(
+      evaluateGatewayPolicy({
+        request: createRequest(),
+        config,
+        targetProvider: 'openai',
+        targetProviderConfig: createProviderConfig('openai-main'),
+        requireKnownModel: true
+      })
+    ).toMatchObject({ ok: false, statusCode: 403 });
+  });
 });
 
 function createRequest(identity: Partial<FastifyRequest['gatewayIdentity']> = {}): FastifyRequest {

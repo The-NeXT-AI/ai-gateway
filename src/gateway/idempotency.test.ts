@@ -61,6 +61,57 @@ describe('gateway idempotency', () => {
     }
   });
 
+  it('hashes binary request bodies directly for replay and conflict detection', async () => {
+    const config = createConfig();
+    const app = Fastify({ logger: false });
+    app.addContentTypeParser(
+      'multipart/form-data',
+      { parseAs: 'buffer' },
+      (_request, body, done) => done(null, body)
+    );
+    registerGatewayIdempotencyHooks(app, config);
+    const preHandler = createGatewayIdempotencyPreHandler(config);
+    let calls = 0;
+    app.post('/v1/test', { preHandler }, async () => {
+      calls += 1;
+      return { calls };
+    });
+    await app.ready();
+
+    const headers = {
+      'content-type': 'multipart/form-data; boundary=binary-test',
+      'idempotency-key': 'binary-key'
+    };
+    try {
+      const first = await app.inject({
+        method: 'POST',
+        url: '/v1/test',
+        headers,
+        payload: Buffer.from('--binary-test\r\nfirst\r\n--binary-test--\r\n')
+      });
+      const replay = await app.inject({
+        method: 'POST',
+        url: '/v1/test',
+        headers,
+        payload: Buffer.from('--binary-test\r\nfirst\r\n--binary-test--\r\n')
+      });
+      const conflict = await app.inject({
+        method: 'POST',
+        url: '/v1/test',
+        headers,
+        payload: Buffer.from('--binary-test\r\nsecond\r\n--binary-test--\r\n')
+      });
+
+      expect(first.statusCode).toBe(200);
+      expect(replay.headers['x-gateway-idempotency-status']).toBe('replayed');
+      expect(conflict.statusCode).toBe(409);
+      expect(conflict.headers['x-gateway-idempotency-status']).toBe('conflict');
+      expect(calls).toBe(1);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('rejects reuse of the same key with a different request fingerprint', async () => {
     const config = createConfig();
     const app = Fastify({ logger: false });

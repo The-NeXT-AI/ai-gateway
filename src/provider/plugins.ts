@@ -1453,11 +1453,18 @@ function applyRequestMutation(
     };
   }
 
-  if (
+  const hasBodyMutation =
     Object.keys(mutation.bodySet).length > 0 ||
     Object.keys(mutation.bodyMerge).length > 0 ||
-    mutation.bodyRemove.length > 0
-  ) {
+    mutation.bodyRemove.length > 0;
+  if (hasBodyMutation && upstreamRequest.bodyEncoding === 'bytes') {
+    if (mutation.strict) {
+      return err(`${section} cannot mutate a binary upstream request body.`);
+    }
+    return ok(upstreamRequest);
+  }
+
+  if (hasBodyMutation) {
     const bodyResult = applyPayloadMutation(
       section,
       {

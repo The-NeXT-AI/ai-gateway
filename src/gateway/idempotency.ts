@@ -40,6 +40,7 @@ const idempotencyStore = new Map<string, IdempotencyEntry>();
 const requestContexts = new WeakMap<FastifyRequest, IdempotencyRequestContext>();
 
 const routeSensitiveHeaders = [
+  'content-type',
   'authorization',
   'x-api-key',
   'api-key',
@@ -501,8 +502,30 @@ function hashIdempotencyRequest(request: FastifyRequest, config: GatewayConfig):
   hash.update('\n');
   hash.update(stableStringify(selectFingerprintHeaders(request)));
   hash.update('\n');
-  hash.update(stableStringify(request.body));
+  updateIdempotencyBodyHash(hash, request.body);
   return hash.digest('hex');
+}
+
+function updateIdempotencyBodyHash(hash: ReturnType<typeof createHash>, body: unknown): void {
+  if (Buffer.isBuffer(body)) {
+    hash.update('Buffer\n');
+    hash.update(body);
+    return;
+  }
+
+  if (body instanceof ArrayBuffer) {
+    hash.update('ArrayBuffer\n');
+    hash.update(Buffer.from(body));
+    return;
+  }
+
+  if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(body)) {
+    hash.update(`${body.constructor.name || 'ArrayBufferView'}\n`);
+    hash.update(Buffer.from(body.buffer, body.byteOffset, body.byteLength));
+    return;
+  }
+
+  hash.update(stableStringify(body));
 }
 
 function buildIdempotencyStoreKey(request: FastifyRequest, idempotencyKey: string): string {

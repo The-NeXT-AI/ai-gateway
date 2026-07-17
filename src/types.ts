@@ -7,6 +7,7 @@ export type BuiltinProviderType =
   | 'openai_chat_completions'
   | 'openai_image_generations'
   | 'openai_video_generations'
+  | 'xai_video_generations'
   | 'anthropic_messages'
   | 'gemini_generate_content'
   | 'gemini_interactions';
@@ -29,6 +30,8 @@ export interface BillingRate {
   outputPerMillionUsd: number;
   cacheReadPerMillionUsd?: number;
   cacheWritePerMillionUsd?: number;
+  videoPerSecondUsd?: number;
+  videoPerSecondUsdBySize?: Record<string, number>;
   tiers?: BillingTierSet;
 }
 
@@ -503,6 +506,12 @@ export interface GatewayIdempotencyConfig {
   cacheErrorResponses: boolean;
 }
 
+export interface GatewayMediaConfig {
+  publicBaseUrl?: string;
+  videoIdSigningSecret?: string;
+  videoIdTtlMs: number;
+}
+
 export interface GatewayUpstreamConcurrencyConfig {
   enabled: boolean;
   maxInFlightPerProvider: number;
@@ -807,6 +816,7 @@ export interface GatewayConfig {
   logging: GatewayLoggingConfig;
   cors: GatewayCorsConfig;
   idempotency: GatewayIdempotencyConfig;
+  media?: GatewayMediaConfig;
   upstreamConcurrency: GatewayUpstreamConcurrencyConfig;
   upstreamCircuitBreaker: GatewayUpstreamCircuitBreakerConfig;
   upstreamRetry: GatewayUpstreamRetryConfig;
@@ -830,6 +840,7 @@ export interface UpstreamRequest {
   headers: Record<string, string>;
   body: unknown;
   bodyEncoding?: 'json' | 'text' | 'form' | 'bytes' | 'none';
+  skipResponseBodyLog?: boolean;
 }
 
 export type HeaderBag = FastifyRequest['headers'];
@@ -893,6 +904,8 @@ export interface StandardUsage {
   cache_duration_seconds?: number;
   cache_ttl_seconds?: number;
   cache_age_seconds?: number;
+  video_seconds?: number;
+  video_size?: string;
   server_tool_use?: {
     web_search_requests?: number;
     web_fetch_requests?: number;

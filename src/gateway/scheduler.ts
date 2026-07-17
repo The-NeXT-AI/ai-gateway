@@ -9,7 +9,7 @@ import type {
   ProviderCredentialLimitConfig,
   StandardUsage
 } from '../types';
-import { providerFromProviderType, readHeader } from '../utils';
+import { findDefaultProviderConfig, readHeader } from '../utils';
 
 export interface GatewaySchedulingRoute {
   provider: Provider;
@@ -52,8 +52,14 @@ interface CacheAffinityBinding {
   lastHitAt: number;
 }
 
+interface GatewaySchedulingRequestEstimate {
+  body: unknown;
+  imageCount?: number;
+}
+
 const credentialStates = new Map<string, CredentialRuntimeState>();
 const cacheAffinityBindings = new Map<string, CacheAffinityBinding>();
+let requestEstimates = new WeakMap<FastifyRequest, GatewaySchedulingRequestEstimate>();
 const defaultProviderCacheConfig: ProviderCacheConfig = {
   enabled: true,
   scope: 'credential_model',
@@ -109,7 +115,9 @@ export function recordGatewaySchedulingResponse(input: {
   if (statusCode !== undefined && statusCode >= 200 && statusCode < 400) {
     state.consecutiveFailures = 0;
     state.cooldownUntil = undefined;
-    incrementCredentialCounters(providerConfig, estimateRequestUsage(input.request, input.config));
+    if (providerConfig.credentialLimits) {
+      incrementCredentialCounters(providerConfig, estimateRequestUsage(input.request, input.config));
+    }
     updateCacheAffinity(input.config, input.request, providerConfig, input.model, input.usage);
     return;
   }
@@ -153,9 +161,34 @@ export function attachGatewaySchedulingHeaders(
   reply.header('x-gateway-scheduled-credential-id', providerConfig.credentialId);
 }
 
+export function resolveGatewayScheduledCredential(
+  providerConfig: ProviderConfig,
+  credentialId: string | undefined
+): ProviderConfig | undefined {
+  if (!credentialId) {
+    return providerConfig;
+  }
+
+  const credential = providerConfig.credentials?.find(
+    (item) =>
+      item.id === credentialId &&
+      item.enabled !== false &&
+      Boolean(item.apikey)
+  );
+  return credential ? providerConfigForCredential(providerConfig, credential) : undefined;
+}
+
+export function setGatewaySchedulingRequestEstimate(
+  request: FastifyRequest,
+  estimate: GatewaySchedulingRequestEstimate
+): void {
+  requestEstimates.set(request, estimate);
+}
+
 export function resetGatewaySchedulingStateForTests(): void {
   credentialStates.clear();
   cacheAffinityBindings.clear();
+  requestEstimates = new WeakMap<FastifyRequest, GatewaySchedulingRequestEstimate>();
 }
 
 function expandSchedulingRoute<T extends GatewaySchedulingRoute>(
@@ -308,7 +341,7 @@ function resolveRouteProviderConfig(
     return route.providerConfig;
   }
 
-  return config.providers.find((providerConfig) => providerFromProviderType(providerConfig.type) === route.provider);
+  return findDefaultProviderConfig(config.providers, route.provider);
 }
 
 function credentialLimitState(
@@ -445,16 +478,21 @@ function estimateRequestUsage(
   request: FastifyRequest,
   config: GatewayConfig
 ): { imageCount: number; totalTokens: number } {
-  const body = request.body;
-  const text = stableStringify(body);
+  const requestEstimate = requestEstimates.get(request);
+  const body = requestEstimate?.body ?? request.body;
+  const binary = binaryPayloadBytes(body);
+  const estimatedCharacterCount = binary?.byteLength ?? stableStringify(body).length;
   const charsPerToken = Math.max(1, config.precheck?.estimation?.charsPerToken || 4);
   return {
-    imageCount: countImageMarkers(body),
-    totalTokens: Math.max(1, Math.ceil(text.length / charsPerToken))
+    imageCount: requestEstimate?.imageCount ?? countImageMarkers(body),
+    totalTokens: Math.max(1, Math.ceil(estimatedCharacterCount / charsPerToken))
   };
 }
 
 function countImageMarkers(value: unknown): number {
+  if (binaryPayloadBytes(value)) {
+    return 0;
+  }
   if (Array.isArray(value)) {
     return value.reduce((sum, item) => sum + countImageMarkers(item), 0);
   }
@@ -634,6 +672,11 @@ function stableStringify(value: unknown): string {
   if (typeof value !== 'object') {
     return JSON.stringify(value);
   }
+  const binary = binaryPayloadBytes(value);
+  if (binary) {
+    const sha256 = createHash('sha256').update(binary).digest('hex');
+    return `{"$binary":{"byteLength":${binary.byteLength},"sha256":${JSON.stringify(sha256)}}}`;
+  }
   if (Array.isArray(value)) {
     return `[${value.map((item) => stableStringify(item)).join(',')}]`;
   }
@@ -643,6 +686,19 @@ function stableStringify(value: unknown): string {
     .sort()
     .map((key) => `${JSON.stringify(key)}:${stableStringify(object[key])}`)
     .join(',')}}`;
+}
+
+function binaryPayloadBytes(value: unknown): Uint8Array | undefined {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  return undefined;
 }
 
 function sanitizeCredentialId(value: string): string {

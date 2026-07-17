@@ -8,7 +8,8 @@
 - OpenAI `POST /v1/responses`
 - OpenAI `POST /v1/embeddings`
 - OpenAI `POST /v1/moderations`
-- OpenAI `POST /v1/images/generations`、`POST /v1/images/edits`、`POST /v1/videos/generations`、`GET /v1/videos/:id`
+- OpenAI `POST /v1/images/generations`、`POST /v1/images/edits`、`POST /v1/videos`、`GET /v1/videos/:id`、`GET /v1/videos/:id/content`
+- xAI `POST /v1/videos/generations`、`GET /v1/videos/:id`
 - Anthropic Claude `POST /v1/messages`
 - Google Gemini `POST /v1beta/models/{model}:generateContent`（同时支持 `/v1/models/*`）
 
@@ -151,8 +152,10 @@ runtime.providerPlugins.register(openAIMainPlugin);
 - 多供应商管理：支持 `x-target-providers`（逗号分隔）定义目标供应商优先级链路。
 - 支持按供应商名称路由：`x-target-provider` / `x-target-providers` 可使用 provider `type` 或 `name`（如 `openai-main`）。
 - 支持模型内联路由：`x-target-model` 或请求体 `model` 可写成 `providerName/modelName`（如 `openai-main/GPT-5.3`）。
-- 支持 OpenAI 兼容媒体端点透传：`/v1/images/generations`、`/v1/images/edits`、`/v1/videos/generations`、`/v1/videos/:id` 复用命名 provider、fallback、插件、precheck、policy、health 与用量计费；图片编辑同时支持 JSON 和原始 multipart 转发。
-- 请求失败自动 fallback：按供应商顺序逐个尝试，直到成功或全部失败。
+- 支持 OpenAI/xAI 媒体端点透传与转换：OpenAI 使用 `POST /v1/videos`，xAI 使用 `POST /v1/videos/generations`；根据目标 provider 的 `openai_video_generations` / `xai_video_generations` 类型自动双向映射 `seconds` ↔ `duration`、`size` ↔ `aspect_ratio + resolution`，并转换创建及轮询响应。为避免静默改变输出，跨 provider 仅转换双方能精确表达的 4/8/12 秒及 `1280x720 ↔ 16:9/720p`、`720x1280 ↔ 9:16/720p`；OpenAI 入口省略参数时会显式带入其 4 秒、`720x1280` 默认值，xAI 入口转 OpenAI 时则要求显式提供这三个公共参数，其他组合会在网关返回明确的 400。网关不会硬编码视频模型；请求未提供 `model` 时，仅在目标 provider 恰好配置一个模型时用于选路和治理推断，否则保留上游默认语义，并在模型策略需要已知模型时 fail-closed。OpenAI JSON 扩展形式的 `input_reference.image_url` 可转换为 xAI `image`；`file_id` 属于上游本地资源，不能跨供应商复用。OpenAI multipart 转 xAI 时仅接受可无损映射的 `model`、`prompt`、`seconds`、`size`，其他字段或文件会返回 400，而不是静默丢弃；这些治理字段必须使用精确的小写名称，避免治理解析与实际转发字节产生歧义。反向的 xAI `image` / `reference_images` 也无法无损构造成 OpenAI 所需的 multipart 文件上传，这些情况都会返回明确的 400。显式的 `x-target-provider` / `x-target-providers` 不会被跨供应商自动匹配覆盖。OpenAI 的 `GET /v1/videos/:id/content` 对 OpenAI 上游流式透传，对 xAI 上游重定向至完成响应中的临时 URL；转换出的 xAI `video.url` 必须使用绝对的 `media.publicBaseUrl` 指向网关 content 路由，未配置或配置为相对地址时跨协议转换会返回明确的 400，下载时仍需携带网关认证。新生成的视频 ID 使用 AES-256-GCM 加密认证路由、模型、过期时间和身份归属信息，避免向客户端暴露内部 provider、credential 和身份指纹；迁移期间仍可读取未过期的旧 `gv2` HMAC ID。启用认证后，创建视频必须有可绑定的身份，状态/内容接口也会拒绝无归属的历史签名 ID。多实例部署必须为所有实例配置相同的 `media.videoIdSigningSecret`。
+- OpenAI 已公告 Videos API、`sora-2` 和 `sora-2-pro` 将于 2026-09-24 下线且没有替代接口；该能力应视为有明确截止日期的兼容层，并提前迁移到其他 provider（[官方下线公告](https://developers.openai.com/api/docs/deprecations#2026-03-24-sora-2-video-generation-models-and-videos-api)）。
+- 图片编辑同时支持 JSON 和原始 multipart 转发，并从 multipart 的标准 `model` / `prompt` 字段提取选路及治理元数据而不重写文件字节；multipart 的实际 `model` 必须与治理模型一致。二进制请求仍执行插件的 header/query 规则；非 strict 的 body mutation 会跳过，strict body mutation 会拒绝请求。
+- 请求失败自动 fallback：按供应商顺序逐个尝试，直到成功或全部失败。图片/视频创建属于非幂等操作：请求一旦向上游发出，网关不会做传输重试，也不会因连接结果不确定或上游非 2xx 响应而换供应商重放，以避免重复任务和重复计费。
 - 主动健康检查：manager API 可触发 provider 探测，也可通过 `providerHealthCheck.enabled=true` 启用定时探测并更新运行态 health，用于 health-aware routing。
 - 运行指标导出：可通过 `metrics.enabled=true` 开启 `GET /metrics`，输出 Prometheus 文本格式的请求计数、耗时与 provider health 指标。
 - 幂等重试保护：可通过 `idempotency.enabled=true` 启用 `Idempotency-Key` 缓存，避免 `/v1*` JSON POST 的非流式成功响应在客户端重试时重复调用上游。
@@ -245,7 +248,8 @@ docker compose up --build
 - `plugins` 是统一插件入口；可声明 `providerHooks`，也可通过 `modulePath` 加载本地模块插件注册 `targetAdapters` / `sourceAdapters` / `providerHooks`，详见 [Gateway Plugins](plugins.md)
 - `providerPlugins` 仍兼容旧配置；新配置建议迁移到 `plugins[].providerHooks`
 - `type` 同时用于声明 provider 类别和上游协议，支持：
-  - OpenAI：`openai`（等价 `openai_responses`）、`openai_responses`、`openai_chat_completions`
+  - OpenAI：`openai`（等价 `openai_responses`）、`openai_responses`、`openai_chat_completions`、`openai_image_generations`、`openai_video_generations`
+  - xAI 视频：`xai_video_generations`
   - Anthropic：`anthropic`（等价 `anthropic_messages`）、`anthropic_messages`
   - Gemini：`gemini`（等价 `gemini_generate_content`）、`gemini_generate_content`
   - 自定义协议：通过模块插件注册对应 `targetAdapters` 后，可使用形如 `acme_messages` 的自定义 provider type
@@ -276,6 +280,8 @@ docker compose up --build
 - `upstreamConcurrency` 用于配置 provider 维度上游并发隔离（默认关闭）：`enabled`、`maxInFlightPerProvider`、`queueTimeoutMs|queueTimeoutSeconds`。
 - `upstreamCircuitBreaker` 用于配置 provider 维度上游熔断（默认关闭）：`enabled`、`failureThreshold`、`cooldownMs|cooldownSeconds`、`failureStatusCodes`。
 - `upstreamRetry` 用于配置上游传输重试：`enabled`、`maxAttempts`、`baseDelayMs|baseDelaySeconds`、`maxDelayMs|maxDelaySeconds`、`backoffMultiplier`、`jitterMs|jitterSeconds`、`retryStatusCodes`。
+- `media` 用于配置媒体公开地址和加密认证视频 ID：`publicBaseUrl`、`videoIdSigningSecret`、`videoIdTtlMs|videoIdTtlSeconds`。`publicBaseUrl` 必须是无 query、无 fragment 的绝对 HTTP(S) URL。`videoIdSigningSecret` 的名称为兼容现有配置而保留，当前同时作为视频 ID 的加密认证密钥材料；未配置时使用进程级临时密钥，进程重启后旧 ID 会失效。生产环境和多实例必须共享足够强度的固定密钥。启用网关鉴权后，视频创建必须解析出身份，状态/内容接口只接受带匹配归属信息的网关视频 ID，不接受无归属签名 ID 或裸上游 ID。不要从请求 `Host` 推导公开地址。
+- provider 的 `billing.default` / `billing.byModel` 可配置 `videoPerSecondUsd` 作为视频每秒兜底价格，并可通过 `videoPerSecondUsdBySize` 按分辨率覆盖（例如 `{"720x1280":0.3,"1024x1792":0.5}`）；预算检查、计费响应头和事件均以 provider `extraBody` 与 request plugin 处理后的最终模型、时长和分辨率为准。xAI 响应中的 `usage.cost_in_usd_ticks` 会按完整的 10 位小数精度作为实际费用（`10^10` ticks = 1 USD）写入计费响应头和事件。
 - `transparentToolExecution` 用于配置普通请求透明工具执行（默认关闭）：`enabled`、`maxTurns`、`maxToolCalls`、`requireClientDeclaration`、`unknownToolPolicy=return_to_client|fail`、`allowTools`、`denyTools`。启用后会绕过同协议非流式 passthrough，以便解析 tool calls；仅执行请求中声明且 MCP 工具源可唯一解析的工具。
 - `agent.mcpServers` 用于配置 MCP 工具源：
   - `transport=stdio`：`name`、`command`、`args`、`env`、`cwd`、`protocolVersion`、`startupTimeoutMs`、`requestTimeoutMs`
@@ -312,6 +318,12 @@ docker compose up --build
 - `HOST`：监听地址，默认 `0.0.0.0`
 - `PORT`：监听端口，默认 `3000`
 - `GATEWAY_CONFIG_PATH`：JSON 配置文件路径（可选）
+- `GATEWAY_PUBLIC_BASE_URL`：媒体 content URL 的可信公开基础地址（可选）
+- `GATEWAY_VIDEO_ID_SIGNING_SECRET`：视频 ID 的共享加密认证密钥材料（配置名为兼容保留，生产多实例必配）
+- `GATEWAY_VIDEO_ID_TTL_MS` / `GATEWAY_VIDEO_ID_TTL_SECONDS`：视频 ID 有效期（默认 24 小时）
+- `OPENAI_VIDEO_PRICE_PER_SECOND`：OpenAI 视频每秒预估价格（USD，可选）
+- `XAI_API_KEY`：xAI provider 未配置 `apikey` 时使用的视频 API 密钥
+- `XAI_BASE_URL`：xAI provider 未配置 `baseurl` 时使用的基础地址（默认 `https://api.x.ai/v1`）
 - `CODEX_REFRESH_TOKEN_URL_OVERRIDE`：`providerPlugins.codexOauth.tokenEndpoint` 默认值覆盖（可选；默认 `https://auth.openai.com/oauth/token`）
 - `MANAGER_API_KEY`：管理接口密钥（建议生产环境必配；设置后需通过 `x-manager-key` 或 `Authorization: Bearer` 访问管理接口）
 - `AGENT_STORAGE_TYPE`：Agent 存储类型，支持 `memory` / `filesystem`，默认 `memory`；`filesystem` 适合本地开发，通用网关部署建议使用 `agent.external` 托管状态
@@ -544,8 +556,10 @@ docker compose up --build
 - `POST /v1/moderations`
 - `POST /v1/images/generations`
 - `POST /v1/images/edits`
+- `POST /v1/videos`
 - `POST /v1/videos/generations`
 - `GET /v1/videos/:id`
+- `GET /v1/videos/:id/content`
 - `WS /v1/responses`
 - `WS /v1/responses` 支持将 `chat/completions`、`messages`、`gemini generateContent/streamGenerateContent` 请求体自动转换为 Codex `response.create`；可通过 `?source_adapter=` 显式指定（如 `openai_chat`、`anthropic_messages`、`gemini_generate`、`gemini_stream`）。
 - `POST /v1/messages`
@@ -714,6 +728,10 @@ curl -s http://localhost:3000/agent/sessions/demo/events?limit=20
 - `x-gateway-billing-output-cost`
 - `x-gateway-billing-cache-read-cost`
 - `x-gateway-billing-cache-write-cost`
+- `x-gateway-billing-video-seconds`
+- `x-gateway-billing-video-size`
+- `x-gateway-billing-video-per-second-usd`
+- `x-gateway-billing-media-cost`
 - `x-gateway-billing-total-cost`
 
 > 流式请求与上游错误响应不会附带计费头。

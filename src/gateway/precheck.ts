@@ -23,7 +23,7 @@ import type {
   StandardRequestInputMessage,
   StandardUsage
 } from '../types';
-import { isObject, providerFromProviderType, readHeader } from '../utils';
+import { findDefaultProviderConfig, isObject, readHeader } from '../utils';
 
 type PrecheckKind = 'rate_limit' | 'quota' | 'budget';
 
@@ -35,6 +35,9 @@ export interface GatewayPrecheckInput {
   model?: string;
   standardRequest?: StandardRequest;
   requestBody?: unknown;
+  imageCount?: number;
+  videoSeconds?: number;
+  videoSize?: string;
 }
 
 export interface GatewayPrecheckEstimate {
@@ -42,6 +45,7 @@ export interface GatewayPrecheckEstimate {
   outputTokens: number;
   totalTokens: number;
   imageCount: number;
+  videoSeconds: number;
   estimatedCostUsd: number;
 }
 
@@ -979,7 +983,9 @@ function estimateGatewayRequestUsage(input: GatewayPrecheckInput): GatewayPreche
   const usage: StandardUsage = {
     input_tokens: inputTokens,
     output_tokens: outputTokens,
-    total_tokens: totalTokens
+    total_tokens: totalTokens,
+    video_seconds: input.videoSeconds,
+    video_size: input.videoSize
   };
   const billing = calculateUsageBilling(
     input.targetProvider,
@@ -992,7 +998,8 @@ function estimateGatewayRequestUsage(input: GatewayPrecheckInput): GatewayPreche
     inputTokens,
     outputTokens,
     totalTokens,
-    imageCount: countImageInputs(input.requestBody),
+    imageCount: input.imageCount ?? countImageInputs(input.requestBody),
+    videoSeconds: input.videoSeconds ?? 0,
     estimatedCostUsd: billing.cost.total
   };
 }
@@ -1055,6 +1062,10 @@ function countUnknownCharacters(value: unknown): number {
     return value.length;
   }
 
+  if (isBinaryValue(value)) {
+    return 0;
+  }
+
   try {
     return JSON.stringify(value)?.length || 0;
   } catch {
@@ -1067,6 +1078,10 @@ function countImageInputs(value: unknown): number {
     return value.reduce((sum, item) => sum + countImageInputs(item), 0);
   }
 
+  if (isBinaryValue(value)) {
+    return 0;
+  }
+
   if (!isObject(value)) {
     return 0;
   }
@@ -1076,6 +1091,14 @@ function countImageInputs(value: unknown): number {
   }
 
   return Object.values(value).reduce<number>((sum, item) => sum + countImageInputs(item), 0);
+}
+
+function isBinaryValue(value: unknown): boolean {
+  return (
+    Buffer.isBuffer(value) ||
+    value instanceof ArrayBuffer ||
+    (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(value))
+  );
 }
 
 function isImageBlock(value: Record<string, unknown>): boolean {
@@ -1240,5 +1263,5 @@ function findProviderConfigByType(
   providers: ProviderConfig[],
   provider: Provider
 ): ProviderConfig | undefined {
-  return providers.find((item) => providerFromProviderType(item.type) === provider);
+  return findDefaultProviderConfig(providers, provider);
 }

@@ -183,6 +183,59 @@ describe('callUpstream', () => {
       global.fetch = originalFetch;
     }
   });
+
+  it('does not clone or buffer binary responses when response body logging is disabled', async () => {
+    const originalFetch = global.fetch;
+    const response = new Response('mock-video-bytes', {
+      headers: { 'content-type': 'video/mp4' }
+    });
+    const cloneSpy = vi.spyOn(response, 'clone');
+
+    try {
+      global.fetch = vi.fn(async () => response) as typeof fetch;
+      const result = await callUpstream(
+        'https://example.test/v1/videos/video-1/content',
+        {},
+        undefined,
+        0,
+        undefined,
+        { logger: { info: vi.fn() } },
+        undefined,
+        { method: 'GET', bodyEncoding: 'none', skipResponseBodyLog: true }
+      );
+
+      expect(result).toBe(response);
+      expect(cloneSpy).not.toHaveBeenCalled();
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('does not clone or buffer event streams when response logging is enabled', async () => {
+    const originalFetch = global.fetch;
+    const response = new Response('data: partial\n\n', {
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' }
+    });
+    const cloneSpy = vi.spyOn(response, 'clone');
+
+    try {
+      global.fetch = vi.fn(async () => response) as typeof fetch;
+      const result = await callUpstream(
+        'https://example.test/v1/images/edits',
+        { 'content-type': 'application/json' },
+        { stream: true },
+        0,
+        undefined,
+        { logger: { info: vi.fn() } }
+      );
+
+      expect(result).toBe(response);
+      expect(cloneSpy).not.toHaveBeenCalled();
+      expect(await result.text()).toBe('data: partial\n\n');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
 });
 
 describe('upstream response abort handling', () => {
@@ -229,6 +282,16 @@ describe('upstream response abort handling', () => {
 });
 
 describe('sanitizePayloadForLog', () => {
+  it('summarizes binary payloads without exposing or expanding their bytes', () => {
+    const sanitized = sanitizePayloadForLog(Buffer.alloc(4 * 1024 * 1024, 7));
+
+    expect(sanitized).toEqual({
+      type: 'Buffer',
+      byteLength: 4 * 1024 * 1024,
+      omitted: true
+    });
+  });
+
   it('preserves usage token counters and details', () => {
     const sanitized = sanitizePayloadForLog({
       usage: {

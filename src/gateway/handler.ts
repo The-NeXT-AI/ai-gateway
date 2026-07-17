@@ -39,6 +39,7 @@ import {
   asNumber,
   asString,
   collectStandardInputMessages,
+  findDefaultProviderConfig,
   formatErrorWithCause,
   isObject,
   normalizeMessageRole,
@@ -6641,7 +6642,7 @@ function findProviderConfigByType(
   providers: ProviderConfig[],
   provider: Provider
 ): ProviderConfig | undefined {
-  return providers.find((item) => providerFromProviderType(item.type) === provider);
+  return findDefaultProviderConfig(providers, provider);
 }
 
 function findProviderConfigByName(

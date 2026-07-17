@@ -349,6 +349,47 @@ describe('evaluateGatewayPrecheck', () => {
     }
   });
 
+  it('includes configured video seconds in budget estimates', async () => {
+    const config = createConfig({
+      enabled: true,
+      rateLimit: disabledRateLimit(),
+      quota: disabledQuota(),
+      budget: {
+        enabled: true,
+        windowMs: 86_400_000,
+        maxCostUsd: 0.2,
+        subject: 'global',
+        scope: 'global'
+      },
+      estimation: { charsPerToken: 4, defaultMaxOutputTokens: 0 }
+    });
+    config.providers[0]!.billing.default = {
+      inputPerMillionUsd: 0,
+      outputPerMillionUsd: 0,
+      videoPerSecondUsd: 0.05
+    };
+
+    const result = await evaluateGatewayPrecheck({
+      request: createRequest(),
+      config,
+      targetProvider: 'openai',
+      targetProviderConfig: config.providers[0],
+      model: 'gpt-test',
+      standardRequest: createStandardRequest('video prompt'),
+      videoSeconds: 8
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      statusCode: 402,
+      code: 'budget_exceeded',
+      details: {
+        requested: 0.4,
+        estimated: { videoSeconds: 8, estimatedCostUsd: 0.4 }
+      }
+    });
+  });
+
   it('enforces API key restriction rate limits even when static precheck is disabled', async () => {
     const config = createConfig({
       enabled: false,

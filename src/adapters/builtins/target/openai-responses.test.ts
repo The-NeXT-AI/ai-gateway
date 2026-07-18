@@ -94,7 +94,7 @@ describe('openAIResponsesTargetAdapter', () => {
   });
 
   it('translates Anthropic output_config effort for OpenAI Responses targets', () => {
-    const body = buildAnthropicOpenAIResponsesBody(
+    const body = buildAnthropicOpenAITargetBody(
       {
         model: 'gpt-reasoning',
         max_tokens: 128,
@@ -126,6 +126,42 @@ describe('openAIResponsesTargetAdapter', () => {
     expect(body.reasoning).toEqual({ effort: 'xhigh' });
     expect(body.thinking).toBeUndefined();
     expect(body.output_config).toBeUndefined();
+  });
+
+  it('omits Anthropic stop sequences for OpenAI Responses targets', () => {
+    const body = buildAnthropicOpenAITargetBody(
+      {
+        model: 'gpt-5.6-sol',
+        max_tokens: 2112,
+        stop_sequences: ['</block>'],
+        messages: [{ role: 'user', content: 'Classify this tool call.' }]
+      },
+      {
+        name: 'openai-main',
+        type: 'openai_responses',
+        models: ['gpt-5.6-sol']
+      }
+    );
+
+    expect(body).not.toHaveProperty('stop');
+  });
+
+  it('preserves Anthropic stop sequences for OpenAI Chat Completions targets', () => {
+    const body = buildAnthropicOpenAITargetBody(
+      {
+        model: 'chat-model',
+        max_tokens: 128,
+        stop_sequences: ['</block>'],
+        messages: [{ role: 'user', content: 'Classify this tool call.' }]
+      },
+      {
+        name: 'openai-chat',
+        type: 'openai_chat_completions',
+        models: ['chat-model']
+      }
+    );
+
+    expect(body.stop).toEqual(['</block>']);
   });
 
   it('encodes assistant history as output_text for OpenAI Responses targets', () => {
@@ -2098,7 +2134,7 @@ describe('openAIResponsesTargetAdapter', () => {
   });
 });
 
-function buildAnthropicOpenAIResponsesBody(
+function buildAnthropicOpenAITargetBody(
   requestBody: Record<string, unknown>,
   targetProviderConfig: Record<string, unknown>
 ): Record<string, unknown> {

@@ -197,6 +197,7 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
   standardRequest: StandardRequest,
   targetProviderConfig?: ProviderConfig
 ): Record<string, unknown> {
+  // The Responses API does not accept `stop`; Chat Completions handles it above.
   const body: Record<string, unknown> = {
     model: standardRequest.model,
     instructions: standardRequest.instructions,
@@ -204,7 +205,6 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
     temperature: standardRequest.temperature,
     top_p: standardRequest.top_p,
     max_output_tokens: standardRequest.max_output_tokens,
-    stop: standardRequest.stop,
     text: standardRequest.text
   };
 

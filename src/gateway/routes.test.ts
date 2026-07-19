@@ -336,6 +336,70 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('omits Anthropic stop_sequences from OpenAI Responses upstream requests', async () => {
+    let upstreamUrl = '';
+    let upstreamBody: Record<string, unknown> = {};
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      upstreamUrl = String(url);
+      upstreamBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+
+      return new Response(
+        JSON.stringify({
+          id: 'resp_auto_mode_classifier',
+          object: 'response',
+          status: 'completed',
+          model: 'gpt-5.6-sol',
+          output_text: '<block>allow</block>',
+          usage: {
+            input_tokens: 10,
+            output_tokens: 4,
+            total_tokens: 14
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6-sol'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'gpt-5.6-sol',
+          max_tokens: 2112,
+          stop_sequences: ['</block>'],
+          messages: [{ role: 'user', content: 'Classify this tool call.' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(upstreamUrl).toBe('https://api.openai.com/v1/responses');
+      expect(upstreamBody).not.toHaveProperty('stop');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('encodes Anthropic assistant history as output_text on the second OpenAI Responses turn', async () => {
     const upstreamBodies: Array<Record<string, unknown>> = [];
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {

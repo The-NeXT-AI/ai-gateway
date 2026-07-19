@@ -66,6 +66,42 @@ describe('provider health scheduler', () => {
     );
   });
 
+  it('checks xAI providers through the bearer-authenticated models endpoint', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ data: [] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'xai-video',
+          type: 'xai_video_generations',
+          apikey: 'xai-provider-key',
+          baseurl: 'https://api.x.ai/v1/',
+          models: ['grok-imagine-video']
+        }
+      ],
+      providerHealthCheck: {
+        enabled: true,
+        intervalMs: 10000,
+        timeoutMs: 1000
+      }
+    });
+
+    const results = await runScheduledProviderHealthChecks(config);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(upstreamUrl).toBe('https://api.x.ai/v1/models');
+    expect(upstreamInit.headers).toMatchObject({
+      authorization: 'Bearer xai-provider-key'
+    });
+    expect(results[0]).toMatchObject({
+      provider: 'xai',
+      providerName: 'xai-video',
+      ok: true,
+      statusCode: 200
+    });
+  });
+
   it('does not schedule checks when disabled', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ data: [] }), { status: 200 }));

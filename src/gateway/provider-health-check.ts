@@ -126,6 +126,25 @@ function buildHealthCheckRequest(
     };
   }
 
+  if (provider === 'xai') {
+    const apiKey = providerConfig.apikey || process.env.XAI_API_KEY;
+    if (!apiKey) {
+      return { ok: false, error: 'XAI_API_KEY is missing.' };
+    }
+
+    return {
+      ok: true,
+      value: {
+        url: `${trimTrailingSlash(
+          providerConfig.baseurl || process.env.XAI_BASE_URL || 'https://api.x.ai/v1'
+        )}/models`,
+        headers: {
+          authorization: `Bearer ${apiKey}`
+        }
+      }
+    };
+  }
+
   const apiKey = providerConfig.apikey || config.geminiApiKey || process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return { ok: false, error: 'GEMINI_API_KEY is missing.' };

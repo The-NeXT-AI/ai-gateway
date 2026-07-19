@@ -1,6 +1,13 @@
 import type { BillingConfig, BillingRate, BillingTier, Provider, StandardUsage } from '../types';
 
 const TOKENS_PER_MILLION = 1_000_000;
+const DEFAULT_MONEY_DECIMAL_PLACES = 8;
+const MONEY_DECIMAL_PLACES = 10;
+const MONEY_SCALE = 10 ** MONEY_DECIMAL_PLACES;
+const zeroBillingRate: BillingRate = {
+  inputPerMillionUsd: 0,
+  outputPerMillionUsd: 0
+};
 
 export interface BillingChargeBreakdown {
   source: 'tier' | 'base';
@@ -21,12 +28,15 @@ export interface BillingResult {
     cache_write_tokens: number;
     total_tokens: number;
     cache_duration_seconds: number;
+    video_seconds?: number;
+    video_size?: string;
   };
   rates: {
     input_per_million_usd: number;
     output_per_million_usd: number;
     cache_read_per_million_usd: number;
     cache_write_per_million_usd: number;
+    video_per_second_usd?: number;
   };
   cost: {
     input: number;
@@ -34,6 +44,7 @@ export interface BillingResult {
     cache_read: number;
     cache_write: number;
     tiered: number;
+    media?: number;
     total: number;
   };
   breakdown: {
@@ -50,7 +61,7 @@ export function calculateUsageBilling(
   config: BillingConfig,
   rateOverride?: BillingRate
 ): BillingResult {
-  const rate = rateOverride || config.rates[provider];
+  const rate = rateOverride || config.rates[provider] || zeroBillingRate;
   const inputTokens = normalizeTokenCount(usage.input_tokens);
   const outputTokens = normalizeTokenCount(usage.output_tokens);
   const cacheReadTokens = normalizeTokenCount(usage.cache_read_tokens);
@@ -59,6 +70,8 @@ export function calculateUsageBilling(
   const cacheDurationSeconds = normalizeDurationSeconds(
     usage.cache_duration_seconds ?? usage.cache_ttl_seconds ?? usage.cache_age_seconds
   );
+  const videoSeconds = normalizePositiveNumber(usage.video_seconds);
+  const videoSize = normalizeVideoSize(usage.video_size);
   const totalTokens = resolveTotalTokens(
     provider,
     totalTokensFromUsage,
@@ -90,8 +103,15 @@ export function calculateUsageBilling(
     cacheWriteRate,
     rate.tiers?.cacheWrite
   );
+  const resolvedVideoRate = resolveVideoPerSecondUsd(rate, videoSize);
+  const videoRate = resolvedVideoRate ?? 0;
+  const mediaCost = roundMoney(videoSeconds * videoRate);
   const totalCost = roundMoney(
-    inputCost.total_cost + outputCost.total_cost + cacheReadCost.total_cost + cacheWriteCost.total_cost
+    inputCost.total_cost +
+      outputCost.total_cost +
+      cacheReadCost.total_cost +
+      cacheWriteCost.total_cost +
+      mediaCost
   );
   const tieredCost = roundMoney(
     inputCost.tiered_cost + outputCost.tiered_cost + cacheReadCost.tiered_cost + cacheWriteCost.tiered_cost
@@ -106,13 +126,18 @@ export function calculateUsageBilling(
       cache_read_tokens: cacheReadTokens,
       cache_write_tokens: cacheWriteTokens,
       total_tokens: totalTokens,
-      cache_duration_seconds: cacheDurationSeconds
+      cache_duration_seconds: cacheDurationSeconds,
+      ...(usage.video_seconds !== undefined ? { video_seconds: videoSeconds } : {}),
+      ...(videoSize ? { video_size: videoSize } : {})
     },
     rates: {
       input_per_million_usd: rate.inputPerMillionUsd,
       output_per_million_usd: rate.outputPerMillionUsd,
       cache_read_per_million_usd: cacheReadRate,
-      cache_write_per_million_usd: cacheWriteRate
+      cache_write_per_million_usd: cacheWriteRate,
+      ...(resolvedVideoRate !== undefined
+        ? { video_per_second_usd: videoRate }
+        : {})
     },
     cost: {
       input: inputCost.total_cost,
@@ -120,6 +145,9 @@ export function calculateUsageBilling(
       cache_read: cacheReadCost.total_cost,
       cache_write: cacheWriteCost.total_cost,
       tiered: tieredCost,
+      ...(usage.video_seconds !== undefined || resolvedVideoRate !== undefined
+        ? { media: mediaCost }
+        : {}),
       total: totalCost
     },
     breakdown: {
@@ -151,7 +179,7 @@ function resolveTotalTokens(
 }
 
 export function buildBillingHeaders(result: BillingResult): Record<string, string> {
-  return {
+  const headers: Record<string, string> = {
     'x-gateway-billing-provider': result.provider,
     'x-gateway-billing-currency': result.currency,
     'x-gateway-billing-input-tokens': String(result.usage.input_tokens),
@@ -167,6 +195,47 @@ export function buildBillingHeaders(result: BillingResult): Record<string, strin
     'x-gateway-billing-tiered-cost': formatMoney(result.cost.tiered),
     'x-gateway-billing-total-cost': formatMoney(result.cost.total)
   };
+  if (result.usage.video_seconds !== undefined) {
+    headers['x-gateway-billing-video-seconds'] = String(result.usage.video_seconds);
+  }
+  if (result.usage.video_size !== undefined) {
+    headers['x-gateway-billing-video-size'] = result.usage.video_size;
+  }
+  if (result.rates.video_per_second_usd !== undefined) {
+    headers['x-gateway-billing-video-per-second-usd'] = formatMoney(
+      result.rates.video_per_second_usd
+    );
+  }
+  if (result.cost.media !== undefined) {
+    headers['x-gateway-billing-media-cost'] = formatMoney(result.cost.media);
+  }
+  return headers;
+}
+
+export function createProviderReportedCostBilling(
+  provider: Provider,
+  costUsd: number,
+  config: BillingConfig
+): BillingResult {
+  const billing = calculateUsageBilling(provider, {}, config);
+  const normalizedCost = roundMoney(Math.max(costUsd, 0));
+  billing.cost.media = normalizedCost;
+  billing.cost.total = normalizedCost;
+  return billing;
+}
+
+export function resolveVideoPerSecondUsd(
+  rate: BillingRate | undefined,
+  videoSize: string | undefined
+): number | undefined {
+  if (!rate) {
+    return undefined;
+  }
+  const normalizedSize = normalizeVideoSize(videoSize);
+  if (normalizedSize && rate.videoPerSecondUsdBySize?.[normalizedSize] !== undefined) {
+    return rate.videoPerSecondUsdBySize[normalizedSize];
+  }
+  return rate.videoPerSecondUsd;
 }
 
 function calculateCostByRateAndTiers(
@@ -309,10 +378,25 @@ function normalizeDurationSeconds(value: number | undefined): number {
   return Math.trunc(value);
 }
 
+function normalizePositiveNumber(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
 function roundMoney(value: number): number {
-  return Math.round(value * 1e8) / 1e8;
+  return Math.round(value * MONEY_SCALE) / MONEY_SCALE;
 }
 
 function formatMoney(value: number): string {
-  return value.toFixed(8);
+  const roundedAtDefaultPrecision =
+    Math.round(value * 10 ** DEFAULT_MONEY_DECIMAL_PLACES) /
+    10 ** DEFAULT_MONEY_DECIMAL_PLACES;
+  return value.toFixed(
+    roundedAtDefaultPrecision === value
+      ? DEFAULT_MONEY_DECIMAL_PLACES
+      : MONEY_DECIMAL_PLACES
+  );
+}
+
+function normalizeVideoSize(value: string | undefined): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim().toLowerCase() : undefined;
 }

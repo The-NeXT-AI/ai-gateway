@@ -42,6 +42,11 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.GATEWAY_IDEMPOTENCY_TTL_SECONDS;
     delete process.env.GATEWAY_IDEMPOTENCY_MAX_ENTRIES;
     delete process.env.GATEWAY_IDEMPOTENCY_CACHE_ERROR_RESPONSES;
+    delete process.env.GATEWAY_PUBLIC_BASE_URL;
+    delete process.env.GATEWAY_VIDEO_ID_SIGNING_SECRET;
+    delete process.env.GATEWAY_VIDEO_ID_TTL_MS;
+    delete process.env.GATEWAY_VIDEO_ID_TTL_SECONDS;
+    delete process.env.OPENAI_VIDEO_PRICE_PER_SECOND;
     delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_ENABLED;
     delete process.env.GATEWAY_UPSTREAM_MAX_IN_FLIGHT_PER_PROVIDER;
     delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_QUEUE_TIMEOUT_MS;
@@ -250,6 +255,68 @@ describe('Gateway config providerPlugins', () => {
       'gemini_interactions',
       'gemini_interactions'
     ]);
+  });
+
+  it('parses OpenAI and xAI video provider protocol types', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'openai-video',
+          type: 'openai_video_generations',
+          models: ['sora-2']
+        },
+        {
+          name: 'xai-video',
+          type: 'xai_video_generations',
+          models: ['grok-imagine-video']
+        }
+      ]
+    });
+
+    expect(config.providers.map((provider) => provider.type)).toEqual([
+      'openai_video_generations',
+      'xai_video_generations'
+    ]);
+  });
+
+  it('does not promote media-only providers to the default OpenAI text config', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'openai-video',
+          type: 'openai_video_generations',
+          apiKey: 'video-key',
+          baseUrl: 'https://video.example/v1',
+          models: ['sora-2']
+        },
+        {
+          name: 'openai-main',
+          type: 'openai_responses',
+          apiKey: 'text-key',
+          baseUrl: 'https://text.example/v1',
+          models: ['gpt-5-mini']
+        }
+      ]
+    });
+
+    expect(config.openaiApiKey).toBe('text-key');
+    expect(config.openaiBaseUrl).toBe('https://text.example/v1');
+    expect(config.defaultOpenAIModel).toBe('gpt-5-mini');
+  });
+
+  it('keeps media-only provider families out of implicit text defaults', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'xai-video',
+          type: 'xai_video_generations',
+          models: ['grok-imagine-video']
+        }
+      ]
+    });
+
+    expect(config.defaultTargetProvider).toBeUndefined();
+    expect(config.defaultTargetProviders).toEqual([]);
   });
 
   it('parses unified gateway plugins and custom provider types', () => {
@@ -1586,6 +1653,66 @@ describe('Gateway config providerPlugins', () => {
       ttlMs: 120000,
       maxEntries: 25,
       cacheErrorResponses: true
+    });
+  });
+
+  it('parses media URL and signed video id settings with env overrides', () => {
+    process.env.GATEWAY_PUBLIC_BASE_URL = 'https://gateway.example/';
+    process.env.GATEWAY_VIDEO_ID_SIGNING_SECRET = 'env-signing-secret';
+    process.env.GATEWAY_VIDEO_ID_TTL_SECONDS = '600';
+
+    const config = parseGatewayConfigFromRaw({
+      media: {
+        publicBaseUrl: 'https://file.example/',
+        videoIdSigningSecret: 'file-signing-secret',
+        videoIdTtlMs: 1_000
+      },
+      providers: [
+        {
+          name: 'xai-video',
+          type: 'xai_video_generations',
+          models: ['grok-imagine-video'],
+          billing: {
+            default: {
+              videoPerSecondUsd: 0.05,
+              videoPerSecondUsdBySize: {
+                ' 1024X1792 ': 0.5,
+                invalid: -1
+              }
+            }
+          }
+        }
+      ]
+    });
+
+    expect(config.media).toEqual({
+      publicBaseUrl: 'https://gateway.example',
+      videoIdSigningSecret: 'env-signing-secret',
+      videoIdTtlMs: 600_000
+    });
+    expect(config.providers[0]?.billing.default?.videoPerSecondUsd).toBe(0.05);
+    expect(config.providers[0]?.billing.default?.videoPerSecondUsdBySize).toEqual({
+      '1024x1792': 0.5
+    });
+  });
+
+  it('keeps the default OpenAI video rate absent unless explicitly configured', () => {
+    const withoutVideoRate = parseGatewayConfigFromRaw({});
+    expect(withoutVideoRate.billing.rates.openai).not.toHaveProperty('videoPerSecondUsd');
+
+    const withZeroVideoRate = parseGatewayConfigFromRaw({
+      billing: {
+        rates: {
+          openai: {
+            videoPerSecondUsd: 0,
+            videoPerSecondUsdBySize: { '1024x1792': 0.5 }
+          }
+        }
+      }
+    });
+    expect(withZeroVideoRate.billing.rates.openai.videoPerSecondUsd).toBe(0);
+    expect(withZeroVideoRate.billing.rates.openai.videoPerSecondUsdBySize).toEqual({
+      '1024x1792': 0.5
     });
   });
 

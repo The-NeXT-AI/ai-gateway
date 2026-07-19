@@ -1,5 +1,5 @@
 import type { GatewayConfig, Provider, ProviderConfig, ProviderHealthStatus } from '../types';
-import { providerFromProviderType } from '../utils';
+import { findDefaultProviderConfig } from '../utils';
 
 export interface HealthAwareProviderRoute {
   provider: Provider;
@@ -133,5 +133,5 @@ function findProviderConfigByType(
   providers: ProviderConfig[],
   provider: Provider
 ): ProviderConfig | undefined {
-  return providers.find((item) => providerFromProviderType(item.type) === provider);
+  return findDefaultProviderConfig(providers, provider);
 }

@@ -1,12 +1,27 @@
-import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type {
+  FastifyInstance,
+  FastifyReply,
+  FastifyRequest,
+  preHandlerHookHandler
+} from 'fastify';
 import type { GatewayConfig, ProviderConfig, VirtualModelProfileConfig } from '../types';
 import { providerFromProviderType, readHeader } from '../utils';
-import { createGatewayAuthPreHandler } from './auth';
+import { addGatewayAuthModelCandidate, createGatewayAuthPreHandler } from './auth';
 import { handleOpenAIEmbeddingsRequest } from './embeddings';
-import { handleOpenAIImageGenerationsRequest, handleOpenAIModerationsRequest } from './openai-json';
+import {
+  handleOpenAIImageEditsRequest,
+  handleOpenAIImageGenerationsRequest,
+  handleOpenAIModerationsRequest,
+  handleOpenAIVideoContentRequest,
+  handleOpenAIVideoGenerationRequest,
+  handleOpenAIVideoStatusRequest,
+  handleXAIVideoGenerationRequest,
+  registerOpenAIMediaBodyParsers
+} from './openai-json';
 import { handleGatewayRequest, parseGeminiTail } from './handler';
 import { createGatewayIdempotencyPreHandler } from './idempotency';
 import type { GatewayRuntime } from './runtime';
+import { decodeGatewayVideoId } from './video-compat';
 
 type ModelListFormat = 'openai' | 'anthropic';
 
@@ -45,6 +60,7 @@ export function registerGatewayRoutes(
   runtime: GatewayRuntime
 ) {
   const gatewayAuthPreHandler = createGatewayAuthPreHandler(config.auth);
+  const gatewayVideoModelPreHandler = createGatewayVideoModelPreHandler(config);
   const gatewayIdempotencyPreHandler = createGatewayIdempotencyPreHandler(config);
   const gatewayWritePreHandlers = [gatewayAuthPreHandler, gatewayIdempotencyPreHandler];
 
@@ -115,6 +131,37 @@ export function registerGatewayRoutes(
     return handleOpenAIImageGenerationsRequest(request, reply, config, runtime);
   });
 
+  fastify.register(async (mediaFastify) => {
+    registerOpenAIMediaBodyParsers(mediaFastify, config.bodyLimitBytes);
+    mediaFastify.post('/v1/images/edits', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+      return handleOpenAIImageEditsRequest(request, reply, config, runtime);
+    });
+    mediaFastify.post('/v1/videos', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+      return handleOpenAIVideoGenerationRequest(request, reply, config, runtime);
+    });
+  });
+
+  fastify.post('/v1/videos/generations', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+    return handleXAIVideoGenerationRequest(request, reply, config, runtime);
+  });
+
+  fastify.get<{ Params: { '*': string } }>(
+    '/v1/videos/*',
+    { preHandler: [gatewayVideoModelPreHandler, gatewayAuthPreHandler] },
+    async (request, reply) => {
+      const tail = request.params['*'];
+      if (tail.endsWith('/content')) {
+        const id = tail.slice(0, -'/content'.length);
+        if (id && !id.includes('/')) {
+          return handleOpenAIVideoContentRequest(request, reply, config, runtime, id);
+        }
+      } else if (tail && !tail.includes('/')) {
+        return handleOpenAIVideoStatusRequest(request, reply, config, runtime, tail);
+      }
+      return reply.code(404).send({ error: { message: 'Video route not found.' } });
+    }
+  );
+
   fastify.post('/v1/messages', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
     return handleGatewayRequest(
       request,
@@ -172,6 +219,26 @@ export function registerGatewayRoutes(
       runtime
     );
   });
+}
+
+function createGatewayVideoModelPreHandler(config: GatewayConfig): preHandlerHookHandler {
+  return async function gatewayVideoModelPreHandler(request): Promise<void> {
+    const tail = (request.params as { '*'?: unknown } | undefined)?.['*'];
+    if (typeof tail !== 'string') {
+      return;
+    }
+    const requestId = tail.endsWith('/content')
+      ? tail.slice(0, -'/content'.length)
+      : tail;
+    if (!requestId || requestId.includes('/')) {
+      return;
+    }
+    const reference = decodeGatewayVideoId(requestId, {
+      signingSecret: config.media?.videoIdSigningSecret,
+      ttlMs: config.media?.videoIdTtlMs
+    });
+    addGatewayAuthModelCandidate(request, reference?.model);
+  };
 }
 
 function handleGetGatewayModel(rawModelId: string, reply: FastifyReply, config: GatewayConfig) {

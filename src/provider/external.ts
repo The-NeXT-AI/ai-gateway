@@ -1,5 +1,13 @@
 import { createDecipheriv } from 'node:crypto';
-import { asString, isObject, parseProvider, parseProviderList, providerFromProviderType } from '../utils';
+import {
+  asString,
+  findDefaultProviderConfig,
+  isMediaOnlyProviderType,
+  isObject,
+  parseProvider,
+  parseProviderList,
+  providerFromProviderType
+} from '../utils';
 import {
   parseGatewayPluginsFromRaw,
   parseProviderPluginsFromRaw,
@@ -250,17 +258,15 @@ async function fetchExternalProviders(
 
 function applyProvidersToGatewayConfig(config: GatewayConfig, providers: ProviderConfig[]): void {
   const previousProviders = [...config.providers];
-  const previousDefaultTargets = dedupeProviderTypes(previousProviders.map((item) => providerFromProviderType(item.type)));
-  const previousDefaultTarget = previousProviders[0]
-    ? providerFromProviderType(previousProviders[0].type)
-    : undefined;
+  const previousDefaultTargets = defaultProviderTypes(previousProviders);
+  const previousDefaultTarget = previousDefaultTargets[0];
 
   config.providers.length = 0;
   for (const provider of providers) {
     config.providers.push(provider);
   }
 
-  const nextDefaultTargets = dedupeProviderTypes(providers.map((item) => providerFromProviderType(item.type)));
+  const nextDefaultTargets = defaultProviderTypes(providers);
   const envDefaultTargets = parseProviderList(process.env.DEFAULT_TARGET_PROVIDERS);
   const hasExplicitDefaultTargets = envDefaultTargets.length > 0;
   if (!hasExplicitDefaultTargets) {
@@ -427,7 +433,15 @@ function findProviderByType(
   providers: ProviderConfig[],
   provider: Provider
 ): ProviderConfig | undefined {
-  return providers.find((item) => providerFromProviderType(item.type) === provider);
+  return findDefaultProviderConfig(providers, provider);
+}
+
+function defaultProviderTypes(providers: ProviderConfig[]): Provider[] {
+  return dedupeProviderTypes(
+    providers
+      .filter((item) => !isMediaOnlyProviderType(item.type))
+      .map((item) => providerFromProviderType(item.type))
+  );
 }
 
 function dedupeProviderTypes(value: Provider[]): Provider[] {

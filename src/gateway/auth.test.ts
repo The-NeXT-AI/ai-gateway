@@ -314,6 +314,46 @@ describe('gateway auth', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('includes multipart model metadata in http introspection requests', async () => {
+    const fetchMock = vi.fn(async () => {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ active: true, userId: 'user-2' })
+      } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const boundary = 'auth-multipart-boundary';
+    const request = createRequest(
+      {
+        authorization: 'Bearer token-123',
+        'content-type': `multipart/form-data; boundary=${boundary}`
+      },
+      {
+        url: '/v1/images/edits',
+        body: Buffer.from(
+          `--${boundary}\r\n` +
+            'Content-Disposition: form-data; name="model"\r\n\r\n' +
+            `gpt-image-1\r\n--${boundary}--\r\n`
+        )
+      }
+    );
+    const result = await authenticateGatewayRequest(request, {
+      ...baseConfig,
+      mode: 'http_introspection'
+    });
+
+    expect(result.ok).toBe(true);
+    const fetchOptions = (fetchMock.mock.calls[0] as unknown as [string, RequestInit] | undefined)?.[1];
+    const fetchBody = JSON.parse(fetchOptions?.body as string);
+    expect(fetchBody).toMatchObject({
+      model: 'gpt-image-1',
+      models: ['gpt-image-1'],
+      path: '/v1/images/edits'
+    });
+  });
+
   it('passes client context to introspection and stores returned restrictions', async () => {
     const fetchMock = vi.fn(async () => {
       return {
@@ -536,6 +576,15 @@ describe('gateway auth', () => {
       expect(routedResult.statusCode).toBe(403);
       expect(routedResult.error).toContain('o3');
     }
+
+    const missingModelResult = evaluateApiKeyModelRestriction(routedRequest, undefined, {
+      provider: 'openai',
+      providerConfig
+    });
+    expect(missingModelResult).toMatchObject({
+      ok: false,
+      statusCode: 403
+    });
   });
 
   it('reads identity fields from envelope data payload', async () => {

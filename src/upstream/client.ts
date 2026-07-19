@@ -25,6 +25,7 @@ export interface UpstreamRetryOptions {
 export interface UpstreamRequestOptions {
   method?: string;
   bodyEncoding?: 'json' | 'text' | 'form' | 'bytes' | 'none';
+  skipResponseBodyLog?: boolean;
 }
 
 interface NormalizedUpstreamRetryOptions {
@@ -113,7 +114,8 @@ export async function callUpstream(
 ): Promise<Response> {
   const retry = normalizeUpstreamRetryOptions(retryOptions);
   const shouldLog = Boolean(logContext?.logger);
-  const shouldSkipResponseBodyLog = isStreamingRequestPayload(body, headers);
+  const shouldSkipResponseBodyLog =
+    requestOptions?.skipResponseBodyLog === true || isStreamingRequestPayload(body, headers);
   const requestLogPayload = shouldLog
     ? {
         url: sanitizeUrlForLog(url),
@@ -174,7 +176,8 @@ export async function callUpstream(
         });
 
         if (shouldLog && requestLogPayload) {
-          const responseBody = shouldSkipResponseBodyLog
+          const responseBody =
+            shouldSkipResponseBodyLog || isEventStreamResponse(response)
             ? '<streaming-response-body omitted>'
             : await readResponseBodyForLog(response);
           logContext?.logger?.info?.(
@@ -281,6 +284,10 @@ export async function callUpstream(
   }
 
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function isEventStreamResponse(response: Response): boolean {
+  return response.headers.get('content-type')?.toLowerCase().includes('text/event-stream') ?? false;
 }
 
 export async function relayUpstreamResponse(
@@ -725,6 +732,11 @@ function redactSensitiveValues(value: unknown, depth: number): unknown {
     return '<max-depth>';
   }
 
+  const binarySummary = summarizeBinaryPayload(value);
+  if (binarySummary) {
+    return binarySummary;
+  }
+
   if (Array.isArray(value)) {
     return value.map((item) => redactSensitiveValues(item, depth + 1));
   }
@@ -747,6 +759,25 @@ function redactSensitiveValues(value: unknown, depth: number): unknown {
   }
 
   return mapped;
+}
+
+function summarizeBinaryPayload(
+  value: unknown
+): { type: string; byteLength: number; omitted: true } | undefined {
+  if (Buffer.isBuffer(value)) {
+    return { type: 'Buffer', byteLength: value.byteLength, omitted: true };
+  }
+  if (value instanceof ArrayBuffer) {
+    return { type: 'ArrayBuffer', byteLength: value.byteLength, omitted: true };
+  }
+  if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(value)) {
+    return {
+      type: value.constructor.name || 'ArrayBufferView',
+      byteLength: value.byteLength,
+      omitted: true
+    };
+  }
+  return undefined;
 }
 
 function truncateStringForLog(value: string): string {

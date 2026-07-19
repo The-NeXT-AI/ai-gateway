@@ -26,6 +26,7 @@ import type {
   GatewayIdempotencyConfig,
   GatewayLoggingConfig,
   GatewayMetricsConfig,
+  GatewayMediaConfig,
   GatewayModelListConfig,
   GatewayPolicyConfig,
   GatewayPolicyRuleConfig,
@@ -77,6 +78,8 @@ import type {
   RawTraceSyncConfig
 } from './types';
 import {
+  findDefaultProviderConfig,
+  isMediaOnlyProviderType,
   isSafeProviderToken,
   parseProvider,
   parseProviderList,
@@ -120,6 +123,8 @@ interface BillingRateJsonConfig {
   outputPerMillionUsd?: unknown;
   cacheReadPerMillionUsd?: unknown;
   cacheWritePerMillionUsd?: unknown;
+  videoPerSecondUsd?: unknown;
+  videoPerSecondUsdBySize?: unknown;
   tiers?: unknown;
 }
 
@@ -593,6 +598,7 @@ interface GatewayJsonConfig {
   logging?: unknown;
   cors?: unknown;
   idempotency?: unknown;
+  media?: unknown;
   upstreamConcurrency?: unknown;
   upstreamCircuitBreaker?: unknown;
   upstreamRetry?: unknown;
@@ -619,6 +625,13 @@ interface GatewaySchedulingJsonConfig {
   cacheAffinity?: unknown;
   credentialScheduler?: unknown;
   fallback?: unknown;
+}
+
+interface GatewayMediaJsonConfig {
+  publicBaseUrl?: unknown;
+  videoIdSigningSecret?: unknown;
+  videoIdTtlMs?: unknown;
+  videoIdTtlSeconds?: unknown;
 }
 
 interface GatewaySchedulingCacheAffinityJsonConfig {
@@ -930,12 +943,23 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
       ? (jsonConfig.externalConfig as GatewayConfigExternalSourceJsonConfig)
       : undefined;
   const providers = parseProvidersConfig(jsonConfig.providers ?? jsonConfig.Providers);
+  const defaultProviderConfigs = providers.filter(
+    (providerConfig) => !isMediaOnlyProviderType(providerConfig.type)
+  );
   const openAIProviderConfig = findProviderConfigByType(providers, 'openai');
   const anthropicProviderConfig = findProviderConfigByType(providers, 'anthropic');
   const geminiProviderConfig = findProviderConfigByType(providers, 'gemini');
   const openAITopLevelBillingRate = parseBillingRate(jsonConfig.billing?.rates?.openai);
   const anthropicTopLevelBillingRate = parseBillingRate(jsonConfig.billing?.rates?.anthropic);
   const geminiTopLevelBillingRate = parseBillingRate(jsonConfig.billing?.rates?.gemini);
+  const openAIVideoPerSecondUsd = resolveOptionalNonNegativeNumber([
+    process.env.OPENAI_VIDEO_PRICE_PER_SECOND,
+    openAITopLevelBillingRate?.videoPerSecondUsd,
+    openAIProviderConfig?.billing.default?.videoPerSecondUsd
+  ]);
+  const openAIVideoPerSecondUsdBySize =
+    openAITopLevelBillingRate?.videoPerSecondUsdBySize ||
+    openAIProviderConfig?.billing.default?.videoPerSecondUsdBySize;
 
   return {
     host: readString(process.env.HOST) || readString(jsonConfig.host) || '0.0.0.0',
@@ -949,7 +973,9 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
     defaultTargetProvider:
       parseProvider(readString(process.env.DEFAULT_TARGET_PROVIDER)) ||
       parseProvider(readString(jsonConfig.defaultTargetProvider)) ||
-      (providers[0] ? providerFromProviderType(providers[0].type) : undefined),
+      (defaultProviderConfigs[0]
+        ? providerFromProviderType(defaultProviderConfigs[0].type)
+        : undefined),
     defaultTargetProviders: resolveDefaultTargetProviders(
       process.env.DEFAULT_TARGET_PROVIDERS,
       providers
@@ -1034,6 +1060,7 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
     logging: parseGatewayLoggingConfig(jsonConfig.logging),
     cors: parseGatewayCorsConfig(jsonConfig.cors),
     idempotency: parseGatewayIdempotencyConfig(jsonConfig.idempotency),
+    media: parseGatewayMediaConfig(jsonConfig.media),
     upstreamConcurrency: parseGatewayUpstreamConcurrencyConfig(jsonConfig.upstreamConcurrency),
     upstreamCircuitBreaker: parseGatewayUpstreamCircuitBreakerConfig(jsonConfig.upstreamCircuitBreaker),
     upstreamRetry: parseGatewayUpstreamRetryConfig(jsonConfig.upstreamRetry),
@@ -1077,6 +1104,12 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
             ],
             0
           ),
+          ...(openAIVideoPerSecondUsd !== undefined
+            ? { videoPerSecondUsd: openAIVideoPerSecondUsd }
+            : {}),
+          ...(openAIVideoPerSecondUsdBySize
+            ? { videoPerSecondUsdBySize: openAIVideoPerSecondUsdBySize }
+            : {}),
           tiers: openAITopLevelBillingRate?.tiers || openAIProviderConfig?.billing.default?.tiers
         },
         anthropic: {
@@ -1159,6 +1192,35 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
     agent: parseAgentConfig(jsonConfig.agent),
     mcpGateway: parseMcpGatewayConfig(jsonConfig.mcpGateway)
   };
+}
+
+function parseGatewayMediaConfig(value: unknown): GatewayMediaConfig {
+  const raw = isPlainObject(value) ? (value as GatewayMediaJsonConfig) : undefined;
+  const publicBaseUrl =
+    readString(process.env.GATEWAY_PUBLIC_BASE_URL) || readString(raw?.publicBaseUrl);
+  return {
+    publicBaseUrl: publicBaseUrl ? trimTrailingSlash(publicBaseUrl) : undefined,
+    videoIdSigningSecret:
+      readString(process.env.GATEWAY_VIDEO_ID_SIGNING_SECRET) ||
+      readString(raw?.videoIdSigningSecret),
+    videoIdTtlMs: resolveGatewayVideoIdTtlMs(raw)
+  };
+}
+
+function resolveGatewayVideoIdTtlMs(raw: GatewayMediaJsonConfig | undefined): number {
+  const candidates: Array<[unknown, number]> = [
+    [process.env.GATEWAY_VIDEO_ID_TTL_MS, 1],
+    [process.env.GATEWAY_VIDEO_ID_TTL_SECONDS, 1000],
+    [raw?.videoIdTtlMs, 1],
+    [raw?.videoIdTtlSeconds, 1000]
+  ];
+  for (const [value, multiplier] of candidates) {
+    const parsed = readFiniteNumber(value);
+    if (parsed !== undefined && parsed > 0) {
+      return Math.floor(parsed * multiplier);
+    }
+  }
+  return 86_400_000;
 }
 
 function parseGatewayPrecheckConfig(value: unknown): GatewayPrecheckConfig {
@@ -4627,8 +4689,22 @@ function parseBillingRate(value: unknown): BillingRate | undefined {
   const output = readNonNegativeNumber((value as BillingRateJsonConfig).outputPerMillionUsd);
   const cacheRead = readNonNegativeNumber((value as BillingRateJsonConfig).cacheReadPerMillionUsd);
   const cacheWrite = readNonNegativeNumber((value as BillingRateJsonConfig).cacheWritePerMillionUsd);
+  const videoPerSecond = readNonNegativeNumber(
+    (value as BillingRateJsonConfig).videoPerSecondUsd
+  );
+  const videoPerSecondBySize = parseVideoPerSecondRatesBySize(
+    (value as BillingRateJsonConfig).videoPerSecondUsdBySize
+  );
   const tiers = parseBillingTierSet((value as BillingRateJsonConfig).tiers);
-  if (input === undefined && output === undefined && cacheRead === undefined && cacheWrite === undefined && !tiers) {
+  if (
+    input === undefined &&
+    output === undefined &&
+    cacheRead === undefined &&
+    cacheWrite === undefined &&
+    videoPerSecond === undefined &&
+    !videoPerSecondBySize &&
+    !tiers
+  ) {
     return undefined;
   }
 
@@ -4645,11 +4721,35 @@ function parseBillingRate(value: unknown): BillingRate | undefined {
     rate.cacheWritePerMillionUsd = cacheWrite;
   }
 
+  if (videoPerSecond !== undefined) {
+    rate.videoPerSecondUsd = videoPerSecond;
+  }
+
+  if (videoPerSecondBySize) {
+    rate.videoPerSecondUsdBySize = videoPerSecondBySize;
+  }
+
   if (tiers) {
     rate.tiers = tiers;
   }
 
   return rate;
+}
+
+function parseVideoPerSecondRatesBySize(value: unknown): Record<string, number> | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+
+  const rates: Record<string, number> = {};
+  for (const [rawSize, rawRate] of Object.entries(value)) {
+    const size = rawSize.trim().toLowerCase();
+    const rate = readNonNegativeNumber(rawRate);
+    if (size && rate !== undefined) {
+      rates[size] = rate;
+    }
+  }
+  return Object.keys(rates).length > 0 ? rates : undefined;
 }
 
 function parseBillingTierSet(value: unknown): BillingRate['tiers'] | undefined {
@@ -4753,17 +4853,25 @@ function resolveDefaultTargetProviders(
     return fromEnv;
   }
 
-  return dedupeProviderTypes(providerConfigs.map((item) => providerFromProviderType(item.type)));
+  return dedupeProviderTypes(
+    providerConfigs
+      .filter((item) => !isMediaOnlyProviderType(item.type))
+      .map((item) => providerFromProviderType(item.type))
+  );
 }
 
 function findProviderConfigByType(
   providers: ProviderConfig[],
   type: Provider
 ): ProviderConfig | undefined {
-  return providers.find((item) => providerFromProviderType(item.type) === type);
+  return findDefaultProviderConfig(providers, type);
 }
 
 function resolveNonNegativeNumber(values: unknown[], fallback: number): number {
+  return resolveOptionalNonNegativeNumber(values) ?? fallback;
+}
+
+function resolveOptionalNonNegativeNumber(values: unknown[]): number | undefined {
   for (const value of values) {
     const parsed = readNonNegativeNumber(value);
     if (parsed !== undefined) {
@@ -4771,7 +4879,7 @@ function resolveNonNegativeNumber(values: unknown[], fallback: number): number {
     }
   }
 
-  return fallback;
+  return undefined;
 }
 
 function resolvePositiveNumber(values: unknown[], fallback: number): number {

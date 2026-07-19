@@ -1,4 +1,9 @@
-import type { Provider, ProviderType, StandardRequestInputMessage } from './types';
+import type {
+  Provider,
+  ProviderConfig,
+  ProviderType,
+  StandardRequestInputMessage
+} from './types';
 
 const maxErrorCauseDepth = 8;
 
@@ -48,7 +53,12 @@ export function parseProviderList(value: string | undefined): Provider[] {
 }
 
 export function providerFromProviderType(type: ProviderType): Provider {
-  if (type === 'openai_chat_completions' || type === 'openai_responses') {
+  if (
+    type === 'openai_chat_completions' ||
+    type === 'openai_responses' ||
+    type === 'openai_image_generations' ||
+    type === 'openai_video_generations'
+  ) {
     return 'openai';
   }
 
@@ -68,6 +78,24 @@ export function providerFromProviderType(type: ProviderType): Provider {
   const separatorIndex = findProviderTypeSeparatorIndex(normalized);
   const provider = separatorIndex > 0 ? normalized.slice(0, separatorIndex) : normalized;
   return isSafeProviderToken(provider) ? provider : 'unknown';
+}
+
+export function isMediaOnlyProviderType(type: ProviderType): boolean {
+  return (
+    type === 'openai_image_generations' ||
+    type === 'openai_video_generations' ||
+    type === 'xai_video_generations'
+  );
+}
+
+export function findDefaultProviderConfig(
+  providers: ProviderConfig[],
+  provider: Provider
+): ProviderConfig | undefined {
+  return providers.find(
+    (item) =>
+      providerFromProviderType(item.type) === provider && !isMediaOnlyProviderType(item.type)
+  );
 }
 
 export function isSafeProviderToken(value: string): boolean {

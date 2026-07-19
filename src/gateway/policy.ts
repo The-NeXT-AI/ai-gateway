@@ -13,6 +13,7 @@ export interface GatewayPolicyInput {
   targetProvider: Provider;
   targetProviderConfig?: ProviderConfig;
   model?: string;
+  requireKnownModel?: boolean;
 }
 
 export type GatewayPolicyResult =
@@ -99,8 +100,20 @@ function evaluatePolicyRule(
   input: GatewayPolicyInput
 ): GatewayPolicyResult {
   const rule = item.rule;
-  const providerName = input.targetProviderConfig?.name;
+  const providerName = resolvePolicyProviderName(input.targetProviderConfig);
   const model = input.model;
+
+  if (
+    input.requireKnownModel &&
+    !model &&
+    (rule.denyModels.length > 0 || rule.denyProviderModels.length > 0)
+  ) {
+    return deny(
+      input,
+      item.label,
+      'Model is missing, so model deny rules cannot be evaluated safely.'
+    );
+  }
 
   if (rule.denyProviders.includes(input.targetProvider)) {
     return deny(input, item.label, `Provider ${input.targetProvider} is denied by gateway policy.`);
@@ -148,7 +161,7 @@ function deny(input: GatewayPolicyInput, rule: string, message: string): Gateway
     message,
     details: {
       provider: input.targetProvider,
-      providerName: input.targetProviderConfig?.name,
+      providerName: resolvePolicyProviderName(input.targetProviderConfig),
       model: input.model,
       rule
     }
@@ -229,6 +242,10 @@ function escapeRegExp(value: string): string {
 }
 
 function formatProviderModel(input: GatewayPolicyInput): string {
-  const provider = input.targetProviderConfig?.name || input.targetProvider;
+  const provider = resolvePolicyProviderName(input.targetProviderConfig) || input.targetProvider;
   return `${provider}/${input.model || '<missing>'}`;
+}
+
+function resolvePolicyProviderName(providerConfig: ProviderConfig | undefined): string | undefined {
+  return providerConfig?.credentialSourceProviderName || providerConfig?.name;
 }

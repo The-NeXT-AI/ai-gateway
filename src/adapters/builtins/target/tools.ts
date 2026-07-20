@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto';
-import type { StandardResponse, StandardResponseFunctionCall } from '../../../types';
+import type {
+  StandardRequestInputContent,
+  StandardResponse,
+  StandardResponseFunctionCall
+} from '../../../types';
 import { asBoolean, asString, isObject } from '../../../utils';
 
 const maxTargetToolNameLength = 64;
@@ -13,6 +17,42 @@ export interface FlattenedStandardTool {
   description?: string;
   parameters: Record<string, unknown>;
   strict?: boolean;
+  deferLoading?: boolean;
+}
+
+type StandardToolSearchOutput = Extract<
+  StandardRequestInputContent,
+  { type: 'tool_search_output' }
+>;
+
+export function serializeStandardToolSearchOutput(item: StandardToolSearchOutput): string {
+  return JSON.stringify({
+    type: 'tool_search_output',
+    execution: item.execution,
+    ...(item.status ? { status: item.status } : {}),
+    tools: item.tools
+  });
+}
+
+export function appendToolReferencesToResultContent(
+  content: string,
+  toolReferences: string[] | undefined,
+  tools?: unknown[]
+): string {
+  if (!toolReferences || toolReferences.length === 0) {
+    return content;
+  }
+
+  const mappedNames = [
+    ...new Set(toolReferences.map((name) => mapStandardToolNameToTargetName(name, tools)))
+  ];
+  const serializedReferences = JSON.stringify(
+    mappedNames.map((toolName) => ({
+      type: 'tool_reference',
+      tool_name: toolName
+    }))
+  );
+  return content ? `${content}\n${serializedReferences}` : serializedReferences;
 }
 
 export function flattenStandardTools(tools: unknown[] | undefined): FlattenedStandardTool[] {
@@ -287,7 +327,8 @@ function mapFunctionLikeTool(
     ...(namespaceName ? { namespace: namespaceName } : {}),
     description: asString(tool.description) || asString(functionPayload?.description),
     parameters: ensureJsonSchema(tool.parameters ?? tool.input_schema ?? functionPayload?.parameters),
-    strict: asBoolean(tool.strict) ?? asBoolean(functionPayload?.strict)
+    strict: asBoolean(tool.strict) ?? asBoolean(functionPayload?.strict),
+    deferLoading: asBoolean(tool.defer_loading) ?? asBoolean(functionPayload?.defer_loading)
   };
 }
 

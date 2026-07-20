@@ -15,13 +15,15 @@ import {
   rewriteOpenAIChatCompatibleRequest
 } from './shared';
 import {
-  isAnthropicWebSearchTool,
-  isOpenAIWebSearchTool,
+  appendToolReferencesToResultContent,
   ensureJsonSchema,
   flattenStandardTools,
+  isAnthropicWebSearchTool,
+  isOpenAIWebSearchTool,
   mapStandardToolNameToTargetName,
   mapToolChoiceFunctionName,
   readToolChoiceFunctionName,
+  serializeStandardToolSearchOutput,
   splitNamespacedToolCallName
 } from './tools';
 
@@ -446,7 +448,11 @@ function standardInputToOpenAIChatMessages(
         content:
           toolResult.result_format === 'web_search'
             ? formatWebSearchResultText(toolResult.content)
-            : toolResult.content
+            : appendToolReferencesToResultContent(
+                toolResult.content,
+                toolResult.tool_references,
+                tools
+              )
       });
     }
     if (text) {
@@ -617,7 +623,11 @@ function standardInputToOpenAIResponsesInput(
       items.push({
         type: 'function_call_output',
         call_id: toolResult.tool_call_id,
-        output: toolResult.content
+        output: appendToolReferencesToResultContent(
+          toolResult.content,
+          toolResult.tool_references,
+          tools
+        )
       });
     }
   }
@@ -724,12 +734,7 @@ function collectUserToolResults(
       if (includeToolSearchOutputs) {
         toolResults.push({
           tool_call_id: item.call_id,
-          content: normalizeFunctionArguments({
-            type: 'tool_search_output',
-            execution: item.execution,
-            ...(item.status ? { status: item.status } : {}),
-            tools: item.tools
-          })
+          content: serializeStandardToolSearchOutput(item)
         });
       }
       continue;

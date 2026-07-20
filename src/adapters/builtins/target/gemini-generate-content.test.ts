@@ -308,6 +308,226 @@ describe('geminiGenerateContentTargetAdapter', () => {
     ]);
   });
 
+  it('maps native Responses tool-search history into both Gemini request formats', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gemini-2.5-flash',
+      input: [
+        {
+          type: 'tool_search_call',
+          execution: 'client',
+          call_id: 'search_123',
+          status: 'completed',
+          arguments: { query: 'calendar' }
+        },
+        {
+          type: 'tool_search_output',
+          execution: 'client',
+          call_id: 'search_123',
+          status: 'completed',
+          tools: [
+            {
+              type: 'function',
+              name: 'calendar_create',
+              defer_loading: true,
+              parameters: { type: 'object', properties: {} }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const config = {
+      geminiApiKey: 'sk-test',
+      geminiBaseUrl: 'https://mock.local',
+      geminiApiVersion: 'v1beta'
+    } as never;
+    const generated = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-flash:generateContent'
+      } as never,
+      standardRequest: parsed.value,
+      config
+    });
+    const interactions = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1/responses'
+      } as never,
+      standardRequest: parsed.value,
+      targetProviderConfig: {
+        type: 'gemini_interactions'
+      } as never,
+      config
+    });
+
+    expect(generated.ok).toBe(true);
+    expect(interactions.ok).toBe(true);
+    if (!generated.ok || !interactions.ok) {
+      return;
+    }
+
+    const serializedOutput =
+      '{"type":"tool_search_output","execution":"client","status":"completed","tools":[{"type":"function","name":"calendar_create","defer_loading":true,"parameters":{"type":"object","properties":{}}}]}';
+    expect((generated.value.body as Record<string, unknown>).contents).toEqual([
+      {
+        role: 'model',
+        parts: [
+          {
+            functionCall: {
+              id: 'search_123',
+              name: 'ToolSearch',
+              args: { query: 'calendar' }
+            }
+          }
+        ]
+      },
+      {
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              id: 'search_123',
+              name: 'ToolSearch',
+              response: { content: serializedOutput }
+            }
+          }
+        ]
+      }
+    ]);
+    expect((interactions.value.body as Record<string, unknown>).input).toEqual([
+      {
+        type: 'function_call',
+        id: 'search_123',
+        name: 'ToolSearch',
+        arguments: { query: 'calendar' }
+      },
+      {
+        type: 'function_result',
+        call_id: 'search_123',
+        name: 'ToolSearch',
+        result: [{ type: 'text', text: serializedOutput }]
+      }
+    ]);
+  });
+
+  it('preserves Anthropic tool references in both Gemini result formats', () => {
+    const parsed = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'toolu_search',
+              name: 'ToolSearch',
+              input: { query: 'calendar' }
+            }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_search',
+              content: [
+                { type: 'text', text: 'matched one tool' },
+                { type: 'tool_reference', tool_name: 'calendar_create' }
+              ]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const config = {
+      geminiApiKey: 'sk-test',
+      geminiBaseUrl: 'https://mock.local',
+      geminiApiVersion: 'v1beta'
+    } as never;
+    const generated = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-flash:generateContent'
+      } as never,
+      standardRequest: parsed.value,
+      config
+    });
+    const interactions = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1/responses'
+      } as never,
+      standardRequest: parsed.value,
+      targetProviderConfig: {
+        type: 'gemini_interactions'
+      } as never,
+      config
+    });
+
+    expect(generated.ok).toBe(true);
+    expect(interactions.ok).toBe(true);
+    if (!generated.ok || !interactions.ok) {
+      return;
+    }
+
+    const resultContent =
+      'matched one tool\n[{"type":"tool_reference","tool_name":"calendar_create"}]';
+    expect((generated.value.body as Record<string, unknown>).contents).toEqual([
+      {
+        role: 'model',
+        parts: [
+          {
+            functionCall: {
+              id: 'toolu_search',
+              name: 'ToolSearch',
+              args: { query: 'calendar' }
+            }
+          }
+        ]
+      },
+      {
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              id: 'toolu_search',
+              name: 'ToolSearch',
+              response: { content: resultContent }
+            }
+          }
+        ]
+      }
+    ]);
+    expect((interactions.value.body as Record<string, unknown>).input).toEqual([
+      {
+        type: 'function_call',
+        id: 'toolu_search',
+        name: 'ToolSearch',
+        arguments: { query: 'calendar' }
+      },
+      {
+        type: 'function_result',
+        call_id: 'toolu_search',
+        name: 'ToolSearch',
+        result: [{ type: 'text', text: resultContent }]
+      }
+    ]);
+  });
+
   it('sanitizes tool schemas to the Gemini schema subset', () => {
     const parsed = parseOpenAIResponsesRequest({
       model: 'gemini-2.5-pro',

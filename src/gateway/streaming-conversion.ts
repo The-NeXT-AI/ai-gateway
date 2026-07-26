@@ -3759,6 +3759,7 @@ function emitOpenAIResponsesFramesFromChatChunk(
 
   frames.push(...collectOpenAIChatToolCallsForOpenAIResponses(state, delta?.tool_calls, tools));
 
+  // OpenAI chat streams can send finish_reason before the usage-only final chunk.
   if (state.finishReason && usage) {
     frames.push(...finalizeOpenAIResponsesRelay(state));
   }
@@ -4523,7 +4524,7 @@ function emitAnthropicFramesFromOpenAIChatChunk(
   frames.push(...emitAnthropicContentDelta(state, 'text', deltaText));
   frames.push(...collectOpenAIChatToolCalls(state, delta?.tool_calls));
 
-  if (finishReason) {
+  if (state.finishReason && usage) {
     frames.push(...flushPendingAnthropicToolCalls(state));
     frames.push(...finalizeAnthropicRelay(state));
   }

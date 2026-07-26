@@ -2954,6 +2954,62 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('streams chat/completions usage-only final chunk as Anthropic message_delta usage', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'data: {"id":"chatcmpl_late_usage","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"hello"}}]}\n\n',
+        'data: {"id":"chatcmpl_late_usage","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+        'data: {"id":"chatcmpl_late_usage","object":"chat.completion.chunk","model":"glm-5","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5,"prompt_tokens_details":{"cached_tokens":2}}}\n\n',
+        'data: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const messageDeltaLine = response.body
+        .split('\n')
+        .find((line) => line.startsWith('data: ') && line.includes('"type":"message_delta"'));
+      expect(messageDeltaLine).toBeDefined();
+      const messageDelta = JSON.parse(String(messageDeltaLine).slice('data: '.length));
+      expect(messageDelta.delta).toMatchObject({
+        stop_reason: 'end_turn',
+        stop_sequence: null
+      });
+      expect(messageDelta.usage).toMatchObject({
+        input_tokens: 4,
+        output_tokens: 1,
+        cache_read_input_tokens: 2
+      });
+      expect(response.body).toContain('event: message_stop');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('defaults Responses completed usage when chat/completions stream omits usage', async () => {
     const fetchMock = vi.fn(async () => {
       return createSseResponse([

@@ -5,14 +5,34 @@ import { buildAnthropicHeaders } from '../common';
 import { parseAnthropicToStandardResponse } from './shared';
 import {
   anthropicWebSearchToolType,
+  appendToolReferencesToResultContent,
+  ensureJsonSchema,
   flattenStandardTools,
   isAnthropicWebSearchTool,
   isOpenAIWebSearchTool,
   mapStandardToolNameToTargetName,
-  mapToolChoiceFunctionName
+  mapToolChoiceFunctionName,
+  serializeStandardToolSearchOutput
 } from './tools';
 
 const defaultAnthropicMaxTokens = 1024;
+
+type StandardToolSearchOutput = Extract<
+  StandardRequestInputContent,
+  { type: 'tool_search_output' }
+>;
+
+interface AnthropicToolContext {
+  tools: unknown[] | undefined;
+  functionTools: unknown[] | undefined;
+  deferredTargetNames: Set<string>;
+  toolSearchReferences: Map<StandardToolSearchOutput, string[]>;
+}
+
+interface DeferredToolDefinition {
+  signature: string;
+  deferLoading: boolean;
+}
 
 export const anthropicMessagesTargetAdapter: TargetAdapter = {
   provider: 'anthropic',
@@ -27,7 +47,16 @@ export const anthropicMessagesTargetAdapter: TargetAdapter = {
       return headersResult;
     }
 
-    const messages = standardInputToAnthropicMessages(input.standardRequest.input, input.standardRequest.tools);
+    const toolsDisabled = isAnthropicToolChoiceNone(input.standardRequest.tool_choice);
+    const toolContext = buildAnthropicToolContext(
+      input.standardRequest.input,
+      input.standardRequest.tools,
+      !toolsDisabled
+    );
+    const messages = standardInputToAnthropicMessages(
+      input.standardRequest.input,
+      toolContext
+    );
     const body: Record<string, unknown> = {
       model: input.standardRequest.model,
       messages: messages.length > 0 ? messages : [{ role: 'user', content: [{ type: 'text', text: '' }] }],
@@ -56,8 +85,7 @@ export const anthropicMessagesTargetAdapter: TargetAdapter = {
       body.stream = input.standardRequest.stream;
     }
 
-    const toolsDisabled = isAnthropicToolChoiceNone(input.standardRequest.tool_choice);
-    const tools = toolsDisabled ? undefined : mapStandardToolsToAnthropicTools(input.standardRequest.tools);
+    const tools = toolsDisabled ? undefined : mapStandardToolsToAnthropicTools(toolContext.tools);
     if (tools) {
       body.tools = tools;
     }
@@ -66,7 +94,7 @@ export const anthropicMessagesTargetAdapter: TargetAdapter = {
       ? undefined
       : mapStandardToolChoiceToAnthropicToolChoice(
           input.standardRequest.tool_choice,
-          input.standardRequest.tools
+          toolContext.functionTools
         );
     if (toolChoice !== undefined) {
       body.tool_choice = toolChoice;
@@ -83,13 +111,190 @@ export const anthropicMessagesTargetAdapter: TargetAdapter = {
   }
 };
 
+function buildAnthropicToolContext(
+  input: string | StandardRequestInputMessage[],
+  configuredTools: unknown[] | undefined,
+  nativeReferencesEnabled: boolean
+): AnthropicToolContext {
+  const effectiveTools = [...(configuredTools ?? [])];
+  const reservedTargetNames = anthropicSpecialToolTargetNames(configuredTools);
+  const definitions = new Map<string, DeferredToolDefinition | null>();
+  for (const tool of flattenAnthropicFunctionTools(configuredTools)) {
+    if (definitions.has(tool.name)) {
+      definitions.set(tool.name, null);
+      continue;
+    }
+    definitions.set(tool.name, {
+      signature: deferredToolDefinitionSignature(tool),
+      deferLoading: tool.deferLoading === true
+    });
+  }
+
+  const pendingReferences = new Map<StandardToolSearchOutput, string[]>();
+  if (nativeReferencesEnabled) {
+    for (const message of collectStandardInputMessages(input)) {
+      for (const item of message.content) {
+        if (
+          item.type !== 'tool_search_output' ||
+          (item.status !== undefined && item.status !== 'completed')
+        ) {
+          continue;
+        }
+
+        const candidates = new Map<
+          string,
+          { tool: Record<string, unknown>; definition: DeferredToolDefinition }
+        >();
+        let valid = item.tools.length > 0;
+        for (const rawTool of item.tools) {
+          if (!isObject(rawTool) || isAnthropicSpecialTool(rawTool)) {
+            valid = false;
+            break;
+          }
+
+          const flattened = flattenAnthropicFunctionTools([rawTool]);
+          if (flattened.length !== 1) {
+            valid = false;
+            break;
+          }
+
+          const flattenedTool = flattened[0];
+          if (reservedTargetNames.has(flattenedTool.targetName)) {
+            valid = false;
+            break;
+          }
+          const definition = {
+            signature: deferredToolDefinitionSignature(flattenedTool),
+            deferLoading: true
+          };
+          const duplicate = candidates.get(flattenedTool.name);
+          if (duplicate && duplicate.definition.signature !== definition.signature) {
+            valid = false;
+            break;
+          }
+          candidates.set(flattenedTool.name, { tool: rawTool, definition });
+        }
+
+        if (!valid) {
+          continue;
+        }
+
+        for (const [name, candidate] of candidates) {
+          if (!definitions.has(name)) {
+            continue;
+          }
+          const existing = definitions.get(name);
+          if (
+            !existing ||
+            existing.signature !== candidate.definition.signature ||
+            !existing.deferLoading
+          ) {
+            valid = false;
+            break;
+          }
+        }
+
+        if (!valid) {
+          continue;
+        }
+
+        for (const [name, candidate] of candidates) {
+          if (!definitions.has(name)) {
+            effectiveTools.push({ ...candidate.tool, defer_loading: true });
+            definitions.set(name, candidate.definition);
+          }
+        }
+        pendingReferences.set(item, [...candidates.keys()]);
+      }
+    }
+  }
+
+  const functionTools = effectiveTools.filter((tool) => !isAnthropicSpecialTool(tool));
+  const flattenedTools = flattenStandardTools(functionTools);
+  const targetNameByName = new Map<string, string>();
+  const deferredTargetNames = new Set<string>();
+  for (const tool of flattenedTools) {
+    if (!targetNameByName.has(tool.name)) {
+      targetNameByName.set(tool.name, tool.targetName);
+    }
+    if (tool.deferLoading === true) {
+      deferredTargetNames.add(tool.targetName);
+    }
+  }
+  for (const tool of effectiveTools) {
+    if (!isObject(tool) || tool.defer_loading !== true) {
+      continue;
+    }
+    const mappedWebSearchTool = mapStandardWebSearchToolToAnthropicTool(tool);
+    const mappedName = mappedWebSearchTool && asString(mappedWebSearchTool.name);
+    if (mappedName) {
+      deferredTargetNames.add(mappedName);
+    }
+  }
+
+  const toolSearchReferences = new Map<StandardToolSearchOutput, string[]>();
+  for (const [item, names] of pendingReferences) {
+    const targetNames = names.map((name) => targetNameByName.get(name));
+    if (
+      targetNames.every(
+        (name): name is string => Boolean(name && deferredTargetNames.has(name))
+      )
+    ) {
+      toolSearchReferences.set(item, targetNames);
+    }
+  }
+
+  return {
+    tools: effectiveTools.length > 0 ? effectiveTools : undefined,
+    functionTools: functionTools.length > 0 ? functionTools : undefined,
+    deferredTargetNames,
+    toolSearchReferences
+  };
+}
+
+function deferredToolDefinitionSignature(tool: {
+  parameters: Record<string, unknown>;
+  strict?: boolean;
+}): string {
+  return JSON.stringify({
+    parameters: tool.parameters,
+    strict: tool.strict ?? null
+  });
+}
+
+function isAnthropicSpecialTool(tool: unknown): boolean {
+  return (
+    isStandardToolSearchDeclaration(tool) ||
+    isAnthropicWebSearchTool(tool) ||
+    isOpenAIWebSearchTool(tool)
+  );
+}
+
+function anthropicSpecialToolTargetNames(tools: unknown[] | undefined): Set<string> {
+  const names = new Set<string>();
+  for (const tool of tools ?? []) {
+    const mapped =
+      mapStandardToolSearchToAnthropicTool(tool) ??
+      mapStandardWebSearchToolToAnthropicTool(tool);
+    const name = mapped && asString(mapped.name);
+    if (name) {
+      names.add(name);
+    }
+  }
+  return names;
+}
+
+function flattenAnthropicFunctionTools(tools: unknown[] | undefined) {
+  return flattenStandardTools((tools ?? []).filter((tool) => !isAnthropicSpecialTool(tool)));
+}
+
 function standardInputToAnthropicMessages(
   input: string | StandardRequestInputMessage[],
-  tools?: unknown[]
+  toolContext: AnthropicToolContext
 ): Array<Record<string, unknown>> {
   const messages: Array<Record<string, unknown>> = [];
   for (const message of collectStandardInputMessages(input)) {
-    const content = standardContentToAnthropicBlocks(message.content, tools);
+    const content = standardContentToAnthropicBlocks(message.content, toolContext);
     if (content.length === 0) {
       continue;
     }
@@ -105,7 +310,7 @@ function standardInputToAnthropicMessages(
 
 function standardContentToAnthropicBlocks(
   content: StandardRequestInputContent[],
-  tools?: unknown[]
+  toolContext: AnthropicToolContext
 ): Array<Record<string, unknown>> {
   const blocks: Array<Record<string, unknown>> = [];
   for (const item of content) {
@@ -126,8 +331,32 @@ function standardContentToAnthropicBlocks(
       blocks.push({
         type: 'tool_use',
         id: item.id,
-        name: mapStandardToolNameToTargetName(item.name, tools),
+        name: mapStandardToolNameToTargetName(item.name, toolContext.functionTools),
         input: isObject(item.input) ? item.input : {}
+      });
+      continue;
+    }
+
+    if (item.type === 'tool_search_call') {
+      blocks.push({
+        type: 'tool_use',
+        id: item.call_id,
+        name: 'ToolSearch',
+        input: normalizeAnthropicToolInput(item.arguments)
+      });
+      continue;
+    }
+
+    if (item.type === 'tool_search_output') {
+      const referenceNames = toolContext.toolSearchReferences.get(item) ?? [];
+      const references = referenceNames.map((toolName) => ({
+        type: 'tool_reference',
+        tool_name: toolName
+      }));
+      blocks.push({
+        type: 'tool_result',
+        tool_use_id: item.call_id,
+        content: references.length > 0 ? references : serializeStandardToolSearchOutput(item)
       });
       continue;
     }
@@ -141,10 +370,36 @@ function standardContentToAnthropicBlocks(
       continue;
     }
 
+    const referenceNames = [
+      ...new Set(
+        (item.tool_references ?? []).map((name) =>
+          mapStandardToolNameToTargetName(name, toolContext.functionTools)
+        )
+      )
+    ];
+    const canUseNativeReferences =
+      referenceNames.length > 0 &&
+      referenceNames.every((name) => toolContext.deferredTargetNames.has(name));
+    const referenceBlocks = canUseNativeReferences
+      ? referenceNames.map((toolName) => ({
+          type: 'tool_reference',
+          tool_name: toolName
+        }))
+      : [];
     const toolResultBlock: Record<string, unknown> = {
       type: 'tool_result',
       tool_use_id: item.tool_use_id,
-      content: item.content
+      content:
+        referenceBlocks.length > 0
+          ? [
+              ...(item.content ? [{ type: 'text', text: item.content }] : []),
+              ...referenceBlocks
+            ]
+          : appendToolReferencesToResultContent(
+              item.content,
+              item.tool_references,
+              toolContext.functionTools
+            )
     };
     if (item.is_error !== undefined) {
       toolResultBlock.is_error = item.is_error;
@@ -153,6 +408,25 @@ function standardContentToAnthropicBlocks(
   }
 
   return blocks;
+}
+
+function normalizeAnthropicToolInput(value: unknown): Record<string, unknown> {
+  if (isObject(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (isObject(parsed)) {
+        return parsed;
+      }
+    } catch {
+      return {};
+    }
+  }
+
+  return {};
 }
 
 function standardReasoningToAnthropicBlocks(
@@ -241,14 +515,26 @@ function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Arra
 
 function mapStandardToolsToAnthropicTools(tools: unknown[] | undefined): Record<string, unknown>[] | undefined {
   const mapped: Record<string, unknown>[] = [];
+  const flattenedTools = flattenAnthropicFunctionTools(tools);
+  let flattenedOffset = 0;
   for (const tool of tools || []) {
+    const toolSearchTool = mapStandardToolSearchToAnthropicTool(tool);
+    if (toolSearchTool) {
+      mapped.push(toolSearchTool);
+      continue;
+    }
+
     const webSearchTool = mapStandardWebSearchToolToAnthropicTool(tool);
     if (webSearchTool) {
       mapped.push(webSearchTool);
       continue;
     }
 
-    for (const flattenedTool of flattenStandardTools([tool])) {
+    const flattenedCount = flattenAnthropicFunctionTools([tool]).length;
+    for (const flattenedTool of flattenedTools.slice(
+      flattenedOffset,
+      flattenedOffset + flattenedCount
+    )) {
       const mappedTool: Record<string, unknown> = {
         name: flattenedTool.targetName,
         input_schema: flattenedTool.parameters
@@ -256,11 +542,39 @@ function mapStandardToolsToAnthropicTools(tools: unknown[] | undefined): Record<
       if (flattenedTool.description) {
         mappedTool.description = flattenedTool.description;
       }
+      if (flattenedTool.deferLoading === true) {
+        mappedTool.defer_loading = true;
+      }
 
       mapped.push(mappedTool);
     }
+    flattenedOffset += flattenedCount;
   }
   return mapped.length > 0 ? mapped : undefined;
+}
+
+function isStandardToolSearchDeclaration(tool: unknown): tool is Record<string, unknown> {
+  return (
+    isObject(tool) &&
+    asString(tool.type) === 'tool_search' &&
+    (tool.execution === undefined || tool.execution === 'client')
+  );
+}
+
+function mapStandardToolSearchToAnthropicTool(tool: unknown): Record<string, unknown> | null {
+  if (!isStandardToolSearchDeclaration(tool)) {
+    return null;
+  }
+
+  const mapped: Record<string, unknown> = {
+    name: 'ToolSearch',
+    input_schema: ensureJsonSchema(tool.parameters ?? tool.input_schema)
+  };
+  const description = asString(tool.description);
+  if (description) {
+    mapped.description = description;
+  }
+  return mapped;
 }
 
 function mapStandardWebSearchToolToAnthropicTool(tool: unknown): Record<string, unknown> | null {
@@ -278,7 +592,8 @@ function mapStandardWebSearchToolToAnthropicTool(tool: unknown): Record<string, 
       'allowed_domains',
       'blocked_domains',
       'user_location',
-      'cache_control'
+      'cache_control',
+      'defer_loading'
     ]);
     return mapped;
   }
@@ -302,6 +617,9 @@ function mapStandardWebSearchToolToAnthropicTool(tool: unknown): Record<string, 
   }
   if (tool.user_location !== undefined) {
     mapped.user_location = tool.user_location;
+  }
+  if (tool.defer_loading !== undefined) {
+    mapped.defer_loading = tool.defer_loading;
   }
 
   return mapped;

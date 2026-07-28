@@ -1790,6 +1790,171 @@ describe('openAIResponsesTargetAdapter', () => {
     expect((built.value.body as Record<string, unknown>).reasoning_split).toBeUndefined();
   });
 
+  it('translates native client tool search history when targeting OpenAI chat', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gpt-5.6',
+      tools: [
+        {
+          type: 'tool_search',
+          execution: 'client',
+          parameters: {
+            type: 'object',
+            properties: { query: { type: 'string' } }
+          }
+        },
+        {
+          type: 'function',
+          name: 'calendar_create',
+          defer_loading: true,
+          parameters: { type: 'object', properties: {} }
+        }
+      ],
+      input: [
+        {
+          type: 'tool_search_call',
+          execution: 'client',
+          call_id: 'search_123',
+          status: 'completed',
+          arguments: { query: 'calendar' }
+        },
+        {
+          type: 'tool_search_output',
+          execution: 'client',
+          call_id: 'search_123',
+          status: 'completed',
+          tools: [
+            {
+              type: 'function',
+              name: 'calendar_create',
+              defer_loading: true,
+              parameters: { type: 'object', properties: {} }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        type: 'openai_chat_completions'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.messages).toEqual([
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            id: 'search_123',
+            type: 'function',
+            function: {
+              name: 'ToolSearch',
+              arguments: '{"query":"calendar"}'
+            }
+          }
+        ]
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'search_123',
+        content:
+          '{"type":"tool_search_output","execution":"client","status":"completed","tools":[{"type":"function","name":"calendar_create","defer_loading":true,"parameters":{"type":"object","properties":{}}}]}'
+      }
+    ]);
+  });
+
+  it('preserves Anthropic tool references when targeting OpenAI chat', () => {
+    const parsed = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'toolu_search',
+              name: 'ToolSearch',
+              input: { query: 'calendar' }
+            }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_search',
+              content: [{ type: 'tool_reference', tool_name: 'calendar_create' }]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        type: 'openai_chat_completions'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).messages).toEqual([
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            id: 'toolu_search',
+            type: 'function',
+            function: {
+              name: 'ToolSearch',
+              arguments: '{"query":"calendar"}'
+            }
+          }
+        ]
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'toolu_search',
+        content: '[{"type":"tool_reference","tool_name":"calendar_create"}]'
+      }
+    ]);
+  });
+
   it('flattens OpenAI Responses namespace tools when targeting OpenAI chat', () => {
     const parsed = parseOpenAIResponsesRequest({
       model: 'gpt-5.4',
@@ -1929,6 +2094,899 @@ describe('openAIResponsesTargetAdapter', () => {
 
     const body = built.value.body as Record<string, unknown>;
     expect(body).not.toHaveProperty('tools');
+  });
+
+  it('translates Claude deferred tool discovery into client-executed tool search', () => {
+    const parsed = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 256,
+      tools: [
+        {
+          name: 'ToolSearch',
+          description: 'Find tools needed for the current task.',
+          input_schema: {
+            type: 'object',
+            properties: { query: { type: 'string' } },
+            required: ['query'],
+            additionalProperties: false
+          }
+        },
+        {
+          name: 'calendar_create',
+          description: 'Create a calendar event.',
+          defer_loading: true,
+          input_schema: {
+            type: 'object',
+            properties: { title: { type: 'string' } },
+            required: ['title'],
+            additionalProperties: false
+          }
+        },
+        {
+          name: 'get_time',
+          description: 'Get the current time.',
+          input_schema: {
+            type: 'object',
+            properties: {}
+          }
+        }
+      ],
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'toolu_search',
+              name: 'ToolSearch',
+              input: { query: 'calendar create' }
+            }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_search',
+              content: [
+                { type: 'tool_reference', tool_name: 'calendar_create' },
+                { type: 'text', text: 'tool loaded' }
+              ]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.tools).toEqual([
+      {
+        type: 'tool_search',
+        execution: 'client',
+        description: 'Find tools needed for the current task.',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+          required: ['query'],
+          additionalProperties: false
+        }
+      },
+      {
+        type: 'function',
+        name: 'get_time',
+        description: 'Get the current time.',
+        parameters: {
+          type: 'object',
+          properties: {}
+        }
+      }
+    ]);
+    expect(body.input).toEqual([
+      {
+        type: 'tool_search_call',
+        execution: 'client',
+        call_id: 'toolu_search',
+        status: 'completed',
+        arguments: { query: 'calendar create' }
+      },
+      {
+        type: 'tool_search_output',
+        execution: 'client',
+        call_id: 'toolu_search',
+        status: 'completed',
+        tools: [
+          {
+            type: 'function',
+            name: 'calendar_create',
+            description: 'Create a calendar event.',
+            defer_loading: true,
+            parameters: {
+              type: 'object',
+              properties: { title: { type: 'string' } },
+              required: ['title'],
+              additionalProperties: false
+            }
+          }
+        ]
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'tool loaded' }]
+      }
+    ]);
+  });
+
+  it('falls back atomically when deferred discovery call IDs are ambiguous', () => {
+    const standardRequest = {
+      model: 'claude-sonnet-4-5',
+      tools: [
+        {
+          name: 'ToolSearch',
+          input_schema: { type: 'object', properties: {} }
+        },
+        {
+          name: 'calendar_create',
+          defer_loading: true,
+          input_schema: { type: 'object', properties: {} }
+        }
+      ],
+      input: [
+        {
+          type: 'message' as const,
+          role: 'assistant' as const,
+          content: [
+            {
+              type: 'tool_use' as const,
+              id: 'toolu_duplicate',
+              name: 'ToolSearch',
+              input: { query: 'calendar' }
+            },
+            {
+              type: 'tool_use' as const,
+              id: 'toolu_duplicate',
+              name: 'ToolSearch',
+              input: { query: 'calendar create' }
+            }
+          ]
+        },
+        {
+          type: 'message' as const,
+          role: 'user' as const,
+          content: [
+            {
+              type: 'tool_result' as const,
+              tool_use_id: 'toolu_duplicate',
+              content: '',
+              tool_references: ['calendar_create']
+            }
+          ]
+        }
+      ]
+    };
+
+    const body = buildOpenAIResponsesBodyFromStandardRequest(standardRequest);
+
+    expect(body.tools).toEqual([
+      {
+        type: 'function',
+        name: 'ToolSearch',
+        parameters: { type: 'object', properties: {} }
+      },
+      {
+        type: 'function',
+        name: 'calendar_create',
+        parameters: { type: 'object', properties: {} }
+      }
+    ]);
+    expect(JSON.stringify(body.input)).not.toContain('tool_search_call');
+    expect(JSON.stringify(body.input)).not.toContain('tool_search_output');
+    expect(JSON.stringify(body.input)).toContain(
+      '[{\\"type\\":\\"tool_reference\\",\\"tool_name\\":\\"calendar_create\\"}]'
+    );
+  });
+
+  it('falls back atomically when deferred tool definitions are ambiguous', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'claude-sonnet-4-5',
+      tools: [
+        {
+          name: 'ToolSearch',
+          input_schema: { type: 'object', properties: {} }
+        },
+        {
+          name: 'calendar_create',
+          description: 'First definition.',
+          defer_loading: true,
+          input_schema: { type: 'object', properties: {} }
+        },
+        {
+          name: 'calendar_create',
+          description: 'Conflicting definition.',
+          defer_loading: true,
+          input_schema: { type: 'object', properties: {} }
+        }
+      ],
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] }]
+    });
+
+    expect(Array.isArray(body.tools)).toBe(true);
+    expect(body.tools).toHaveLength(3);
+    expect(JSON.stringify(body.tools)).not.toContain('tool_search');
+  });
+
+  it('keeps native search choices coherent with the advertised tools', () => {
+    const tools = [
+      {
+        name: 'ToolSearch',
+        input_schema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'calendar_create',
+        defer_loading: true,
+        input_schema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'get_time',
+        input_schema: { type: 'object', properties: {} }
+      }
+    ];
+    const input = [
+      {
+        type: 'message' as const,
+        role: 'user' as const,
+        content: [{ type: 'input_text' as const, text: 'hello' }]
+      }
+    ];
+
+    const forcedSearch = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'claude-sonnet-4-5',
+      tools,
+      tool_choice: { type: 'tool', name: 'ToolSearch' },
+      input
+    });
+    expect(forcedSearch.tool_choice).toEqual({ type: 'tool_search' });
+    expect(forcedSearch.tools).toEqual([
+      { type: 'tool_search', execution: 'client', parameters: { type: 'object', properties: {} } },
+      { type: 'function', name: 'get_time', parameters: { type: 'object', properties: {} } }
+    ]);
+
+    const forcedDeferred = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'claude-sonnet-4-5',
+      tools,
+      tool_choice: { type: 'tool', name: 'calendar_create' },
+      input
+    });
+    expect(forcedDeferred.tool_choice).toEqual({ type: 'function', name: 'calendar_create' });
+    expect(forcedDeferred.tools).toHaveLength(3);
+    expect(JSON.stringify(forcedDeferred.tools)).not.toContain('"type":"tool_search"');
+
+    const forcedEager = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'claude-sonnet-4-5',
+      tools,
+      tool_choice: { type: 'tool', name: 'get_time' },
+      input
+    });
+    expect(forcedEager.tool_choice).toEqual({ type: 'function', name: 'get_time' });
+    expect(JSON.stringify(forcedEager.tools)).toContain('"type":"tool_search"');
+  });
+
+  it('falls back when a search call ID is shared with an ordinary tool call', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'claude-sonnet-4-5',
+      tools: [
+        { name: 'ToolSearch', input_schema: { type: 'object', properties: {} } },
+        {
+          name: 'calendar_create',
+          defer_loading: true,
+          input_schema: { type: 'object', properties: {} }
+        },
+        { name: 'lookup', input_schema: { type: 'object', properties: {} } }
+      ],
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'shared_id', name: 'ToolSearch', input: { query: 'calendar' } },
+            { type: 'tool_use', id: 'shared_id', name: 'lookup', input: {} }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'shared_id',
+              content: '',
+              tool_references: ['calendar_create']
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(body.tools).toHaveLength(3);
+    expect(JSON.stringify(body.input)).not.toContain('tool_search_call');
+    expect(JSON.stringify(body.input)).not.toContain('tool_search_output');
+  });
+
+  it('falls back when a search result precedes its call', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'claude-sonnet-4-5',
+      tools: [
+        { name: 'ToolSearch', input_schema: { type: 'object', properties: {} } },
+        {
+          name: 'calendar_create',
+          defer_loading: true,
+          input_schema: { type: 'object', properties: {} }
+        }
+      ],
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'search_1',
+              content: '',
+              tool_references: ['calendar_create']
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'search_1', name: 'ToolSearch', input: { query: 'calendar' } }
+          ]
+        }
+      ]
+    });
+
+    expect(body.tools).toHaveLength(2);
+    expect(JSON.stringify(body.input)).not.toContain('tool_search_call');
+    expect(JSON.stringify(body.input)).not.toContain('tool_search_output');
+  });
+
+  it('falls back when a deferred function call precedes its discovery output', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'claude-sonnet-4-5',
+      tools: [
+        { name: 'ToolSearch', input_schema: { type: 'object', properties: {} } },
+        {
+          name: 'calendar_create',
+          defer_loading: true,
+          input_schema: { type: 'object', properties: {} }
+        }
+      ],
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'calendar_before_discovery',
+              name: 'calendar_create',
+              input: { title: 'Planning' }
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'calendar_before_discovery',
+              content: 'created'
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'search_after_call',
+              name: 'ToolSearch',
+              input: { query: 'calendar' }
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'search_after_call',
+              content: '',
+              tool_references: ['calendar_create']
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(body.tools).toEqual([
+      { type: 'function', name: 'ToolSearch', parameters: { type: 'object', properties: {} } },
+      {
+        type: 'function',
+        name: 'calendar_create',
+        parameters: { type: 'object', properties: {} }
+      }
+    ]);
+    expect(body.input).toEqual([
+      {
+        type: 'function_call',
+        call_id: 'calendar_before_discovery',
+        name: 'calendar_create',
+        arguments: '{"title":"Planning"}'
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'calendar_before_discovery',
+        output: 'created'
+      },
+      {
+        type: 'function_call',
+        call_id: 'search_after_call',
+        name: 'ToolSearch',
+        arguments: '{"query":"calendar"}'
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'search_after_call',
+        output: '[{"type":"tool_reference","tool_name":"calendar_create"}]'
+      }
+    ]);
+  });
+
+  it('keeps native tool search when deferred function calls follow discovery', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'claude-sonnet-4-5',
+      tools: [
+        { name: 'ToolSearch', input_schema: { type: 'object', properties: {} } },
+        {
+          name: 'calendar_create',
+          description: 'Create a calendar event.',
+          defer_loading: true,
+          input_schema: { type: 'object', properties: {} }
+        }
+      ],
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'search_before_call',
+              name: 'ToolSearch',
+              input: { query: 'calendar' }
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'search_before_call',
+              content: '',
+              tool_references: ['calendar_create']
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'calendar_after_discovery',
+              name: 'calendar_create',
+              input: { title: 'Planning' }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(body.tools).toEqual([
+      {
+        type: 'tool_search',
+        execution: 'client',
+        parameters: { type: 'object', properties: {} }
+      }
+    ]);
+    expect(body.input).toEqual([
+      {
+        type: 'tool_search_call',
+        execution: 'client',
+        call_id: 'search_before_call',
+        status: 'completed',
+        arguments: { query: 'calendar' }
+      },
+      {
+        type: 'tool_search_output',
+        execution: 'client',
+        call_id: 'search_before_call',
+        status: 'completed',
+        tools: [
+          {
+            type: 'function',
+            name: 'calendar_create',
+            description: 'Create a calendar event.',
+            parameters: { type: 'object', properties: {} },
+            defer_loading: true
+          }
+        ]
+      },
+      {
+        type: 'function_call',
+        call_id: 'calendar_after_discovery',
+        name: 'calendar_create',
+        arguments: '{"title":"Planning"}'
+      }
+    ]);
+  });
+
+  it('falls back when eager and deferred tools share a name', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'claude-sonnet-4-5',
+      tools: [
+        { name: 'ToolSearch', input_schema: { type: 'object', properties: {} } },
+        { name: 'calendar_create', input_schema: { type: 'object', properties: { eager: { type: 'boolean' } } } },
+        {
+          name: 'calendar_create',
+          defer_loading: true,
+          input_schema: { type: 'object', properties: { deferred: { type: 'boolean' } } }
+        }
+      ],
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] }]
+    });
+
+    expect(body.tools).toHaveLength(3);
+    expect(JSON.stringify(body.tools)).not.toContain('"type":"tool_search"');
+  });
+
+  it('keeps deferred hosted tools eager while translating their search history', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'claude-sonnet-4-5',
+      tools: [
+        { name: 'ToolSearch', input_schema: { type: 'object', properties: {} } },
+        { type: 'web_search_20250305', name: 'web_search', defer_loading: true }
+      ],
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'search_web', name: 'ToolSearch', input: { query: 'news' } }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'search_web',
+              content: '',
+              tool_references: ['web_search']
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(body.tools).toEqual([
+      { type: 'tool_search', execution: 'client', parameters: { type: 'object', properties: {} } },
+      { type: 'web_search' }
+    ]);
+    expect(body.input).toEqual([
+      {
+        type: 'tool_search_call',
+        execution: 'client',
+        call_id: 'search_web',
+        status: 'completed',
+        arguments: { query: 'news' }
+      },
+      {
+        type: 'tool_search_output',
+        execution: 'client',
+        call_id: 'search_web',
+        status: 'completed',
+        tools: []
+      }
+    ]);
+  });
+
+  it('forces deferred hosted tools through a compatible advertised choice', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest({
+      model: 'claude-sonnet-4-5',
+      tools: [
+        { name: 'ToolSearch', input_schema: { type: 'object', properties: {} } },
+        { type: 'web_search_20250305', name: 'web_search', defer_loading: true }
+      ],
+      tool_choice: { type: 'tool', name: 'web_search' },
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'find current news' }]
+        }
+      ]
+    });
+
+    expect(body.tools).toEqual([
+      { type: 'function', name: 'ToolSearch', parameters: { type: 'object', properties: {} } },
+      { type: 'web_search' }
+    ]);
+    expect(body.tool_choice).toEqual({
+      type: 'allowed_tools',
+      mode: 'required',
+      tools: [{ type: 'web_search' }]
+    });
+    expect(body.tool_choice).not.toEqual({ type: 'function', name: 'web_search' });
+  });
+
+  it('preserves native client tool search during Responses-to-Responses routing', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gpt-5.6',
+      tools: [
+        {
+          type: 'tool_search',
+          execution: 'client',
+          description: 'Find a matching tool.',
+          parameters: {
+            type: 'object',
+            properties: { query: { type: 'string' } }
+          }
+        }
+      ],
+      input: [
+        {
+          type: 'tool_search_call',
+          execution: 'client',
+          call_id: 'search_123',
+          status: 'completed',
+          arguments: { query: 'calendar' }
+        },
+        {
+          type: 'tool_search_output',
+          execution: 'client',
+          call_id: 'search_123',
+          status: 'completed',
+          tools: [
+            {
+              type: 'function',
+              name: 'calendar_create',
+              description: 'Create an event.',
+              defer_loading: true,
+              parameters: { type: 'object', properties: {} }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const body = buildOpenAIResponsesBodyFromStandardRequest(parsed.value);
+    expect(body.tools).toEqual([
+      {
+        type: 'tool_search',
+        execution: 'client',
+        description: 'Find a matching tool.',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string' } }
+        }
+      }
+    ]);
+    expect(body.input).toEqual([
+      {
+        type: 'tool_search_call',
+        execution: 'client',
+        call_id: 'search_123',
+        status: 'completed',
+        arguments: { query: 'calendar' }
+      },
+      {
+        type: 'tool_search_output',
+        execution: 'client',
+        call_id: 'search_123',
+        status: 'completed',
+        tools: [
+          {
+            type: 'function',
+            name: 'calendar_create',
+            description: 'Create an event.',
+            defer_loading: true,
+            parameters: { type: 'object', properties: {} }
+          }
+        ]
+      }
+    ]);
+  });
+
+  it('preserves deferred flags for native Responses tool search declarations', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gpt-5.6',
+      input: 'Find calendar tools',
+      tools: [
+        {
+          type: 'function',
+          name: 'calendar_create',
+          defer_loading: true,
+          parameters: { type: 'object', properties: {} }
+        },
+        {
+          type: 'namespace',
+          name: 'calendar',
+          tools: [
+            {
+              type: 'function',
+              name: 'delete',
+              defer_loading: true,
+              parameters: { type: 'object', properties: {} }
+            },
+            {
+              type: 'function',
+              name: 'list',
+              parameters: { type: 'object', properties: {} }
+            }
+          ]
+        },
+        {
+          type: 'tool_search',
+          execution: 'client',
+          parameters: {
+            type: 'object',
+            properties: { query: { type: 'string' } }
+          }
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const body = buildOpenAIResponsesBodyFromStandardRequest(parsed.value);
+    expect(body.tools).toEqual([
+      {
+        type: 'function',
+        name: 'calendar_create',
+        parameters: { type: 'object', properties: {} },
+        defer_loading: true
+      },
+      {
+        type: 'namespace',
+        name: 'calendar',
+        tools: [
+          {
+            type: 'function',
+            name: 'delete',
+            parameters: { type: 'object', properties: {} },
+            defer_loading: true
+          },
+          {
+            type: 'function',
+            name: 'list',
+            parameters: { type: 'object', properties: {} }
+          }
+        ]
+      },
+      {
+        type: 'tool_search',
+        execution: 'client',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string' } }
+        }
+      }
+    ]);
+  });
+
+  it('parses client tool search calls as Claude ToolSearch requests', () => {
+    const parsed = openAIResponsesTargetAdapter.toStandardResponse({
+      id: 'resp_tool_search',
+      model: 'gpt-5.6',
+      output: [
+        {
+          type: 'tool_search_call',
+          execution: 'client',
+          call_id: 'toolu_search',
+          status: 'completed',
+          arguments: { query: 'calendar create' }
+        }
+      ],
+      usage: {
+        input_tokens: 10,
+        output_tokens: 4,
+        total_tokens: 14
+      }
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    expect(parsed.value.output).toEqual([
+      {
+        type: 'function_call',
+        id: 'toolu_search',
+        call_id: 'toolu_search',
+        name: 'ToolSearch',
+        arguments: '{"query":"calendar create"}',
+        status: 'completed'
+      }
+    ]);
+  });
+
+  it('does not promote incomplete client tool search calls to executable calls', () => {
+    const parsed = openAIResponsesTargetAdapter.toStandardResponse({
+      id: 'resp_tool_search_incomplete',
+      model: 'gpt-5.6',
+      status: 'incomplete',
+      incomplete_details: { reason: 'max_output_tokens' },
+      output: [
+        {
+          type: 'tool_search_call',
+          execution: 'client',
+          call_id: 'toolu_search_incomplete',
+          status: 'incomplete',
+          arguments: { query: 'calendar' }
+        }
+      ],
+      usage: {
+        input_tokens: 10,
+        output_tokens: 4,
+        total_tokens: 14
+      }
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect(parsed.value.status).toBe('incomplete');
+    expect(parsed.value.finish_reason).toBe('max_output_tokens');
+    expect(parsed.value.output).toEqual([]);
   });
 
   it('passes explicit OpenAI Responses web_search tools through as hosted tools', () => {

@@ -298,8 +298,14 @@ export function parseOpenAIToStandardResponse(payload: unknown): Result<Standard
     extractOpenAIChatText(payload.choices);
   const toolCalls = extractOpenAIFunctionCalls(payload);
   const reasoningItems = extractOpenAIReasoningItems(payload);
+  const responseIncomplete = asString(payload.status) === 'incomplete';
 
-  if (!outputText && toolCalls.length === 0 && reasoningItems.length === 0) {
+  if (
+    !responseIncomplete &&
+    !outputText &&
+    toolCalls.length === 0 &&
+    reasoningItems.length === 0
+  ) {
     return err('OpenAI response does not contain text output, reasoning output, or tool calls.');
   }
 
@@ -331,7 +337,11 @@ export function parseOpenAIToStandardResponse(payload: unknown): Result<Standard
     outputText,
     outputItems: buildStandardResponseOutputItems(outputText, toolCalls, reasoningItems),
     usage,
-    finishReason: extractOpenAIFinishReason(payload.choices)
+    finishReason: responseIncomplete
+      ? asString(isObject(payload.incomplete_details) ? payload.incomplete_details.reason : undefined) ||
+        'max_tokens'
+      : extractOpenAIFinishReason(payload.choices),
+    status: responseIncomplete ? 'incomplete' : 'completed'
   }));
 }
 
@@ -450,6 +460,7 @@ function createStandardResponse(args: {
   outputItems?: StandardResponseOutputItem[];
   usage: StandardUsage;
   finishReason?: string;
+  status?: 'completed' | 'incomplete';
 }): StandardResponse {
   const output = args.outputItems && args.outputItems.length > 0
     ? args.outputItems
@@ -458,7 +469,7 @@ function createStandardResponse(args: {
   return {
     id: args.id,
     object: 'response',
-    status: 'completed',
+    status: args.status ?? 'completed',
     model: args.model,
     output_text: args.outputText,
     output,
@@ -976,11 +987,20 @@ function appendReasoningContentIfDistinct(
 }
 
 function extractOpenAIFunctionCalls(payload: Record<string, unknown>): StandardResponseFunctionCall[] {
-  return [...extractOpenAIResponsesFunctionCalls(payload.output), ...extractOpenAIChatFunctionCalls(payload.choices)];
+  return [
+    ...extractOpenAIResponsesFunctionCalls(payload.output, asString(payload.status)),
+    ...extractOpenAIChatFunctionCalls(payload.choices)
+  ];
 }
 
-function extractOpenAIResponsesFunctionCalls(output: unknown): StandardResponseFunctionCall[] {
+function extractOpenAIResponsesFunctionCalls(
+  output: unknown,
+  responseStatus: string | undefined
+): StandardResponseFunctionCall[] {
   if (!Array.isArray(output)) {
+    return [];
+  }
+  if (responseStatus === 'incomplete') {
     return [];
   }
 
@@ -991,17 +1011,30 @@ function extractOpenAIResponsesFunctionCalls(output: unknown): StandardResponseF
     }
 
     const type = asString(item.type);
-    if (type !== 'function_call' && type !== 'tool_call') {
+    const isClientToolSearch =
+      type === 'tool_search_call' &&
+      asString(item.execution) === 'client' &&
+      asString(item.status) === 'completed' &&
+      Boolean(asString(item.call_id));
+    if (asString(item.status) === 'incomplete') {
+      continue;
+    }
+    if (type !== 'function_call' && type !== 'tool_call' && !isClientToolSearch) {
       continue;
     }
 
     const functionPayload = isObject(item.function) ? item.function : undefined;
-    const name = asString(item.name) || asString(functionPayload?.name);
+    const name = isClientToolSearch
+      ? 'ToolSearch'
+      : asString(item.name) || asString(functionPayload?.name);
     if (!name) {
       continue;
     }
 
-    const id = asString(item.id) || `fc_${randomUUID().replace(/-/g, '')}`;
+    const id =
+      asString(item.id) ||
+      (isClientToolSearch ? asString(item.call_id) : undefined) ||
+      `fc_${randomUUID().replace(/-/g, '')}`;
     toolCalls.push({
       id,
       type: 'function_call',

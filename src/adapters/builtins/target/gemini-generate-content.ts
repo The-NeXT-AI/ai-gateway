@@ -16,11 +16,13 @@ import { asBoolean, asNumber, asString, collectStandardInputMessages, isObject }
 import { buildGeminiInteractionsUrl, buildGeminiUrl } from '../common';
 import { parseGeminiToStandardResponse } from './shared';
 import {
+  appendToolReferencesToResultContent,
   flattenStandardTools,
   isAnthropicWebSearchTool,
   isOpenAIWebSearchTool,
   mapStandardToolNameToTargetName,
-  mapToolChoiceFunctionName
+  mapToolChoiceFunctionName,
+  serializeStandardToolSearchOutput
 } from './tools';
 
 const geminiSchemaStringKeys = new Set(['description', 'format', 'title']);
@@ -156,7 +158,10 @@ function buildGeminiInteractionsRequestFromStandard(input: TargetAdapterRequestI
   }
 
   const body: Record<string, unknown> = {
-    input: standardInputToGeminiInteractionsInput(input.standardRequest.input)
+    input: standardInputToGeminiInteractionsInput(
+      input.standardRequest.input,
+      input.standardRequest.tools
+    )
   };
   if (agent) {
     body.agent = agent;
@@ -218,7 +223,8 @@ function standardInputToGeminiContents(
 }
 
 function standardInputToGeminiInteractionsInput(
-  input: string | StandardRequestInputMessage[]
+  input: string | StandardRequestInputMessage[],
+  tools?: unknown[]
 ): string | Array<Record<string, unknown>> {
   if (typeof input === 'string') {
     return input;
@@ -270,6 +276,32 @@ function standardInputToGeminiInteractionsInput(
         continue;
       }
 
+      if (item.type === 'tool_search_call' && message.role === 'assistant') {
+        toolNamesById.set(item.call_id, 'ToolSearch');
+        steps.push({
+          type: 'function_call',
+          id: item.call_id,
+          name: 'ToolSearch',
+          arguments: normalizeGeminiFunctionCallArgs(item.arguments)
+        });
+        continue;
+      }
+
+      if (item.type === 'tool_search_output') {
+        steps.push({
+          type: 'function_result',
+          call_id: item.call_id,
+          name: 'ToolSearch',
+          result: [
+            {
+              type: 'text',
+              text: serializeStandardToolSearchOutput(item)
+            }
+          ]
+        });
+        continue;
+      }
+
       if (item.type === 'tool_use' && message.role === 'assistant') {
         toolNamesById.set(item.id, item.name);
         steps.push({
@@ -290,7 +322,11 @@ function standardInputToGeminiInteractionsInput(
           result: [
             {
               type: 'text',
-              text: item.content
+              text: appendToolReferencesToResultContent(
+                item.content,
+                item.tool_references,
+                tools
+              )
             }
           ]
         });
@@ -558,6 +594,31 @@ function standardContentToGeminiParts(
       continue;
     }
 
+    if (item.type === 'tool_search_call') {
+      state.toolNamesById.set(item.call_id, 'ToolSearch');
+      parts.push({
+        functionCall: {
+          id: item.call_id,
+          name: 'ToolSearch',
+          args: normalizeGeminiFunctionCallArgs(item.arguments)
+        }
+      });
+      continue;
+    }
+
+    if (item.type === 'tool_search_output') {
+      parts.push({
+        functionResponse: {
+          id: item.call_id,
+          name: 'ToolSearch',
+          response: {
+            content: serializeStandardToolSearchOutput(item)
+          }
+        }
+      });
+      continue;
+    }
+
     if (item.type === 'tool_use') {
       const targetName = mapStandardToolNameToTargetName(item.name, tools);
       state.toolNamesById.set(item.id, targetName);
@@ -594,7 +655,7 @@ function standardContentToGeminiParts(
     }
 
     const response: Record<string, unknown> = {
-      content: item.content
+      content: appendToolReferencesToResultContent(item.content, item.tool_references, tools)
     };
     if (item.is_error !== undefined) {
       response.is_error = item.is_error;

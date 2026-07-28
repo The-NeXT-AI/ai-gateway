@@ -3333,7 +3333,7 @@ function emitGeminiFramesFromOpenAIResponsesEvent(
     return [];
   }
 
-  if (eventType === 'response.completed') {
+  if (eventType === 'response.completed' || eventType === 'response.incomplete') {
     const response = isObject(payload.response) ? payload.response : undefined;
     const model = asString(response?.model);
     if (model) {
@@ -3418,6 +3418,9 @@ function collectOpenAIResponsesToolCallsForGemini(
   if (!response || !Array.isArray(response.output)) {
     return;
   }
+  if (asString(response.status) === 'incomplete') {
+    return;
+  }
 
   let fallbackIndex = state.pendingToolCalls.size;
   for (const outputItem of response.output) {
@@ -3426,14 +3429,24 @@ function collectOpenAIResponsesToolCallsForGemini(
     }
 
     const outputType = asString(outputItem.type);
-    if (outputType !== 'function_call' && outputType !== 'tool_call') {
+    if (asString(outputItem.status) === 'incomplete') {
+      continue;
+    }
+    const isClientToolSearch =
+      outputType === 'tool_search_call' &&
+      asString(outputItem.execution) === 'client' &&
+      asString(outputItem.status) === 'completed' &&
+      Boolean(asString(outputItem.call_id));
+    if (outputType !== 'function_call' && outputType !== 'tool_call' && !isClientToolSearch) {
       continue;
     }
 
     const indexValue = asNumber(outputItem.index);
     const toolIndex = indexValue !== undefined ? Math.max(0, Math.trunc(indexValue)) : fallbackIndex++;
     const functionPayload = isObject(outputItem.function) ? outputItem.function : undefined;
-    const name = asString(outputItem.name) || asString(functionPayload?.name);
+    const name = isClientToolSearch
+      ? 'ToolSearch'
+      : asString(outputItem.name) || asString(functionPayload?.name);
     const argumentsJson = normalizeToolArguments(
       outputItem.arguments ?? functionPayload?.arguments ?? outputItem.input
     );
@@ -4557,7 +4570,7 @@ function emitAnthropicFramesFromOpenAIResponsesEvent(
     return emitAnthropicContentDelta(state, 'text', deltaText);
   }
 
-  if (eventType === 'response.completed') {
+  if (eventType === 'response.completed' || eventType === 'response.incomplete') {
     const response = isObject(payload.response) ? payload.response : undefined;
     updateAnthropicRelayIdentity(state, response);
     updateAnthropicRelayUsage(state, isObject(response?.usage) ? response.usage : undefined);
@@ -4587,6 +4600,11 @@ function extractResponsesFinishReason(response: Record<string, unknown> | undefi
     return undefined;
   }
 
+  if (asString(response.status) === 'incomplete') {
+    const incompleteDetails = isObject(response.incomplete_details) ? response.incomplete_details : undefined;
+    return asString(incompleteDetails?.reason) || 'max_tokens';
+  }
+
   if (Array.isArray(response.output)) {
     for (const item of response.output) {
       if (!isObject(item)) {
@@ -4597,12 +4615,20 @@ function extractResponsesFinishReason(response: Record<string, unknown> | undefi
       if (finishReason) {
         return finishReason;
       }
-    }
-  }
 
-  if (asString(response.status) === 'incomplete') {
-    const incompleteDetails = isObject(response.incomplete_details) ? response.incomplete_details : undefined;
-    return asString(incompleteDetails?.reason) || 'max_tokens';
+      const itemType = asString(item.type);
+      const itemStatus = asString(item.status);
+      if (
+        ((itemType === 'function_call' || itemType === 'tool_call') &&
+          itemStatus !== 'incomplete') ||
+        (itemType === 'tool_search_call' &&
+          asString(item.execution) === 'client' &&
+          itemStatus === 'completed' &&
+          Boolean(asString(item.call_id)))
+      ) {
+        return 'tool_use';
+      }
+    }
   }
 
   return undefined;
@@ -4658,6 +4684,9 @@ function collectOpenAIResponsesToolCalls(state: AnthropicRelayState, response: R
   if (!response || !Array.isArray(response.output)) {
     return;
   }
+  if (asString(response.status) === 'incomplete') {
+    return;
+  }
 
   let fallbackIndex = state.pendingToolCalls.size;
   for (const outputItem of response.output) {
@@ -4666,7 +4695,15 @@ function collectOpenAIResponsesToolCalls(state: AnthropicRelayState, response: R
     }
 
     const outputType = asString(outputItem.type);
-    if (outputType !== 'function_call' && outputType !== 'tool_call') {
+    if (asString(outputItem.status) === 'incomplete') {
+      continue;
+    }
+    const isClientToolSearch =
+      outputType === 'tool_search_call' &&
+      asString(outputItem.execution) === 'client' &&
+      asString(outputItem.status) === 'completed' &&
+      Boolean(asString(outputItem.call_id));
+    if (outputType !== 'function_call' && outputType !== 'tool_call' && !isClientToolSearch) {
       continue;
     }
 
@@ -4674,7 +4711,9 @@ function collectOpenAIResponsesToolCalls(state: AnthropicRelayState, response: R
     const toolIndex = indexValue !== undefined ? Math.max(0, Math.trunc(indexValue)) : fallbackIndex++;
     const functionPayload = isObject(outputItem.function) ? outputItem.function : undefined;
     const id = asString(outputItem.call_id) || asString(outputItem.id);
-    const name = asString(outputItem.name) || asString(functionPayload?.name);
+    const name = isClientToolSearch
+      ? 'ToolSearch'
+      : asString(outputItem.name) || asString(functionPayload?.name);
     const argumentsJson = normalizeToolArguments(
       outputItem.arguments ?? functionPayload?.arguments ?? outputItem.input
     );

@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { parseOpenAIChatCompletionsRequest, parseOpenAIResponsesRequest } from '../source/parsers';
+import {
+  parseAnthropicMessagesRequest,
+  parseOpenAIChatCompletionsRequest,
+  parseOpenAIResponsesRequest
+} from '../source/parsers';
 import { anthropicMessagesTargetAdapter } from './anthropic-messages';
 
 describe('anthropicMessagesTargetAdapter', () => {
@@ -216,6 +220,407 @@ describe('anthropicMessagesTargetAdapter', () => {
             type: 'tool_result',
             tool_use_id: 'call_weather',
             content: '{"temperature":22}'
+          }
+        ]
+      }
+    ]);
+  });
+
+  it('maps native Responses tool-search history into Anthropic tool history', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gpt-5.6',
+      tools: [
+        {
+          type: 'tool_search',
+          execution: 'client',
+          description: 'Find tools.',
+          parameters: {
+            type: 'object',
+            properties: { query: { type: 'string' } },
+            required: ['query']
+          }
+        }
+      ],
+      input: [
+        {
+          type: 'tool_search_call',
+          execution: 'client',
+          call_id: 'search_123',
+          status: 'completed',
+          arguments: { query: 'calendar' }
+        },
+        {
+          type: 'tool_search_output',
+          execution: 'client',
+          call_id: 'search_123',
+          status: 'completed',
+          tools: [
+            {
+              type: 'function',
+              name: 'calendar_create',
+              description: 'Create a calendar event.',
+              defer_loading: true,
+              parameters: { type: 'object', properties: {} }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: parsed.value,
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).tools).toEqual([
+      {
+        name: 'ToolSearch',
+        description: 'Find tools.',
+        input_schema: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+          required: ['query']
+        }
+      },
+      {
+        name: 'calendar_create',
+        description: 'Create a calendar event.',
+        input_schema: { type: 'object', properties: {} },
+        defer_loading: true
+      }
+    ]);
+    expect((built.value.body as Record<string, unknown>).messages).toEqual([
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool_use',
+            id: 'search_123',
+            name: 'ToolSearch',
+            input: { query: 'calendar' }
+          }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'search_123',
+            content: [{ type: 'tool_reference', tool_name: 'calendar_create' }]
+          }
+        ]
+      }
+    ]);
+  });
+
+  it('keeps deferred tool declarations and references aligned after name collisions', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gpt-5.6',
+      tools: [
+        {
+          type: 'tool_search',
+          execution: 'client',
+          parameters: { type: 'object', properties: {} }
+        }
+      ],
+      input: [
+        {
+          type: 'tool_search_call',
+          execution: 'client',
+          call_id: 'search_collision',
+          status: 'completed',
+          arguments: { query: 'colliding names' }
+        },
+        {
+          type: 'tool_search_output',
+          execution: 'client',
+          call_id: 'search_collision',
+          status: 'completed',
+          tools: [
+            {
+              type: 'function',
+              name: 'foo.bar',
+              defer_loading: true,
+              parameters: { type: 'object', properties: {} }
+            },
+            {
+              type: 'function',
+              name: 'foo_bar',
+              defer_loading: true,
+              parameters: { type: 'object', properties: {} }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: parsed.value,
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    const declarations = (body.tools as Array<Record<string, unknown>>).filter(
+      (tool) => tool.name !== 'ToolSearch'
+    );
+    const declarationNames = declarations.map((tool) => tool.name);
+    const messages = body.messages as Array<Record<string, unknown>>;
+    const resultBlocks = messages[1]?.content as Array<Record<string, unknown>>;
+    const references = resultBlocks[0]?.content as Array<Record<string, unknown>>;
+    const referenceNames = references.map((reference) => reference.tool_name);
+
+    expect(declarationNames).toHaveLength(2);
+    expect(new Set(declarationNames).size).toBe(2);
+    expect(declarations.every((tool) => tool.defer_loading === true)).toBe(true);
+    expect(referenceNames).toEqual(declarationNames);
+  });
+
+  it.each([
+    {
+      name: 'a collision with the ToolSearch declaration',
+      configuredTools: [],
+      outputStatus: 'completed',
+      outputTool: {
+        type: 'function',
+        name: 'ToolSearch',
+        parameters: { type: 'object', properties: {} }
+      },
+      expectedToolNames: ['ToolSearch']
+    },
+    {
+      name: 'a conflicting configured definition',
+      configuredTools: [
+        {
+          type: 'function',
+          name: 'calendar_create',
+          defer_loading: true,
+          parameters: {
+            type: 'object',
+            properties: { date: { type: 'string' } }
+          }
+        }
+      ],
+      outputStatus: 'completed',
+      outputTool: {
+        type: 'function',
+        name: 'calendar_create',
+        parameters: {
+          type: 'object',
+          properties: { event_id: { type: 'number' } }
+        }
+      },
+      expectedToolNames: ['ToolSearch', 'calendar_create']
+    },
+    {
+      name: 'an incomplete discovery result',
+      configuredTools: [],
+      outputStatus: 'incomplete',
+      outputTool: {
+        type: 'function',
+        name: 'calendar_create',
+        parameters: { type: 'object', properties: {} }
+      },
+      expectedToolNames: ['ToolSearch']
+    }
+  ])('serializes tool-search output for $name', (scenario) => {
+    const callId = `search_${scenario.outputTool.name}_${scenario.outputStatus}`;
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gpt-5.6',
+      tools: [
+        {
+          type: 'tool_search',
+          execution: 'client',
+          parameters: { type: 'object', properties: {} }
+        },
+        ...scenario.configuredTools
+      ],
+      input: [
+        {
+          type: 'tool_search_call',
+          execution: 'client',
+          call_id: callId,
+          status: 'completed',
+          arguments: { query: 'calendar' }
+        },
+        {
+          type: 'tool_search_output',
+          execution: 'client',
+          call_id: callId,
+          status: scenario.outputStatus,
+          tools: [scenario.outputTool]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: parsed.value,
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    const toolNames = (body.tools as Array<Record<string, unknown>>).map(
+      (tool) => tool.name
+    );
+    const messages = body.messages as Array<Record<string, unknown>>;
+    const resultBlocks = messages[1]?.content as Array<Record<string, unknown>>;
+    const resultContent = resultBlocks[0]?.content;
+
+    expect(toolNames).toEqual(scenario.expectedToolNames);
+    expect(resultContent).toBe(
+      JSON.stringify({
+        type: 'tool_search_output',
+        execution: 'client',
+        status: scenario.outputStatus,
+        tools: [scenario.outputTool]
+      })
+    );
+  });
+
+  it('round-trips Anthropic tool references without an empty result body', () => {
+    const parsed = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 128,
+      tools: [
+        {
+          name: 'ToolSearch',
+          description: 'Find tools.',
+          input_schema: {
+            type: 'object',
+            properties: { query: { type: 'string' } }
+          }
+        },
+        {
+          name: 'calendar_create',
+          description: 'Create a calendar event.',
+          defer_loading: true,
+          input_schema: { type: 'object', properties: {} }
+        }
+      ],
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'toolu_search',
+              name: 'ToolSearch',
+              input: { query: 'calendar create' }
+            }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_search',
+              content: [
+                { type: 'tool_reference', tool_name: 'calendar_create' },
+                { type: 'tool_reference', tool_name: 'calendar_create' }
+              ]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: parsed.value,
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).tools).toEqual([
+      {
+        name: 'ToolSearch',
+        description: 'Find tools.',
+        input_schema: {
+          type: 'object',
+          properties: { query: { type: 'string' } }
+        }
+      },
+      {
+        name: 'calendar_create',
+        description: 'Create a calendar event.',
+        input_schema: { type: 'object', properties: {} },
+        defer_loading: true
+      }
+    ]);
+    expect((built.value.body as Record<string, unknown>).messages).toEqual([
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool_use',
+            id: 'toolu_search',
+            name: 'ToolSearch',
+            input: { query: 'calendar create' }
+          }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_search',
+            content: [{ type: 'tool_reference', tool_name: 'calendar_create' }]
           }
         ]
       }

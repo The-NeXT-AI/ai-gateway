@@ -942,6 +942,21 @@ export type StandardRequestInputContent =
       content: string;
       is_error?: boolean;
       result_format?: 'function' | 'web_search';
+      tool_references?: string[];
+    }
+  | {
+      type: 'tool_search_call';
+      call_id: string;
+      execution: 'client';
+      arguments: unknown;
+      status?: string;
+    }
+  | {
+      type: 'tool_search_output';
+      call_id: string;
+      execution: 'client';
+      tools: unknown[];
+      status?: string;
     }
   | {
       type: 'reasoning';

@@ -531,6 +531,240 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('converts Anthropic deferred tool history to native Responses tool search', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'resp_tool_search_route',
+          object: 'response',
+          status: 'completed',
+          model: 'gpt-5.6',
+          output: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'ready' }]
+            }
+          ],
+          usage: { input_tokens: 12, output_tokens: 2, total_tokens: 14 }
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'gpt-5.6',
+          max_tokens: 128,
+          tools: [
+            {
+              name: 'ToolSearch',
+              description: 'Find tools.',
+              input_schema: { type: 'object', properties: {} }
+            },
+            {
+              name: 'calendar_create',
+              defer_loading: true,
+              input_schema: { type: 'object', properties: {} }
+            }
+          ],
+          messages: [
+            {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'tool_use',
+                  id: 'toolu_search_route',
+                  name: 'ToolSearch',
+                  input: { query: 'calendar' }
+                }
+              ]
+            },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'toolu_search_route',
+                  content: [
+                    { type: 'tool_reference', tool_name: 'calendar_create' }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [
+        string,
+        RequestInit
+      ];
+      expect(upstreamUrl).toBe('https://api.openai.com/v1/responses');
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.tools).toEqual([
+        {
+          type: 'tool_search',
+          execution: 'client',
+          description: 'Find tools.',
+          parameters: { type: 'object', properties: {} }
+        }
+      ]);
+      expect(upstreamBody.input).toEqual([
+        {
+          type: 'tool_search_call',
+          execution: 'client',
+          call_id: 'toolu_search_route',
+          status: 'completed',
+          arguments: { query: 'calendar' }
+        },
+        {
+          type: 'tool_search_output',
+          execution: 'client',
+          call_id: 'toolu_search_route',
+          status: 'completed',
+          tools: [
+            {
+              type: 'function',
+              name: 'calendar_create',
+              defer_loading: true,
+              parameters: { type: 'object', properties: {} }
+            }
+          ]
+        }
+      ]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('streams client tool search calls back as Anthropic ToolSearch uses', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_search_stream","object":"response","status":"in_progress","model":"gpt-5.6","output":[]}}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_search_stream","object":"response","status":"completed","model":"gpt-5.6","output":[{"type":"tool_search_call","execution":"client","call_id":"toolu_search_stream","status":"completed","arguments":{"query":"calendar"}}],"usage":{"input_tokens":8,"output_tokens":3,"total_tokens":11}}}\n\n',
+        'data: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'gpt-5.6',
+          max_tokens: 128,
+          stream: true,
+          tools: [
+            {
+              name: 'ToolSearch',
+              input_schema: { type: 'object', properties: {} }
+            },
+            {
+              name: 'calendar_create',
+              defer_loading: true,
+              input_schema: { type: 'object', properties: {} }
+            }
+          ],
+          messages: [{ role: 'user', content: 'find a calendar tool' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain(
+        '"type":"tool_use","id":"toolu_search_stream","name":"ToolSearch"'
+      );
+      expect(response.body).toContain(
+        '"type":"input_json_delta","partial_json":"{\\"query\\":\\"calendar\\"}"'
+      );
+      expect(response.body).toContain('"stop_reason":"tool_use"');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not stream incomplete Responses tool calls as executable Anthropic uses', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_incomplete_tools","object":"response","status":"in_progress","model":"gpt-5.6","output":[]}}\n\n',
+        'event: response.incomplete\ndata: {"type":"response.incomplete","response":{"id":"resp_incomplete_tools","object":"response","status":"incomplete","model":"gpt-5.6","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"tool_search_call","execution":"client","call_id":"toolu_search_incomplete","status":"incomplete","arguments":{"query":"calendar"}},{"type":"function_call","call_id":"call_lookup_incomplete","name":"lookup","status":"incomplete","arguments":"{\\"query\\":\\"calendar\\"}"}],"usage":{"input_tokens":8,"output_tokens":3,"total_tokens":11}}}\n\n',
+        'data: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'gpt-5.6',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'find a calendar tool' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).not.toContain('"type":"tool_use"');
+      expect(response.body).not.toContain('ToolSearch');
+      expect(response.body).not.toContain('lookup');
+      expect(response.body).toContain('"stop_reason":"max_tokens"');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('converts /v1/responses to chat/completions for openai_chat_completions targets', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(
@@ -3978,6 +4212,88 @@ describe('gateway routes protocol conversion', () => {
       expect(response.body).toContain('"parts":[{"text":"world"}]');
       expect(response.body).toContain('"finishReason":"STOP"');
       expect(response.body).toContain('"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('streams client tool search calls back as Gemini function calls', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_gemini_search","object":"response","status":"in_progress","model":"gpt-5.6","output":[]}}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_gemini_search","object":"response","status":"completed","model":"gpt-5.6","output":[{"type":"tool_search_call","execution":"client","call_id":"toolu_gemini_search","status":"completed","arguments":{"query":"calendar"}}],"usage":{"input_tokens":8,"output_tokens":3,"total_tokens":11}}}\n\n',
+        'data: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/models/openai-main/gpt-5.6:streamGenerateContent?alt=sse',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          contents: [{ role: 'user', parts: [{ text: 'find a calendar tool' }] }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain(
+        '"functionCall":{"name":"ToolSearch","args":{"query":"calendar"}}'
+      );
+      expect(response.body).toContain('"finishReason":"STOP"');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('finalizes Gemini streams from Responses incomplete events', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_gemini_incomplete","object":"response","status":"in_progress","model":"gpt-5.6","output":[]}}\n\n',
+        'event: response.incomplete\ndata: {"type":"response.incomplete","response":{"id":"resp_gemini_incomplete","object":"response","status":"incomplete","model":"gpt-5.6","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":8,"output_tokens":3,"total_tokens":11}}}\n\n',
+        'data: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/models/openai-main/gpt-5.6:streamGenerateContent?alt=sse',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          contents: [{ role: 'user', parts: [{ text: 'write a long answer' }] }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain('"finishReason":"MAX_TOKENS"');
+      expect(response.body).toContain(
+        '"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,"totalTokenCount":11}'
+      );
     } finally {
       await app.close();
     }

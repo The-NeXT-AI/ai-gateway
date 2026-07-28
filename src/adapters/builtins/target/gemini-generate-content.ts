@@ -597,6 +597,22 @@ function standardContentToGeminiParts(
     flushText();
 
     if (item.type === 'reasoning') {
+      if (state.pendingThoughtSignature) {
+        if (
+          state.pendingThoughtPart &&
+          state.pendingThoughtPart.thoughtSignature === undefined
+        ) {
+          state.pendingThoughtPart.thoughtSignature = state.pendingThoughtSignature;
+        } else {
+          parts.push({
+            thought: true,
+            thoughtSignature: state.pendingThoughtSignature
+          });
+        }
+        state.pendingThoughtSignature = undefined;
+        state.pendingThoughtPart = undefined;
+      }
+
       if (standardReasoningFormat(item) !== GEMINI_GENERATE_CONTENT_REASONING_FORMAT) {
         state.pendingThoughtSignature = undefined;
         state.pendingThoughtPart = undefined;
@@ -607,12 +623,26 @@ function standardContentToGeminiParts(
         parts.push(reasoningPart);
         state.pendingThoughtPart = reasoningPart;
       }
-      const thoughtSignature = standardReasoningThoughtSignature(
+      const thoughtSignatureState = standardReasoningThoughtSignatureState(
         item,
         GEMINI_GENERATE_CONTENT_REASONING_FORMAT
       );
-      if (thoughtSignature) {
-        state.pendingThoughtSignature = thoughtSignature;
+      if (
+        thoughtSignatureState?.kind === 'encrypted' &&
+        thoughtSignatureState.partIndex !== undefined
+      ) {
+        if (reasoningPart) {
+          reasoningPart.thoughtSignature = thoughtSignatureState.signature;
+        } else {
+          parts.push({
+            thought: true,
+            thoughtSignature: thoughtSignatureState.signature
+          });
+        }
+        state.pendingThoughtSignature = undefined;
+        state.pendingThoughtPart = undefined;
+      } else if (thoughtSignatureState) {
+        state.pendingThoughtSignature = thoughtSignatureState.signature;
       }
       continue;
     }
@@ -817,6 +847,19 @@ function standardReasoningThoughtSignature(
   item: Extract<StandardRequestInputContent, { type: 'reasoning' }>,
   expectedFormat: string
 ): string | undefined {
+  return standardReasoningThoughtSignatureState(item, expectedFormat)?.signature;
+}
+
+interface StandardReasoningThoughtSignatureState {
+  signature: string;
+  kind: 'signature' | 'encrypted';
+  partIndex?: number;
+}
+
+function standardReasoningThoughtSignatureState(
+  item: Extract<StandardRequestInputContent, { type: 'reasoning' }>,
+  expectedFormat: string
+): StandardReasoningThoughtSignatureState | undefined {
   const details = Array.isArray(item.reasoning_details) ? item.reasoning_details : [];
   for (const detail of details) {
     if (!isObject(detail)) {
@@ -826,19 +869,26 @@ function standardReasoningThoughtSignature(
     if (format !== expectedFormat) {
       continue;
     }
-    const signature =
+    const explicitSignature =
       asString(detail.signature) ||
       asString(detail.thoughtSignature) ||
-      asString(detail.thought_signature) ||
+      asString(detail.thought_signature);
+    const encrypted =
       asString(detail.data) ||
       asString(detail.encrypted_content);
+    const signature = explicitSignature || encrypted;
     if (signature) {
-      return signature;
+      const partIndex = asNumber(detail.index);
+      return {
+        signature,
+        kind: explicitSignature ? 'signature' : 'encrypted',
+        ...(partIndex !== undefined ? { partIndex } : {})
+      };
     }
   }
 
-  return item.source_format === expectedFormat
-    ? item.encrypted_content
+  return item.source_format === expectedFormat && item.encrypted_content
+    ? { signature: item.encrypted_content, kind: 'encrypted' }
     : undefined;
 }
 

@@ -1296,9 +1296,7 @@ function readGeminiThoughtSignature(
 }
 
 function extractGeminiReasoningItems(parts: unknown[]): StandardResponseReasoning[] {
-  const reasoningContent: NonNullable<StandardResponseReasoning['content']> = [];
-  const reasoningDetails: unknown[] = [];
-  let encryptedContent: string | undefined;
+  const reasoningItems: StandardResponseReasoning[] = [];
 
   for (let index = 0; index < parts.length; index += 1) {
     const part = parts[index];
@@ -1316,6 +1314,8 @@ function extractGeminiReasoningItems(parts: unknown[]): StandardResponseReasonin
       continue;
     }
 
+    const reasoningContent: NonNullable<StandardResponseReasoning['content']> = [];
+    const reasoningDetails: unknown[] = [];
     if (text) {
       reasoningContent.push({
         type: 'reasoning_text',
@@ -1329,7 +1329,6 @@ function extractGeminiReasoningItems(parts: unknown[]): StandardResponseReasonin
       });
     }
     if (thoughtSignature) {
-      encryptedContent = encryptedContent || thoughtSignature;
       reasoningDetails.push({
         type: 'reasoning.encrypted',
         data: thoughtSignature,
@@ -1337,24 +1336,20 @@ function extractGeminiReasoningItems(parts: unknown[]): StandardResponseReasonin
         index
       });
     }
-  }
 
-  if (reasoningDetails.length === 0) {
-    return [];
-  }
-
-  return [
-    {
+    reasoningItems.push({
       id: `rs_${randomUUID().replace(/-/g, '')}`,
       type: 'reasoning',
       status: 'completed',
       summary: [],
       ...(reasoningContent.length > 0 ? { content: reasoningContent } : {}),
-      ...(encryptedContent ? { encrypted_content: encryptedContent } : {}),
+      ...(thoughtSignature ? { encrypted_content: thoughtSignature } : {}),
       reasoning_details: reasoningDetails,
       source_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT
-    }
-  ];
+    });
+  }
+
+  return reasoningItems;
 }
 
 function normalizeFunctionCallArguments(value: unknown): string {

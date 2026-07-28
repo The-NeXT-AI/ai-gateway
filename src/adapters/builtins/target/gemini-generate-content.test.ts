@@ -7,7 +7,11 @@ import {
   OPENAI_RESPONSES_REASONING_FORMAT
 } from '../reasoning-envelope';
 import { formatAnthropicMessagesResponse, formatGeminiGenerateContentResponse } from '../source/formatters';
-import { parseAnthropicMessagesRequest, parseOpenAIResponsesRequest } from '../source/parsers';
+import {
+  parseAnthropicMessagesRequest,
+  parseGeminiGenerateContentRequest,
+  parseOpenAIResponsesRequest
+} from '../source/parsers';
 import { geminiGenerateContentTargetAdapter } from './gemini-generate-content';
 
 describe('geminiGenerateContentTargetAdapter', () => {
@@ -1188,6 +1192,191 @@ describe('geminiGenerateContentTargetAdapter', () => {
         }
       ]
     });
+  });
+
+  it('keeps multiple signed Gemini thought parts separate when formatting a response', () => {
+    const parsed = geminiGenerateContentTargetAdapter.toStandardResponse({
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [
+              {
+                text: 'First thought summary.',
+                thought: true,
+                thoughtSignature: 'gemini-thought-signature-1'
+              },
+              {
+                text: 'Second thought summary.',
+                thought: true,
+                thoughtSignature: 'gemini-thought-signature-2'
+              },
+              {
+                text: 'Visible answer.'
+              }
+            ]
+          },
+          finishReason: 'STOP'
+        }
+      ],
+      usageMetadata: {
+        promptTokenCount: 8,
+        candidatesTokenCount: 6,
+        totalTokenCount: 14
+      },
+      modelVersion: 'gemini-3.5-flash'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const reasoningItems = parsed.value.output.filter((item) => item.type === 'reasoning');
+    expect(reasoningItems).toHaveLength(2);
+    expect(reasoningItems[0]).toMatchObject({
+      type: 'reasoning',
+      content: [{ type: 'reasoning_text', text: 'First thought summary.' }],
+      encrypted_content: 'gemini-thought-signature-1',
+      reasoning_details: [
+        {
+          type: 'reasoning.text',
+          text: 'First thought summary.',
+          format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+          index: 0
+        },
+        {
+          type: 'reasoning.encrypted',
+          data: 'gemini-thought-signature-1',
+          format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+          index: 0
+        }
+      ]
+    });
+    expect(reasoningItems[1]).toMatchObject({
+      type: 'reasoning',
+      content: [{ type: 'reasoning_text', text: 'Second thought summary.' }],
+      encrypted_content: 'gemini-thought-signature-2',
+      reasoning_details: [
+        {
+          type: 'reasoning.text',
+          text: 'Second thought summary.',
+          format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+          index: 1
+        },
+        {
+          type: 'reasoning.encrypted',
+          data: 'gemini-thought-signature-2',
+          format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+          index: 1
+        }
+      ]
+    });
+
+    const formatted = formatGeminiGenerateContentResponse(parsed.value) as Record<string, any>;
+    expect(formatted.candidates[0].content.parts).toEqual([
+      {
+        text: 'First thought summary.',
+        thought: true,
+        thoughtSignature: 'gemini-thought-signature-1'
+      },
+      {
+        text: 'Second thought summary.',
+        thought: true,
+        thoughtSignature: 'gemini-thought-signature-2'
+      },
+      {
+        text: 'Visible answer.'
+      }
+    ]);
+  });
+
+  it('keeps multiple signed Gemini thought parts separate when rebuilding a request', () => {
+    const parsed = parseGeminiGenerateContentRequest(
+      {
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: 'Solve this.' }]
+          },
+          {
+            role: 'model',
+            parts: [
+              {
+                text: 'First thought summary.',
+                thought: true,
+                thoughtSignature: 'gemini-thought-signature-1'
+              },
+              {
+                text: 'Second thought summary.',
+                thought: true,
+                thoughtSignature: 'gemini-thought-signature-2'
+              },
+              {
+                text: 'Visible answer.'
+              }
+            ]
+          },
+          {
+            role: 'user',
+            parts: [{ text: 'Continue.' }]
+          }
+        ]
+      },
+      'gemini-3.5-flash'
+    );
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-3.5-flash:generateContent'
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).contents).toEqual([
+      {
+        role: 'user',
+        parts: [{ text: 'Solve this.' }]
+      },
+      {
+        role: 'model',
+        parts: [
+          {
+            text: 'First thought summary.',
+            thought: true,
+            thoughtSignature: 'gemini-thought-signature-1'
+          },
+          {
+            text: 'Second thought summary.',
+            thought: true,
+            thoughtSignature: 'gemini-thought-signature-2'
+          },
+          {
+            text: 'Visible answer.'
+          }
+        ]
+      },
+      {
+        role: 'user',
+        parts: [{ text: 'Continue.' }]
+      }
+    ]);
   });
 
   it('keeps Responses reasoning envelopes separate from Gemini function calls', () => {

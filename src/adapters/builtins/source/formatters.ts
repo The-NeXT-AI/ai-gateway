@@ -274,6 +274,19 @@ function collectGeminiParts(response: StandardResponse): Array<Record<string, un
     }
 
     if (item.type === 'reasoning') {
+      if (pendingThoughtSignature) {
+        if (pendingThoughtPart && pendingThoughtPart.thoughtSignature === undefined) {
+          pendingThoughtPart.thoughtSignature = pendingThoughtSignature;
+        } else {
+          parts.push({
+            thought: true,
+            thoughtSignature: pendingThoughtSignature
+          });
+        }
+        pendingThoughtSignature = undefined;
+        pendingThoughtPart = undefined;
+      }
+
       const thoughtPart = formatGeminiThoughtPart(item);
       if (thoughtPart) {
         parts.push(thoughtPart);
@@ -284,7 +297,23 @@ function collectGeminiParts(response: StandardResponse): Array<Record<string, un
         opaqueState,
         GEMINI_GENERATE_CONTENT_REASONING_FORMAT
       );
-      if (
+      const belongsToOriginalGeminiPart =
+        thoughtSignature &&
+        opaqueState?.format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT &&
+        opaqueState.kind === 'encrypted' &&
+        opaqueState.partIndex !== undefined;
+      if (belongsToOriginalGeminiPart) {
+        if (thoughtPart) {
+          thoughtPart.thoughtSignature = thoughtSignature;
+        } else {
+          parts.push({
+            thought: true,
+            thoughtSignature
+          });
+        }
+        pendingThoughtPart = undefined;
+        pendingThoughtSignature = undefined;
+      } else if (
         thoughtSignature &&
         opaqueState?.format !== GEMINI_GENERATE_CONTENT_REASONING_FORMAT
       ) {
@@ -477,6 +506,7 @@ interface ReasoningOpaqueState {
   format: string;
   id?: string;
   kind: 'signature' | 'encrypted';
+  partIndex?: number;
 }
 
 function readReasoningOpaqueState(item: StandardResponseReasoning): ReasoningOpaqueState | undefined {
@@ -501,7 +531,10 @@ function readReasoningOpaqueState(item: StandardResponseReasoning): ReasoningOpa
           data,
           format,
           id: asOptionalString(record.id) || item.id,
-          kind: signature ? 'signature' : 'encrypted'
+          kind: signature ? 'signature' : 'encrypted',
+          ...(typeof record.index === 'number' && Number.isFinite(record.index)
+            ? { partIndex: record.index }
+            : {})
         };
       }
     }

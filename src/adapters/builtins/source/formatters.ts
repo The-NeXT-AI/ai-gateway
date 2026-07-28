@@ -4,6 +4,10 @@ import {
   mapFinishReasonToGemini,
   mapFinishReasonToOpenAI
 } from '../common';
+import {
+  encodeOpenAIResponsesReasoningEnvelope,
+  OPENAI_RESPONSES_REASONING_FORMAT
+} from '../reasoning-envelope';
 
 export function formatOpenAIChatCompletionsResponse(response: StandardResponse): Record<string, unknown> {
   const usage: Record<string, unknown> = {
@@ -355,7 +359,10 @@ function formatAnthropicThinkingBlocks(item: StandardResponseReasoning): Array<R
   if (item.encrypted_content) {
     blocks.push({
       type: 'redacted_thinking',
-      data: item.encrypted_content
+      data:
+        item.source_format === OPENAI_RESPONSES_REASONING_FORMAT
+          ? encodeOpenAIResponsesReasoningEnvelope(item.id, item.encrypted_content)
+          : item.encrypted_content
     });
   }
 
@@ -429,9 +436,14 @@ function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Arra
 
     if (type === 'reasoning.encrypted' || type === 'redacted_thinking' || (!thinking && data)) {
       if (data) {
+        const id = asOptionalString(record.id);
+        const encodedData =
+          asOptionalString(record.format) === OPENAI_RESPONSES_REASONING_FORMAT && id
+            ? encodeOpenAIResponsesReasoningEnvelope(id, data)
+            : data;
         blocks.push({
           type: 'redacted_thinking',
-          data
+          data: encodedData
         });
       }
       continue;

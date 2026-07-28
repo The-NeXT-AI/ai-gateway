@@ -11,6 +11,7 @@ import type {
 } from '../../../types';
 import { err, ok } from '../../../types';
 import { asBoolean, asNumber, asString, extractTextFromPart, isObject } from '../../../utils';
+import { OPENAI_RESPONSES_REASONING_FORMAT } from '../reasoning-envelope';
 import { resolveOpenAIChatProviderThinkingAdapter } from './openai-chat-compat';
 
 interface OpenAIChatCompatibleRewriteOptions {
@@ -764,7 +765,8 @@ function normalizeOpenAIResponsesReasoningItem(item: unknown): StandardResponseR
     id: asString(item.id) || `rs_${randomUUID().replace(/-/g, '')}`,
     type: 'reasoning',
     status: 'completed',
-    summary
+    summary,
+    source_format: OPENAI_RESPONSES_REASONING_FORMAT
   };
 
   if (content.length > 0) {

@@ -888,6 +888,7 @@ export interface StandardResponseReasoning {
   content?: StandardResponseReasoningContent[];
   encrypted_content?: string;
   reasoning_details?: unknown[];
+  source_format?: string;
 }
 
 export type StandardResponseOutputItem =
@@ -960,10 +961,12 @@ export type StandardRequestInputContent =
     }
   | {
       type: 'reasoning';
+      id?: string;
       text?: string;
       summary?: string;
       encrypted_content?: string;
       reasoning_details?: unknown[];
+      source_format?: string;
     };
 
 export interface StandardRequestInputMessage {

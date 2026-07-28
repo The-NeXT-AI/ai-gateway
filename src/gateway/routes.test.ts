@@ -400,7 +400,7 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
-  it('encodes Anthropic assistant history as output_text on the second OpenAI Responses turn', async () => {
+  it('preserves encrypted reasoning IDs in Anthropic history on the second OpenAI Responses turn', async () => {
     const upstreamBodies: Array<Record<string, unknown>> = [];
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
       const upstreamBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
@@ -416,6 +416,13 @@ describe('gateway routes protocol conversion', () => {
           model: 'gpt-5.6-sol',
           output_text: text,
           output: [
+            {
+              id: `rs_anthropic_history_${turn}`,
+              type: 'reasoning',
+              status: 'completed',
+              summary: [],
+              encrypted_content: `encrypted-reasoning-${turn}`
+            },
             {
               id: `msg_anthropic_history_${turn}`,
               type: 'message',
@@ -476,13 +483,19 @@ describe('gateway routes protocol conversion', () => {
     try {
       const firstResponse = await sendTurn([{ role: 'user', content: 'First turn' }]);
       expect(firstResponse.statusCode).toBe(200);
-      const firstBody = JSON.parse(firstResponse.body) as { content: unknown };
-      expect(firstBody.content).toEqual([
+      const firstBody = JSON.parse(firstResponse.body) as {
+        content: Array<Record<string, unknown>>;
+      };
+      expect(firstBody.content[0]).toMatchObject({
+        type: 'redacted_thinking'
+      });
+      expect(firstBody.content[0]?.data).not.toBe('encrypted-reasoning-1');
+      expect(firstBody.content[1]).toEqual(
         {
           type: 'text',
           text: 'Hello from the first turn.'
         }
-      ]);
+      );
 
       const secondResponse = await sendTurn([
         {
@@ -515,6 +528,12 @@ describe('gateway routes protocol conversion', () => {
             content: [{ type: 'input_text', text: 'First turn' }]
           },
           {
+            type: 'reasoning',
+            id: 'rs_anthropic_history_1',
+            summary: [],
+            encrypted_content: 'encrypted-reasoning-1'
+          },
+          {
             type: 'message',
             role: 'assistant',
             content: [{ type: 'output_text', text: 'Hello from the first turn.' }]
@@ -526,6 +545,154 @@ describe('gateway routes protocol conversion', () => {
           }
         ]
       });
+      const secondInput = upstreamBodies[1]?.input as Array<Record<string, unknown>>;
+      expect(secondInput[1]).not.toHaveProperty('status');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('streams encrypted Responses reasoning IDs in Anthropic history blocks', async () => {
+    const upstreamFrames = [
+      'event: response.created\n' +
+        'data: {"type":"response.created","response":{"id":"resp_stream_reasoning_1","object":"response","status":"in_progress","model":"gpt-5.6-sol"}}\n\n',
+      'event: response.output_text.delta\n' +
+        'data: {"type":"response.output_text.delta","delta":"stream answer"}\n\n',
+      'event: response.completed\n' +
+        'data: {"type":"response.completed","response":{"id":"resp_stream_reasoning_1","object":"response","status":"completed","model":"gpt-5.6-sol","output_text":"stream answer","output":[{"id":"rs_stream_reasoning_1","type":"reasoning","status":"completed","summary":[],"encrypted_content":"encrypted-stream-reasoning"},{"id":"msg_stream_reasoning_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"stream answer"}]}],"usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7}}}\n\n'
+    ];
+    const upstreamBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>);
+      if (upstreamBodies.length === 1) {
+        return createSseResponse(upstreamFrames);
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'resp_stream_reasoning_2',
+          object: 'response',
+          status: 'completed',
+          model: 'gpt-5.6-sol',
+          output_text: 'second answer',
+          output: [
+            {
+              id: 'msg_stream_reasoning_2',
+              type: 'message',
+              role: 'assistant',
+              status: 'completed',
+              content: [{ type: 'output_text', text: 'second answer' }]
+            }
+          ],
+          usage: {
+            input_tokens: 8,
+            output_tokens: 3,
+            total_tokens: 11
+          }
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6-sol'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const firstResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'gpt-5.6-sol',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'First turn' }]
+        }
+      });
+
+      expect(firstResponse.statusCode).toBe(200);
+      expect(firstResponse.headers['content-type']).toContain('text/event-stream');
+      expect(firstResponse.body).toContain('"type":"redacted_thinking"');
+      expect(firstResponse.body).toContain('ccr-openai-responses-reasoning-v1:');
+      expect(firstResponse.body).not.toContain('encrypted-stream-reasoning');
+
+      const eventPayloads = firstResponse.body
+        .split('\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => JSON.parse(line.slice('data: '.length)) as Record<string, unknown>);
+      const redactedStart = eventPayloads.find((event) => {
+        const block = event.content_block as Record<string, unknown> | undefined;
+        return event.type === 'content_block_start' && block?.type === 'redacted_thinking';
+      });
+      const redactedBlock = redactedStart?.content_block as Record<string, unknown> | undefined;
+      if (!redactedBlock) {
+        throw new Error('Expected a streamed redacted_thinking block.');
+      }
+
+      const secondResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'gpt-5.6-sol',
+          max_tokens: 128,
+          messages: [
+            { role: 'user', content: 'First turn' },
+            {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'stream answer' }, redactedBlock]
+            },
+            { role: 'user', content: 'Second turn' }
+          ]
+        }
+      });
+
+      expect(secondResponse.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(upstreamBodies[1]).toMatchObject({
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'First turn' }]
+          },
+          {
+            type: 'reasoning',
+            id: 'rs_stream_reasoning_1',
+            summary: [],
+            encrypted_content: 'encrypted-stream-reasoning'
+          },
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'stream answer' }]
+          },
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Second turn' }]
+          }
+        ]
+      });
+      const secondInput = upstreamBodies[1]?.input as Array<Record<string, unknown>>;
+      expect(secondInput[1]).not.toHaveProperty('status');
     } finally {
       await app.close();
     }

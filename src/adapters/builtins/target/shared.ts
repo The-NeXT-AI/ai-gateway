@@ -11,7 +11,12 @@ import type {
 } from '../../../types';
 import { err, ok } from '../../../types';
 import { asBoolean, asNumber, asString, extractTextFromPart, isObject } from '../../../utils';
-import { OPENAI_RESPONSES_REASONING_FORMAT } from '../reasoning-envelope';
+import {
+  ANTHROPIC_CLAUDE_REASONING_FORMAT,
+  GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
+  OPENAI_RESPONSES_REASONING_FORMAT
+} from '../reasoning-envelope';
 import { resolveOpenAIChatProviderThinkingAdapter } from './openai-chat-compat';
 
 interface OpenAIChatCompatibleRewriteOptions {
@@ -525,16 +530,17 @@ function extractGeminiInteractionFunctionCalls(steps: unknown[]): StandardRespon
 }
 
 function extractGeminiInteractionReasoningItems(steps: unknown[]): StandardResponseReasoning[] {
-  const reasoningContent: NonNullable<StandardResponseReasoning['content']> = [];
-  const reasoningSummary: NonNullable<StandardResponseReasoning['summary']> = [];
-  const reasoningDetails: unknown[] = [];
-  let encryptedContent: string | undefined;
+  const reasoningItems: StandardResponseReasoning[] = [];
 
-  for (const step of steps) {
+  for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index];
     if (!isObject(step) || asString(step.type) !== 'thought') {
       continue;
     }
 
+    const reasoningContent: NonNullable<StandardResponseReasoning['content']> = [];
+    const reasoningSummary: NonNullable<StandardResponseReasoning['summary']> = [];
+    const reasoningDetails: unknown[] = [];
     const summary =
       extractGeminiInteractionThoughtSummary(step.summary) ||
       extractGeminiInteractionThoughtSummary(step.thought_summary);
@@ -546,7 +552,8 @@ function extractGeminiInteractionReasoningItems(steps: unknown[]): StandardRespo
       reasoningDetails.push({
         type: 'reasoning.summary',
         summary,
-        format: 'google-interactions-v1'
+        format: GEMINI_INTERACTIONS_REASONING_FORMAT,
+        index
       });
     }
 
@@ -559,47 +566,38 @@ function extractGeminiInteractionReasoningItems(steps: unknown[]): StandardRespo
       reasoningDetails.push({
         type: 'reasoning.text',
         text,
-        format: 'google-interactions-v1'
+        format: GEMINI_INTERACTIONS_REASONING_FORMAT,
+        index
       });
     }
 
     const signature = asString(step.signature);
     if (signature) {
-      encryptedContent = encryptedContent || signature;
       reasoningDetails.push({
         type: 'reasoning.encrypted',
         data: signature,
-        format: 'google-interactions-v1'
+        format: GEMINI_INTERACTIONS_REASONING_FORMAT,
+        index
       });
     }
+
+    if (reasoningDetails.length === 0) {
+      continue;
+    }
+
+    reasoningItems.push({
+      id: asString(step.id) || `rs_${randomUUID().replace(/-/g, '')}`,
+      type: 'reasoning',
+      status: 'completed',
+      summary: reasoningSummary,
+      ...(reasoningContent.length > 0 ? { content: reasoningContent } : {}),
+      ...(signature ? { encrypted_content: signature } : {}),
+      reasoning_details: reasoningDetails,
+      source_format: GEMINI_INTERACTIONS_REASONING_FORMAT
+    });
   }
 
-  if (
-    reasoningContent.length === 0 &&
-    reasoningSummary.length === 0 &&
-    reasoningDetails.length === 0 &&
-    !encryptedContent
-  ) {
-    return [];
-  }
-
-  const reasoning: StandardResponseReasoning = {
-    id: `rs_${randomUUID().replace(/-/g, '')}`,
-    type: 'reasoning',
-    status: 'completed',
-    summary: reasoningSummary
-  };
-  if (reasoningContent.length > 0) {
-    reasoning.content = reasoningContent;
-  }
-  if (encryptedContent) {
-    reasoning.encrypted_content = encryptedContent;
-  }
-  if (reasoningDetails.length > 0) {
-    reasoning.reasoning_details = reasoningDetails;
-  }
-
-  return [reasoning];
+  return reasoningItems;
 }
 
 function extractGeminiInteractionThoughtSummary(value: unknown): string {
@@ -829,6 +827,9 @@ function extractOpenAIChatReasoningItems(choices: unknown): StandardResponseReas
   if (details.rawDetails.length > 0) {
     reasoning.reasoning_details = details.rawDetails;
   }
+  if (details.sourceFormat) {
+    reasoning.source_format = details.sourceFormat;
+  }
 
   return [reasoning];
 }
@@ -891,6 +892,7 @@ function normalizeReasoningContentParts(value: unknown): NonNullable<StandardRes
 
 function normalizeChatReasoningDetails(value: unknown): {
   id?: string;
+  sourceFormat?: string;
   content: NonNullable<StandardResponseReasoning['content']>;
   summary: StandardResponseReasoning['summary'];
   encryptedContent?: string;
@@ -898,6 +900,7 @@ function normalizeChatReasoningDetails(value: unknown): {
 } {
   const normalized: {
     id?: string;
+    sourceFormat?: string;
     content: NonNullable<StandardResponseReasoning['content']>;
     summary: StandardResponseReasoning['summary'];
     encryptedContent?: string;
@@ -930,6 +933,10 @@ function normalizeChatReasoningDetails(value: unknown): {
     const id = asString(detail.id);
     if (id && !normalized.id) {
       normalized.id = id;
+    }
+    const format = asString(detail.format);
+    if (format && !normalized.sourceFormat) {
+      normalized.sourceFormat = format;
     }
 
     const type = asString(detail.type);
@@ -1161,18 +1168,22 @@ function extractAnthropicReasoningItems(content: unknown): StandardResponseReaso
     const type = asString(block.type);
     if (type === 'thinking') {
       const thinking = asString(block.thinking);
-      if (!thinking) {
+      const signature = asString(block.signature);
+      if (!thinking && !signature) {
         continue;
       }
 
-      reasoningContent.push({
-        type: 'reasoning_text',
-        text: thinking
-      });
+      if (thinking) {
+        reasoningContent.push({
+          type: 'reasoning_text',
+          text: thinking
+        });
+      }
       reasoningDetails.push({
         type: 'thinking',
-        thinking,
-        ...(asString(block.signature) ? { signature: asString(block.signature) } : {})
+        thinking: thinking || '',
+        ...(signature ? { signature } : {}),
+        format: ANTHROPIC_CLAUDE_REASONING_FORMAT
       });
       continue;
     }
@@ -1186,7 +1197,8 @@ function extractAnthropicReasoningItems(content: unknown): StandardResponseReaso
       encryptedContent = encryptedContent || data;
       reasoningDetails.push({
         type: 'redacted_thinking',
-        data
+        data,
+        format: ANTHROPIC_CLAUDE_REASONING_FORMAT
       });
     }
   }
@@ -1199,7 +1211,8 @@ function extractAnthropicReasoningItems(content: unknown): StandardResponseReaso
     id: `rs_${randomUUID().replace(/-/g, '')}`,
     type: 'reasoning',
     status: 'completed',
-    summary: []
+    summary: [],
+    source_format: ANTHROPIC_CLAUDE_REASONING_FORMAT
   };
 
   if (reasoningContent.length > 0) {
@@ -1259,6 +1272,9 @@ function extractGeminiFunctionCalls(parts: unknown[]): StandardResponseFunctionC
       name,
       arguments: normalizeFunctionCallArguments(functionCall.args ?? functionCall.arguments),
       ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
+      ...(thoughtSignature
+        ? { thought_signature_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT }
+        : {}),
       status: 'completed'
     });
   }
@@ -1282,29 +1298,48 @@ function readGeminiThoughtSignature(
 function extractGeminiReasoningItems(parts: unknown[]): StandardResponseReasoning[] {
   const reasoningContent: NonNullable<StandardResponseReasoning['content']> = [];
   const reasoningDetails: unknown[] = [];
+  let encryptedContent: string | undefined;
 
-  for (const part of parts) {
-    if (!isObject(part) || asBoolean(part.thought) !== true) {
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!isObject(part)) {
       continue;
     }
 
-    const text = extractTextFromPart(part);
-    if (!text) {
+    const functionCall = isObject(part.functionCall) || isObject(part.function_call);
+    const isThought = asBoolean(part.thought) === true;
+    const text = isThought ? extractTextFromPart(part) : '';
+    const thoughtSignature = functionCall
+      ? undefined
+      : readGeminiThoughtSignature(part);
+    if (!text && !thoughtSignature) {
       continue;
     }
 
-    reasoningContent.push({
-      type: 'reasoning_text',
-      text
-    });
-    reasoningDetails.push({
-      type: 'reasoning.text',
-      text,
-      format: 'google-gemini-v1'
-    });
+    if (text) {
+      reasoningContent.push({
+        type: 'reasoning_text',
+        text
+      });
+      reasoningDetails.push({
+        type: 'reasoning.text',
+        text,
+        format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+        index
+      });
+    }
+    if (thoughtSignature) {
+      encryptedContent = encryptedContent || thoughtSignature;
+      reasoningDetails.push({
+        type: 'reasoning.encrypted',
+        data: thoughtSignature,
+        format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+        index
+      });
+    }
   }
 
-  if (reasoningContent.length === 0 && reasoningDetails.length === 0) {
+  if (reasoningDetails.length === 0) {
     return [];
   }
 
@@ -1314,8 +1349,10 @@ function extractGeminiReasoningItems(parts: unknown[]): StandardResponseReasonin
       type: 'reasoning',
       status: 'completed',
       summary: [],
-      content: reasoningContent,
-      reasoning_details: reasoningDetails
+      ...(reasoningContent.length > 0 ? { content: reasoningContent } : {}),
+      ...(encryptedContent ? { encrypted_content: encryptedContent } : {}),
+      reasoning_details: reasoningDetails,
+      source_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT
     }
   ];
 }

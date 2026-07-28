@@ -867,6 +867,7 @@ export interface StandardResponseFunctionCall {
   namespace?: string;
   arguments: string;
   thought_signature?: string;
+  thought_signature_format?: string;
   status: 'completed';
 }
 
@@ -935,6 +936,7 @@ export type StandardRequestInputContent =
       name: string;
       input: unknown;
       thought_signature?: string;
+      thought_signature_format?: string;
     }
   | {
       type: 'tool_result';

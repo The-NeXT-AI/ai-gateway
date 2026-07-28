@@ -3569,8 +3569,7 @@ function expectedAnthropicInterleavedThinkingToolMessages(includeReasoning: bool
         type: 'reasoning.text',
         text: 'Need to call the weather tool before answering.',
         format: 'anthropic-claude-v1',
-        index: 0,
-        signature: 'sig_123'
+        index: 0
       }
     ];
   }

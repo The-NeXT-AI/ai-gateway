@@ -369,6 +369,7 @@ describe('parseAnthropicMessagesRequest', () => {
         content: [
           {
             type: 'reasoning',
+            source_format: 'anthropic-claude-v1',
             text: 'anthropic thinking',
             reasoning_details: [
               {
@@ -529,6 +530,8 @@ describe('parseOpenAIChatCompletionsRequest', () => {
           },
           {
             type: 'reasoning',
+            id: 'reasoning-text-1',
+            source_format: 'anthropic-claude-v1',
             text: 'interleaved thinking',
             reasoning_details: [
               {
@@ -797,6 +800,7 @@ describe('parseGeminiGenerateContentRequest', () => {
         content: [
           {
             type: 'reasoning',
+            source_format: 'google-generate-content-v1',
             text: 'gemini interleaved thinking',
             encrypted_content: 'gemini-thought-signature',
             reasoning_details: [

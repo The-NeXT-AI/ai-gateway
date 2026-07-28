@@ -16,6 +16,10 @@ import { closeRawTraceManager, initializeRawTraceManager } from '../raw-trace';
 import { closeCodexOauthStateStore, updateDistributedCredentialEncryption } from '../provider/plugins';
 import { syncGatewayPluginModulesFromConfig } from '../plugins/loader';
 import type { GatewayConfig, ProviderConfig, ProviderPluginConfig, TargetAdapter } from '../types';
+import {
+  decodeReasoningTransportEnvelope,
+  GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+} from '../adapters/builtins/reasoning-envelope';
 
 describe('gateway routes protocol conversion', () => {
   afterEach(async () => {
@@ -5057,7 +5061,7 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
-  it('maps OpenAI Responses reasoning history to Gemini Interactions thought summary arrays', async () => {
+  it('keeps OpenAI Responses reasoning history out of Gemini Interactions thoughts', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(
         JSON.stringify({
@@ -5138,10 +5142,6 @@ describe('gateway routes protocol conversion', () => {
         {
           type: 'user_input',
           content: [{ type: 'text', text: 'Use a weather tool.' }]
-        },
-        {
-          type: 'thought',
-          summary: [{ type: 'text', text: 'Check current weather.\nNeed weather data.' }]
         },
         {
           type: 'function_call',
@@ -5367,7 +5367,18 @@ describe('gateway routes protocol conversion', () => {
       expect(response.headers['content-type']).toContain('text/event-stream');
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(response.body).toContain('"type":"thinking"');
-      expect(response.body).toContain('"type":"signature_delta","signature":"gemini-function-signature"');
+      const signatureEvent = parseJsonSseEvents(response.body).find(
+        ({ data }) => data.delta?.type === 'signature_delta'
+      );
+      expect(
+        decodeReasoningTransportEnvelope(
+          String(signatureEvent?.data.delta?.signature)
+        )
+      ).toMatchObject({
+        format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+        data: 'gemini-function-signature',
+        kind: 'signature'
+      });
       expect(response.body).toContain('"type":"tool_use"');
       expect(response.body).toContain('"id":"toolu_weather_stream"');
       expect(response.body).not.toContain('"thought_signature":"gemini-function-signature"');
@@ -5485,7 +5496,20 @@ describe('gateway routes protocol conversion', () => {
 
       expect(firstResponse.statusCode).toBe(200);
       expect(firstResponse.body).toContain('"type":"thinking"');
-      expect(firstResponse.body).toContain('"signature":"gemini-function-signature"');
+      const firstPayload = JSON.parse(firstResponse.body) as {
+        content: Array<Record<string, unknown>>;
+      };
+      const carriedSignature = String(
+        firstPayload.content.find((block) => block.type === 'thinking')
+          ?.signature
+      );
+      expect(
+        decodeReasoningTransportEnvelope(carriedSignature)
+      ).toMatchObject({
+        format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+        data: 'gemini-function-signature',
+        kind: 'signature'
+      });
       expect(firstResponse.body).not.toContain('"thought_signature":"gemini-function-signature"');
 
       const secondResponse = await app.inject({
@@ -5519,7 +5543,7 @@ describe('gateway routes protocol conversion', () => {
                 {
                   type: 'thinking',
                   thinking: '',
-                  signature: 'gemini-function-signature'
+                  signature: carriedSignature
                 },
                 {
                   type: 'tool_use',

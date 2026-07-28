@@ -1,4 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import {
+  decodeOpenAIResponsesReasoningEnvelope,
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
+  OPENAI_RESPONSES_REASONING_FORMAT
+} from '../reasoning-envelope';
 import { geminiInteractionsSourceAdapter } from './gemini-interactions';
 
 describe('geminiInteractionsSourceAdapter', () => {
@@ -160,6 +165,7 @@ describe('geminiInteractionsSourceAdapter', () => {
         content: [
           {
             type: 'reasoning',
+            source_format: GEMINI_INTERACTIONS_REASONING_FORMAT,
             text: 'Need current conditions.',
             summary: 'Use a weather tool.',
             encrypted_content: 'sig_123',
@@ -219,6 +225,7 @@ describe('geminiInteractionsSourceAdapter', () => {
             id: 'rs_123',
             type: 'reasoning',
             status: 'completed',
+            source_format: GEMINI_INTERACTIONS_REASONING_FORMAT,
             summary: [{ type: 'summary_text', text: 'Need weather.' }],
             content: [{ type: 'reasoning_text', text: 'Use tool result.' }],
             encrypted_content: 'sig_123'
@@ -288,6 +295,139 @@ describe('geminiInteractionsSourceAdapter', () => {
     });
     expect(typeof (formatted as Record<string, unknown>).created).toBe('string');
     expect(typeof (formatted as Record<string, unknown>).updated).toBe('string');
+  });
+
+  it('preserves Responses reasoning IDs across Gemini Interactions history', () => {
+    const formatted = geminiInteractionsSourceAdapter.fromStandardResponse({
+      response: {
+        id: 'resp_roundtrip',
+        object: 'response',
+        status: 'completed',
+        model: 'responses-model',
+        output_text: 'First answer.',
+        output: [
+          {
+            id: 'rs_roundtrip',
+            type: 'reasoning',
+            status: 'completed',
+            summary: [],
+            content: [],
+            encrypted_content: 'encrypted-roundtrip',
+            source_format: OPENAI_RESPONSES_REASONING_FORMAT
+          },
+          {
+            id: 'msg_roundtrip',
+            type: 'message',
+            role: 'assistant',
+            status: 'completed',
+            content: [
+              {
+                type: 'output_text',
+                text: 'First answer.',
+                annotations: []
+              }
+            ]
+          }
+        ],
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          total_tokens: 2,
+          cache_read_tokens: 0
+        }
+      }
+    } as never) as Record<string, unknown>;
+
+    const steps = formatted.steps as Array<Record<string, unknown>>;
+    expect(decodeOpenAIResponsesReasoningEnvelope(String(steps[0]?.signature))).toEqual({
+      id: 'rs_roundtrip',
+      encryptedContent: 'encrypted-roundtrip'
+    });
+
+    const parsed = geminiInteractionsSourceAdapter.toStandardRequest({
+      body: {
+        model: 'responses-model',
+        input: [...steps, { type: 'user_input', content: [{ type: 'text', text: 'Continue.' }] }]
+      },
+      request: {
+        url: '/v1beta/interactions'
+      } as never,
+      source: {
+        adapterKey: 'gemini_interactions'
+      },
+      config: {} as never
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const input = parsed.value.input as Array<{
+      role: string;
+      content: Array<Record<string, unknown>>;
+    }>;
+    expect(input[0]?.content[0]).toMatchObject({
+      type: 'reasoning',
+      id: 'rs_roundtrip',
+      source_format: OPENAI_RESPONSES_REASONING_FORMAT,
+      encrypted_content: 'encrypted-roundtrip'
+    });
+    expect(input[0]?.content[0]?.reasoning_details).toEqual([
+      {
+        type: 'reasoning.encrypted',
+        data: 'encrypted-roundtrip',
+        id: 'rs_roundtrip',
+        format: OPENAI_RESPONSES_REASONING_FORMAT
+      }
+    ]);
+  });
+
+  it('keeps malformed reasoning envelopes as native Gemini signatures', () => {
+    const malformedEnvelope = 'ccr-openai-responses-reasoning-v1:not-valid-base64';
+    const parsed = geminiInteractionsSourceAdapter.toStandardRequest({
+      body: {
+        model: 'gemini-model',
+        input: [
+          {
+            type: 'thought',
+            signature: malformedEnvelope
+          }
+        ]
+      },
+      request: {
+        url: '/v1beta/interactions'
+      } as never,
+      source: {
+        adapterKey: 'gemini_interactions'
+      },
+      config: {} as never
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const reasoning = (parsed.value.input as Array<{
+      content: Array<Record<string, unknown>>;
+    }>)[0]?.content[0];
+    expect(reasoning).toMatchObject({
+      type: 'reasoning',
+      encrypted_content: malformedEnvelope,
+      reasoning_details: [
+        {
+          type: 'reasoning.encrypted',
+          data: malformedEnvelope,
+          format: 'google-interactions-v1'
+        }
+      ]
+    });
+    expect(reasoning).not.toHaveProperty('id');
+    expect(reasoning).toHaveProperty(
+      'source_format',
+      GEMINI_INTERACTIONS_REASONING_FORMAT
+    );
   });
 
   it('builds passthrough Interactions upstream requests', () => {

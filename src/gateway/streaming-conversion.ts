@@ -14,7 +14,11 @@ import {
   formatGeminiGenerateContentResponse
 } from '../adapters/builtins/source/formatters';
 import {
+  ANTHROPIC_CLAUDE_REASONING_FORMAT,
   encodeOpenAIResponsesReasoningEnvelope,
+  encodeReasoningTransportEnvelope,
+  GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
   OPENAI_RESPONSES_REASONING_FORMAT
 } from '../adapters/builtins/reasoning-envelope';
 import { splitNamespacedToolCallName } from '../adapters/builtins/target/tools';
@@ -27,7 +31,7 @@ import type {
   StandardResponseReasoning,
   StandardUsage
 } from '../types';
-import { asNumber, asString, extractTextFromPart, isObject } from '../utils';
+import { asBoolean, asNumber, asString, extractTextFromPart, isObject } from '../utils';
 
 interface OpenAIResponsesRelayState {
   createdAt: number;
@@ -1883,6 +1887,10 @@ function buildGeminiInteractionsStreamFrames(standardResponse: StandardResponse)
       if (text) {
         frames.push(...emitGeminiInteractionsThoughtDelta(state, 'thought_summary', text));
       }
+      const signature = standardReasoningSignatureForGeminiInteractions(item);
+      if (signature) {
+        frames.push(...emitGeminiInteractionsStandaloneThoughtSignatures(state, [signature]));
+      }
       continue;
     }
 
@@ -2035,10 +2043,13 @@ function emitGeminiInteractionsThoughtDelta(
 
 function ensureGeminiInteractionsThoughtStarted(state: GeminiInteractionsRelayState): string[] {
   const frames = ensureGeminiInteractionsRelayStarted(state);
-  if (state.thoughtStarted) {
+  if (state.thoughtStarted && !state.thoughtStopped) {
     return frames;
   }
 
+  state.thoughtStarted = false;
+  state.thoughtStopped = false;
+  state.thoughtStepIndex = undefined;
   state.thoughtStepIndex = state.nextStepIndex++;
   state.thoughtStarted = true;
   frames.push(
@@ -2050,6 +2061,24 @@ function ensureGeminiInteractionsThoughtStarted(state: GeminiInteractionsRelaySt
       event_type: 'step.start'
     })
   );
+  return frames;
+}
+
+function emitGeminiInteractionsStandaloneThoughtSignatures(
+  state: GeminiInteractionsRelayState,
+  signatures: string[]
+): string[] {
+  const frames: string[] = [];
+  for (const signature of signatures) {
+    if (!signature) {
+      continue;
+    }
+    frames.push(...emitGeminiInteractionsThoughtDelta(state, 'thought_signature', signature));
+    if (state.thoughtStarted && !state.thoughtStopped) {
+      frames.push(encodeGeminiInteractionsStepStop(state.thoughtStepIndex));
+      state.thoughtStopped = true;
+    }
+  }
   return frames;
 }
 
@@ -2209,6 +2238,48 @@ function collectStandardReasoningText(item: StandardResponseReasoning): string {
   }
 
   return item.summary.map((summary) => summary.text).filter(Boolean).join('\n').trim();
+}
+
+function standardReasoningSignatureForGeminiInteractions(
+  item: StandardResponseReasoning
+): string | undefined {
+  let signature: string | undefined;
+  let kind: 'signature' | 'encrypted' | undefined;
+  let format = item.source_format;
+  let id = item.id;
+  if (Array.isArray(item.reasoning_details)) {
+    for (const detail of item.reasoning_details) {
+      if (!isObject(detail)) {
+        continue;
+      }
+      format = asString(detail.format) || format;
+      id = asString(detail.id) || id;
+      const explicitSignature =
+        asString(detail.signature) ||
+        asString(detail.thoughtSignature) ||
+        asString(detail.thought_signature);
+      const encrypted =
+        asString(detail.data) ||
+        asString(detail.encrypted_content);
+      signature = explicitSignature || encrypted;
+      if (signature) {
+        kind = explicitSignature ? 'signature' : 'encrypted';
+        break;
+      }
+    }
+  }
+
+  if (!signature && item.encrypted_content) {
+    signature = item.encrypted_content;
+    kind = 'encrypted';
+  }
+  if (!signature || !format) {
+    return undefined;
+  }
+
+  return format === GEMINI_INTERACTIONS_REASONING_FORMAT
+    ? signature
+    : encodeReasoningTransportEnvelope(format, signature, id, kind);
 }
 
 async function* relayAnthropicMessagesFromOpenAIStream(upstreamResponse: Response): AsyncGenerator<string> {
@@ -2545,7 +2616,7 @@ function emitGeminiInteractionsFramesFromOpenAIResponsesEvent(
     return frames;
   }
 
-  if (eventType === 'response.completed') {
+  if (eventType === 'response.completed' || eventType === 'response.incomplete') {
     const response = isObject(payload.response) ? payload.response : undefined;
     const id = asString(response?.id);
     const model = asString(response?.model);
@@ -2555,8 +2626,14 @@ function emitGeminiInteractionsFramesFromOpenAIResponsesEvent(
     if (model) {
       state.model = model;
     }
+    state.status = asString(response?.status) || state.status;
     const outputText = asString(response?.output_text) || extractOpenAIResponsesOutputText(response?.output);
     const frames: string[] = [];
+    const reasoningSignatures = collectOpenAIResponsesEncryptedReasoning(response).map(
+      ({ id: reasoningId, encryptedContent }) =>
+        encodeOpenAIResponsesReasoningEnvelope(reasoningId, encryptedContent)
+    );
+    frames.push(...emitGeminiInteractionsStandaloneThoughtSignatures(state, reasoningSignatures));
     if (outputText && !state.outputText) {
       frames.push(...emitGeminiInteractionsTextDelta(state, outputText));
     }
@@ -2687,6 +2764,22 @@ function emitGeminiInteractionsFramesFromAnthropicEvent(
     if (deltaType === 'thinking_delta') {
       return emitGeminiInteractionsThoughtDelta(state, 'thought_summary', asString(delta?.thinking) || '');
     }
+    if (deltaType === 'signature_delta') {
+      const signature = asString(delta?.signature);
+      return emitGeminiInteractionsStandaloneThoughtSignatures(
+        state,
+        signature
+          ? [
+              encodeReasoningTransportEnvelope(
+                ANTHROPIC_CLAUDE_REASONING_FORMAT,
+                signature,
+                undefined,
+                'signature'
+              )
+            ]
+          : []
+      );
+    }
     if (deltaType === 'input_json_delta') {
       const index = asNumber(payload.index) ?? 0;
       const toolCall = state.pendingToolCalls.get(index);
@@ -2745,6 +2838,28 @@ function emitGeminiInteractionsFramesFromGeminiGeneratePayload(
       : isObject(part.function_call)
         ? part.function_call
         : undefined;
+    const thoughtSignature =
+      asString(part.thoughtSignature) ||
+      asString(part.thought_signature) ||
+      (functionCall
+        ? asString(functionCall.thoughtSignature) ||
+          asString(functionCall.thought_signature)
+        : undefined);
+    if (thoughtSignature) {
+      frames.push(
+        ...emitGeminiInteractionsStandaloneThoughtSignatures(
+          state,
+          [
+            encodeReasoningTransportEnvelope(
+              GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+              thoughtSignature,
+              undefined,
+              'signature'
+            )
+          ]
+        )
+      );
+    }
     if (functionCall) {
       const toolCall = mergeGeminiInteractionsToolCall(
         state,
@@ -2761,7 +2876,9 @@ function emitGeminiInteractionsFramesFromGeminiGeneratePayload(
     }
 
     const text = asString(part.text);
-    if (text) {
+    if (text && asBoolean(part.thought) === true) {
+      frames.push(...emitGeminiInteractionsThoughtDelta(state, 'thought_summary', text));
+    } else if (text) {
       frames.push(...emitGeminiInteractionsTextDelta(state, text));
     }
   }
@@ -2902,11 +3019,51 @@ function emitOpenAIChatFramesFromAnthropicEvent(
       return frames;
     }
 
+    if (deltaType === 'signature_delta') {
+      const signature = asString(delta?.signature);
+      if (!signature) {
+        return [];
+      }
+
+      const frames = ensureOpenAIChatRelayStarted(state);
+      frames.push(
+        buildOpenAIChatRelayDeltaFrame(state, {
+          reasoning_details: [
+            {
+              type: 'reasoning.text',
+              signature,
+              format: ANTHROPIC_CLAUDE_REASONING_FORMAT
+            }
+          ]
+        })
+      );
+      return frames;
+    }
+
     return [];
   }
 
   if (eventType === 'content_block_start') {
     const contentBlock = isObject(payload.content_block) ? payload.content_block : undefined;
+    if (asString(contentBlock?.type) === 'redacted_thinking') {
+      const data = asString(contentBlock?.data);
+      if (!data) {
+        return [];
+      }
+      const frames = ensureOpenAIChatRelayStarted(state);
+      frames.push(
+        buildOpenAIChatRelayDeltaFrame(state, {
+          reasoning_details: [
+            {
+              type: 'reasoning.encrypted',
+              data,
+              format: ANTHROPIC_CLAUDE_REASONING_FORMAT
+            }
+          ]
+        })
+      );
+      return frames;
+    }
     if (asString(contentBlock?.type) !== 'tool_use') {
       return [];
     }
@@ -3801,8 +3958,23 @@ function emitOpenAIResponsesFramesFromChatChunk(
     frames.push(...emitOpenAIResponsesReasoningTextDelta(state, textDelta));
   }
   if (reasoningDeltas.encryptedContent && !state.reasoningEncryptedContent) {
-    state.reasoningEncryptedContent = reasoningDeltas.encryptedContent;
-    frames.push(...ensureOpenAIResponsesReasoningOutputStarted(state));
+    if (reasoningDeltas.encryptedId && !state.reasoningItemStarted) {
+      state.reasoningItemId = reasoningDeltas.encryptedId;
+    }
+    state.reasoningEncryptedContent =
+      reasoningDeltas.encryptedFormat === OPENAI_RESPONSES_REASONING_FORMAT
+        ? reasoningDeltas.encryptedContent
+        : reasoningDeltas.encryptedFormat
+          ? encodeReasoningTransportEnvelope(
+              reasoningDeltas.encryptedFormat,
+              reasoningDeltas.encryptedContent,
+              reasoningDeltas.encryptedId || state.reasoningItemId,
+              reasoningDeltas.encryptedKind
+            )
+          : undefined;
+    if (state.reasoningEncryptedContent) {
+      frames.push(...ensureOpenAIResponsesReasoningOutputStarted(state));
+    }
   }
 
   if (deltaText) {
@@ -3835,11 +4007,17 @@ function collectOpenAIChatReasoningDeltas(delta: Record<string, unknown> | undef
   textDeltas: string[];
   summaryDeltas: string[];
   encryptedContent?: string;
+  encryptedFormat?: string;
+  encryptedId?: string;
+  encryptedKind?: 'signature' | 'encrypted';
 } {
   const collected: {
     textDeltas: string[];
     summaryDeltas: string[];
     encryptedContent?: string;
+    encryptedFormat?: string;
+    encryptedId?: string;
+    encryptedKind?: 'signature' | 'encrypted';
   } = {
     textDeltas: [],
     summaryDeltas: []
@@ -3865,7 +4043,14 @@ function collectOpenAIChatReasoningDeltas(delta: Record<string, unknown> | undef
     const type = asString(detail.type);
     const summary = asString(detail.summary);
     const text = asString(detail.text) || asString(detail.reasoning) || asString(detail.thinking);
-    const encryptedContent = asString(detail.encrypted_content) || asString(detail.data);
+    const signature =
+      asString(detail.signature) ||
+      asString(detail.thoughtSignature) ||
+      asString(detail.thought_signature);
+    const encryptedContent =
+      signature ||
+      asString(detail.encrypted_content) ||
+      asString(detail.data);
 
     if (type === 'reasoning.summary' || (summary && !text)) {
       if (summary || text) {
@@ -3880,6 +4065,9 @@ function collectOpenAIChatReasoningDeltas(delta: Record<string, unknown> | undef
 
     if (encryptedContent && !collected.encryptedContent) {
       collected.encryptedContent = encryptedContent;
+      collected.encryptedFormat = asString(detail.format);
+      collected.encryptedId = asString(detail.id);
+      collected.encryptedKind = signature ? 'signature' : 'encrypted';
     }
   }
 
@@ -5644,7 +5832,12 @@ function emitOpenAIResponsesFramesFromGeminiInteractionEvent(
       if (!signature || state.reasoningEncryptedContent) {
         return [];
       }
-      state.reasoningEncryptedContent = signature;
+      state.reasoningEncryptedContent = encodeReasoningTransportEnvelope(
+        GEMINI_INTERACTIONS_REASONING_FORMAT,
+        signature,
+        state.reasoningItemId,
+        'signature'
+      );
       return ensureOpenAIResponsesReasoningOutputStarted(state);
     }
 
@@ -5754,6 +5947,22 @@ function emitOpenAIChatFramesFromGeminiInteractionEvent(
     if (deltaType === 'thought_summary') {
       const text = extractGeminiInteractionDeltaText(delta);
       return text ? [buildOpenAIChatRelayDeltaFrame(state, { reasoning_content: text })] : [];
+    }
+    if (deltaType === 'thought_signature') {
+      const signature = asString(delta?.signature);
+      return signature
+        ? [
+            buildOpenAIChatRelayDeltaFrame(state, {
+              reasoning_details: [
+                {
+                  type: 'reasoning.encrypted',
+                  data: signature,
+                  format: GEMINI_INTERACTIONS_REASONING_FORMAT
+                }
+              ]
+            })
+          ]
+        : [];
     }
     if (deltaType === 'arguments_delta') {
       const args = asString(delta?.arguments) || '';
@@ -5877,6 +6086,30 @@ function emitAnthropicFramesFromGeminiInteractionEvent(
       return frames;
     }
 
+    if (deltaType === 'thought_signature') {
+      const signature = asString(delta?.signature);
+      if (!signature) {
+        return [];
+      }
+      const frames = ensureAnthropicThinkingBlockStarted(state);
+      frames.push(
+        encodeSseEvent('content_block_delta', {
+          type: 'content_block_delta',
+          index: state.activeBlockIndex,
+          delta: {
+            type: 'signature_delta',
+            signature: encodeReasoningTransportEnvelope(
+              GEMINI_INTERACTIONS_REASONING_FORMAT,
+              signature,
+              undefined,
+              'signature'
+            )
+          }
+        })
+      );
+      return frames;
+    }
+
     if (deltaType === 'arguments_delta') {
       const index = asNumber(payload.index) ?? 0;
       const toolCall = state.pendingToolCalls.get(index);
@@ -5962,6 +6195,56 @@ function emitGeminiFramesFromGeminiInteractionEvent(
               content: {
                 role: 'model',
                 parts: [{ text }]
+              }
+            }
+          ],
+          modelVersion: state.model
+        })
+      ];
+    }
+    if (deltaType === 'thought_summary') {
+      const text = extractGeminiInteractionDeltaText(delta);
+      if (!text) {
+        return [];
+      }
+      state.emittedAnyDelta = true;
+      return [
+        encodeSseData({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ text, thought: true }]
+              }
+            }
+          ],
+          modelVersion: state.model
+        })
+      ];
+    }
+    if (deltaType === 'thought_signature') {
+      const thoughtSignature = asString(delta?.signature);
+      if (!thoughtSignature) {
+        return [];
+      }
+      state.emittedAnyDelta = true;
+      return [
+        encodeSseData({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [
+                  {
+                    thought: true,
+                    thoughtSignature: encodeReasoningTransportEnvelope(
+                      GEMINI_INTERACTIONS_REASONING_FORMAT,
+                      thoughtSignature,
+                      undefined,
+                      'signature'
+                    )
+                  }
+                ]
               }
             }
           ],

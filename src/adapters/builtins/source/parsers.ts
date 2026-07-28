@@ -17,7 +17,10 @@ import {
   normalizeMessageRole
 } from '../../../utils';
 import {
-  decodeOpenAIResponsesReasoningEnvelope,
+  ANTHROPIC_CLAUDE_REASONING_FORMAT,
+  decodeReasoningTransportEnvelope,
+  GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
   OPENAI_RESPONSES_REASONING_FORMAT
 } from '../reasoning-envelope';
 import { normalizeNamespacedToolName } from '../target/tools';
@@ -415,6 +418,11 @@ function normalizeGeminiInteractionInputItem(
       normalizeGeminiInteractionThoughtSummary(item.summary) ||
       normalizeGeminiInteractionThoughtSummary(item.thought_summary);
     const signature = asString(item.signature);
+    const envelope = signature
+      ? decodeReasoningTransportEnvelope(signature)
+      : undefined;
+    const encryptedContent = envelope?.data || signature;
+    const sourceFormat = envelope?.format || GEMINI_INTERACTIONS_REASONING_FORMAT;
     if (!text && !summary && !signature) {
       return null;
     }
@@ -424,16 +432,18 @@ function normalizeGeminiInteractionInputItem(
       content: [
         {
           type: 'reasoning',
+          ...(envelope?.id ? { id: envelope.id } : {}),
+          source_format: sourceFormat,
           ...(text ? { text } : {}),
           ...(summary ? { summary } : {}),
-          ...(signature ? { encrypted_content: signature } : {}),
+          ...(encryptedContent ? { encrypted_content: encryptedContent } : {}),
           reasoning_details: [
             ...(summary
               ? [
                   {
                     type: 'reasoning.summary',
                     summary,
-                    format: 'google-interactions-v1'
+                    format: sourceFormat
                   }
                 ]
               : []),
@@ -442,17 +452,25 @@ function normalizeGeminiInteractionInputItem(
                   {
                     type: 'reasoning.text',
                     text,
-                    format: 'google-interactions-v1'
+                    format: sourceFormat
                   }
                 ]
               : []),
-            ...(signature
+            ...(encryptedContent
               ? [
-                  {
-                    type: 'reasoning.encrypted',
-                    data: signature,
-                    format: 'google-interactions-v1'
-                  }
+                  envelope?.kind === 'signature'
+                    ? {
+                        type: 'reasoning.text',
+                        signature: encryptedContent,
+                        ...(envelope?.id ? { id: envelope.id } : {}),
+                        format: sourceFormat
+                      }
+                    : {
+                        type: 'reasoning.encrypted',
+                        data: encryptedContent,
+                        ...(envelope?.id ? { id: envelope.id } : {}),
+                        format: sourceFormat
+                      }
                 ]
               : [])
           ]
@@ -890,11 +908,15 @@ function normalizeOpenAIResponsesReasoningItem(item: Record<string, unknown>): S
 
   const summary = normalizeReasoningSummaryText(item.summary);
   const text = normalizeReasoningContentText(item.content) || asString(item.text);
-  const encryptedContent = asString(item.encrypted_content);
-  const id = asString(item.id);
+  const rawEncryptedContent = asString(item.encrypted_content);
+  const envelope = rawEncryptedContent
+    ? decodeReasoningTransportEnvelope(rawEncryptedContent)
+    : undefined;
+  const encryptedContent = envelope?.data || rawEncryptedContent;
+  const id = envelope?.id || asString(item.id);
   const reasoning: StandardRequestInputContent = {
     type: 'reasoning',
-    source_format: OPENAI_RESPONSES_REASONING_FORMAT
+    source_format: envelope?.format || OPENAI_RESPONSES_REASONING_FORMAT
   };
 
   if (id) {
@@ -914,7 +936,18 @@ function normalizeOpenAIResponsesReasoningItem(item: Record<string, unknown>): S
     return null;
   }
 
-  reasoning.reasoning_details = buildReasoningDetailsForChat(reasoning);
+  reasoning.reasoning_details =
+    envelope?.kind === 'signature'
+      ? [
+          {
+            type: 'reasoning.text',
+            ...(text ? { text } : {}),
+            signature: encryptedContent,
+            ...(id ? { id } : {}),
+            format: reasoning.source_format
+          }
+        ]
+      : buildReasoningDetailsForChat(reasoning);
   return reasoning;
 }
 
@@ -1192,13 +1225,11 @@ function normalizeOpenAIChatReasoningDetails(value: unknown): {
     const summary = asString(detail.summary);
     const text = asString(detail.text) || asString(detail.reasoning) || asString(detail.thinking);
     const encryptedContent = asString(detail.encrypted_content) || asString(detail.data);
-    if (format === OPENAI_RESPONSES_REASONING_FORMAT) {
-      if (id && !normalized.id) {
-        normalized.id = id;
-      }
-      if (!normalized.sourceFormat) {
-        normalized.sourceFormat = format;
-      }
+    if (id && !normalized.id) {
+      normalized.id = id;
+    }
+    if (format && !normalized.sourceFormat) {
+      normalized.sourceFormat = format;
     }
 
     if (type === 'reasoning.summary' || (summary && !text)) {
@@ -1280,11 +1311,56 @@ function normalizeOpenAIChatAssistantToolCalls(toolCalls: unknown): StandardRequ
       continue;
     }
 
+    const extraContent = isObject(toolCall.extra_content) ? toolCall.extra_content : undefined;
+    const googleExtra = isObject(extraContent?.google) ? extraContent.google : undefined;
+    const rawThoughtSignature =
+      asString(googleExtra?.thought_signature) ||
+      asString(googleExtra?.thoughtSignature);
+    const envelope = rawThoughtSignature
+      ? decodeReasoningTransportEnvelope(rawThoughtSignature)
+      : undefined;
+    const thoughtSignature = envelope?.data || rawThoughtSignature;
+    const thoughtSignatureFormat =
+      envelope?.format || (thoughtSignature ? GEMINI_GENERATE_CONTENT_REASONING_FORMAT : undefined);
+    if (
+      thoughtSignature &&
+      thoughtSignatureFormat &&
+      thoughtSignatureFormat !== GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+    ) {
+      normalized.push({
+        type: 'reasoning',
+        ...(envelope?.id ? { id: envelope.id } : {}),
+        source_format: thoughtSignatureFormat,
+        encrypted_content: thoughtSignature,
+        reasoning_details: [
+          envelope?.kind === 'signature'
+            ? {
+                type: 'reasoning.text',
+                signature: thoughtSignature,
+                ...(envelope?.id ? { id: envelope.id } : {}),
+                format: thoughtSignatureFormat
+              }
+            : {
+                type: 'reasoning.encrypted',
+                data: thoughtSignature,
+                ...(envelope?.id ? { id: envelope.id } : {}),
+                format: thoughtSignatureFormat
+              }
+        ]
+      });
+    }
+
     normalized.push({
       type: 'tool_use',
       id: asString(toolCall.id) || `chatcmpl_call_${name}`,
       name,
-      input: normalizeFunctionArgumentsInput(functionPayload?.arguments ?? toolCall.arguments ?? toolCall.input)
+      input: normalizeFunctionArgumentsInput(functionPayload?.arguments ?? toolCall.arguments ?? toolCall.input),
+      ...(thoughtSignature && thoughtSignatureFormat === GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+        ? {
+            thought_signature: thoughtSignature,
+            thought_signature_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+          }
+        : {})
     });
   }
 
@@ -1423,14 +1499,19 @@ function normalizeAnthropicThinkingBlock(
   const blockType = asString(block.type);
   if (blockType === 'thinking') {
     const thinking = asString(block.thinking) || asString(block.text);
-    const signature = asString(block.signature);
-    if (!thinking && !signature) {
+    const rawSignature = asString(block.signature);
+    const envelope = rawSignature
+      ? decodeReasoningTransportEnvelope(rawSignature)
+      : undefined;
+    const signature = envelope?.data || rawSignature;
+    const sourceFormat = envelope?.format || ANTHROPIC_CLAUDE_REASONING_FORMAT;
+    if (!thinking && !rawSignature) {
       return null;
     }
 
     const detail: Record<string, unknown> = {
       type: 'reasoning.text',
-      format: 'anthropic-claude-v1',
+      format: sourceFormat,
       index
     };
     if (thinking) {
@@ -1442,6 +1523,8 @@ function normalizeAnthropicThinkingBlock(
 
     const reasoning: StandardRequestInputContent = {
       type: 'reasoning',
+      ...(envelope?.id ? { id: envelope.id } : {}),
+      source_format: sourceFormat,
       reasoning_details: [detail]
     };
     if (thinking) {
@@ -1456,23 +1539,20 @@ function normalizeAnthropicThinkingBlock(
       return null;
     }
 
-    const envelope = decodeOpenAIResponsesReasoningEnvelope(data);
-    const encryptedContent = envelope?.encryptedContent || data;
+    const envelope = decodeReasoningTransportEnvelope(data);
+    const encryptedContent = envelope?.data || data;
+    const sourceFormat = envelope?.format || ANTHROPIC_CLAUDE_REASONING_FORMAT;
     return {
       type: 'reasoning',
-      ...(envelope
-        ? {
-            id: envelope.id,
-            source_format: OPENAI_RESPONSES_REASONING_FORMAT
-          }
-        : {}),
+      ...(envelope?.id ? { id: envelope.id } : {}),
+      source_format: sourceFormat,
       encrypted_content: encryptedContent,
       reasoning_details: [
         {
           type: 'reasoning.encrypted',
           data: encryptedContent,
-          ...(envelope ? { id: envelope.id } : {}),
-          format: envelope ? OPENAI_RESPONSES_REASONING_FORMAT : 'anthropic-claude-v1',
+          ...(envelope?.id ? { id: envelope.id } : {}),
+          format: sourceFormat,
           index
         }
       ]
@@ -1605,9 +1685,43 @@ function extractGeminiMessageContent(
         name,
         input: normalizeGeminiFunctionCallArguments(functionCall.args ?? functionCall.arguments)
       };
-      const thoughtSignature = readGeminiThoughtSignature(part, functionCall);
-      if (thoughtSignature) {
+      const rawThoughtSignature = readGeminiThoughtSignature(part, functionCall);
+      const envelope = rawThoughtSignature
+        ? decodeReasoningTransportEnvelope(rawThoughtSignature)
+        : undefined;
+      const thoughtSignature = envelope?.data || rawThoughtSignature;
+      const thoughtSignatureFormat =
+        envelope?.format || GEMINI_GENERATE_CONTENT_REASONING_FORMAT;
+      if (
+        thoughtSignature &&
+        thoughtSignatureFormat !== GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+      ) {
+        normalized.push({
+          type: 'reasoning',
+          ...(envelope?.id ? { id: envelope.id } : {}),
+          source_format: thoughtSignatureFormat,
+          encrypted_content: thoughtSignature,
+          reasoning_details: [
+            envelope?.kind === 'signature'
+              ? {
+                  type: 'reasoning.text',
+                  signature: thoughtSignature,
+                  ...(envelope?.id ? { id: envelope.id } : {}),
+                  format: thoughtSignatureFormat,
+                  index: partIndex
+                }
+              : {
+                  type: 'reasoning.encrypted',
+                  data: thoughtSignature,
+                  ...(envelope?.id ? { id: envelope.id } : {}),
+                  format: thoughtSignatureFormat,
+                  index: partIndex
+                }
+          ]
+        });
+      } else if (thoughtSignature) {
         toolUse.thought_signature = thoughtSignature;
+        toolUse.thought_signature_format = GEMINI_GENERATE_CONTENT_REASONING_FORMAT;
       }
       normalized.push(toolUse);
       trackGeminiToolUseId(state, name, id);
@@ -1684,21 +1798,15 @@ function normalizeGeminiThoughtPart(
     return null;
   }
   const envelope = thoughtSignature
-    ? decodeOpenAIResponsesReasoningEnvelope(thoughtSignature)
+    ? decodeReasoningTransportEnvelope(thoughtSignature)
     : undefined;
-  const encryptedContent = envelope?.encryptedContent || thoughtSignature;
-  const sourceFormat = envelope
-    ? OPENAI_RESPONSES_REASONING_FORMAT
-    : 'google-generate-content-v1';
+  const encryptedContent = envelope?.data || thoughtSignature;
+  const sourceFormat = envelope?.format || GEMINI_GENERATE_CONTENT_REASONING_FORMAT;
 
   const reasoning: StandardRequestInputContent = {
     type: 'reasoning',
-    ...(envelope
-      ? {
-          id: envelope.id,
-          source_format: OPENAI_RESPONSES_REASONING_FORMAT
-        }
-      : {}),
+    ...(envelope?.id ? { id: envelope.id } : {}),
+    source_format: sourceFormat,
     reasoning_details: [
       ...(text
         ? [
@@ -1712,13 +1820,21 @@ function normalizeGeminiThoughtPart(
         : []),
       ...(encryptedContent
         ? [
-            {
-              type: 'reasoning.encrypted',
-              data: encryptedContent,
-              ...(envelope ? { id: envelope.id } : {}),
-              format: sourceFormat,
-              index
-            }
+            envelope?.kind === 'signature'
+              ? {
+                  type: 'reasoning.text',
+                  signature: encryptedContent,
+                  ...(envelope?.id ? { id: envelope.id } : {}),
+                  format: sourceFormat,
+                  index
+                }
+              : {
+                  type: 'reasoning.encrypted',
+                  data: encryptedContent,
+                  ...(envelope?.id ? { id: envelope.id } : {}),
+                  format: sourceFormat,
+                  index
+                }
           ]
         : [])
     ]

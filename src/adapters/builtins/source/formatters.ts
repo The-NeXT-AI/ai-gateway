@@ -5,7 +5,10 @@ import {
   mapFinishReasonToOpenAI
 } from '../common';
 import {
-  encodeOpenAIResponsesReasoningEnvelope,
+  ANTHROPIC_CLAUDE_REASONING_FORMAT,
+  encodeReasoningTransportEnvelope,
+  GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
   OPENAI_RESPONSES_REASONING_FORMAT
 } from '../reasoning-envelope';
 
@@ -154,14 +157,31 @@ function collectOpenAIChatToolCalls(response: StandardResponse): Array<Record<st
       continue;
     }
 
-    toolCalls.push({
+    const toolCall: Record<string, unknown> = {
       id: item.call_id || item.id,
       type: 'function',
       function: {
         name: item.name,
         arguments: item.arguments
       }
-    });
+    };
+    if (item.thought_signature && item.thought_signature_format) {
+      const thoughtSignature =
+        item.thought_signature_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+          ? item.thought_signature
+          : encodeReasoningTransportEnvelope(
+              item.thought_signature_format,
+              item.thought_signature,
+              undefined,
+              'signature'
+            );
+      toolCall.extra_content = {
+        google: {
+          thought_signature: thoughtSignature
+        }
+      };
+    }
+    toolCalls.push(toolCall);
   }
 
   return toolCalls;
@@ -189,8 +209,18 @@ function collectAnthropicContentBlocks(response: StandardResponse): Array<Record
       continue;
     }
 
-    if (item.thought_signature) {
-      attachAnthropicThinkingSignature(blocks, item.thought_signature);
+    if (item.thought_signature && item.thought_signature_format) {
+      attachAnthropicThinkingSignature(
+        blocks,
+        item.thought_signature_format === ANTHROPIC_CLAUDE_REASONING_FORMAT
+          ? item.thought_signature
+          : encodeReasoningTransportEnvelope(
+              item.thought_signature_format,
+              item.thought_signature,
+              undefined,
+              'signature'
+            )
+      );
     }
 
     const block: Record<string, unknown> = {
@@ -249,9 +279,16 @@ function collectGeminiParts(response: StandardResponse): Array<Record<string, un
         parts.push(thoughtPart);
         pendingThoughtPart = thoughtPart;
       }
-      const thoughtSignature = readReasoningThoughtSignature(item);
-      if (thoughtSignature && item.source_format === OPENAI_RESPONSES_REASONING_FORMAT) {
-        // Keep the Responses envelope on a thought part instead of letting a later function call consume it.
+      const opaqueState = readReasoningOpaqueState(item);
+      const thoughtSignature = encodeOpaqueStateForClient(
+        opaqueState,
+        GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+      );
+      if (
+        thoughtSignature &&
+        opaqueState?.format !== GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+      ) {
+        // Foreign opaque state is a client-side carrier, never a Gemini function-call signature.
         if (thoughtPart) {
           thoughtPart.thoughtSignature = thoughtSignature;
         } else {
@@ -276,7 +313,26 @@ function collectGeminiParts(response: StandardResponse): Array<Record<string, un
     const part: Record<string, unknown> = {
       functionCall
     };
-    const thoughtSignature = item.thought_signature || pendingThoughtSignature;
+    let thoughtSignature = pendingThoughtSignature;
+    if (item.thought_signature && item.thought_signature_format) {
+      const encodedSignature =
+        item.thought_signature_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+          ? item.thought_signature
+          : encodeReasoningTransportEnvelope(
+              item.thought_signature_format,
+              item.thought_signature,
+              undefined,
+              'signature'
+            );
+      if (item.thought_signature_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT) {
+        thoughtSignature = encodedSignature;
+      } else {
+        parts.push({
+          thought: true,
+          thoughtSignature: encodedSignature
+        });
+      }
+    }
     pendingThoughtSignature = undefined;
     pendingThoughtPart = undefined;
     if (thoughtSignature) {
@@ -304,11 +360,15 @@ function collectGeminiInteractionSteps(response: StandardResponse): Array<Record
       const summary = item.summary.map((entry) => entry.text).filter(Boolean).join('\n').trim();
       const text = collectReasoningText(item);
       const thoughtSummary = [summary, text].filter(Boolean).join('\n').trim();
-      if (thoughtSummary || item.encrypted_content) {
+      const signature = encodeOpaqueStateForClient(
+        readReasoningOpaqueState(item),
+        GEMINI_INTERACTIONS_REASONING_FORMAT
+      );
+      if (thoughtSummary || signature) {
         steps.push({
           type: 'thought',
           ...(thoughtSummary ? { summary: geminiInteractionTextContent(thoughtSummary) } : {}),
-          ...(item.encrypted_content ? { signature: item.encrypted_content } : {})
+          ...(signature ? { signature } : {})
         });
       }
       continue;
@@ -330,6 +390,17 @@ function collectGeminiInteractionSteps(response: StandardResponse): Array<Record
       continue;
     }
 
+    if (item.thought_signature && item.thought_signature_format) {
+      steps.push({
+        type: 'thought',
+        signature: encodeReasoningTransportEnvelope(
+          item.thought_signature_format,
+          item.thought_signature,
+          undefined,
+          'signature'
+        )
+      });
+    }
     steps.push({
       type: 'function_call',
       id: item.call_id || item.id,
@@ -358,7 +429,11 @@ function geminiInteractionTextContent(text: string): Array<Record<string, unknow
 }
 
 function formatAnthropicThinkingBlocks(item: StandardResponseReasoning): Array<Record<string, unknown>> {
-  const blocks = anthropicBlocksFromReasoningDetails(item.reasoning_details);
+  const blocks = anthropicBlocksFromReasoningDetails(
+    item.reasoning_details,
+    item.source_format,
+    item.id
+  );
   if (blocks.length > 0) {
     return blocks;
   }
@@ -371,13 +446,15 @@ function formatAnthropicThinkingBlocks(item: StandardResponseReasoning): Array<R
     });
   }
 
-  if (item.encrypted_content) {
+  const opaqueState = readReasoningOpaqueState(item);
+  const encodedData = encodeOpaqueStateForClient(
+    opaqueState,
+    ANTHROPIC_CLAUDE_REASONING_FORMAT
+  );
+  if (encodedData) {
     blocks.push({
       type: 'redacted_thinking',
-      data:
-        item.source_format === OPENAI_RESPONSES_REASONING_FORMAT
-          ? encodeOpenAIResponsesReasoningEnvelope(item.id, item.encrypted_content)
-          : item.encrypted_content
+      data: encodedData
     });
   }
 
@@ -395,8 +472,14 @@ function collectGeminiReasoningText(item: StandardResponseReasoning): string {
   return [summary, text].filter(Boolean).join('\n').trim();
 }
 
-function readReasoningThoughtSignature(item: StandardResponseReasoning): string | undefined {
-  let signature: string | undefined;
+interface ReasoningOpaqueState {
+  data: string;
+  format: string;
+  id?: string;
+  kind: 'signature' | 'encrypted';
+}
+
+function readReasoningOpaqueState(item: StandardResponseReasoning): ReasoningOpaqueState | undefined {
   if (Array.isArray(item.reasoning_details)) {
     for (const detail of item.reasoning_details) {
       if (typeof detail !== 'object' || detail === null || Array.isArray(detail)) {
@@ -404,30 +487,61 @@ function readReasoningThoughtSignature(item: StandardResponseReasoning): string 
       }
 
       const record = detail as Record<string, unknown>;
-      signature =
+      const signature =
         asOptionalString(record.signature) ||
         asOptionalString(record.thoughtSignature) ||
-        asOptionalString(record.thought_signature) ||
+        asOptionalString(record.thought_signature);
+      const encrypted =
         asOptionalString(record.data) ||
         asOptionalString(record.encrypted_content);
-      if (signature) {
-        break;
+      const data = signature || encrypted;
+      const format = asOptionalString(record.format) || item.source_format;
+      if (data && format) {
+        return {
+          data,
+          format,
+          id: asOptionalString(record.id) || item.id,
+          kind: signature ? 'signature' : 'encrypted'
+        };
       }
     }
   }
 
-  signature ||= item.encrypted_content;
-  if (
-    signature &&
-    item.source_format === OPENAI_RESPONSES_REASONING_FORMAT &&
-    item.id
-  ) {
-    return encodeOpenAIResponsesReasoningEnvelope(item.id, signature);
+  if (item.encrypted_content && item.source_format) {
+    return {
+      data: item.encrypted_content,
+      format: item.source_format,
+      id: item.id,
+      kind: 'encrypted'
+    };
   }
-  return signature;
+
+  return undefined;
 }
 
-function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Array<Record<string, unknown>> {
+function encodeOpaqueStateForClient(
+  state: ReasoningOpaqueState | undefined,
+  destinationFormat: string
+): string | undefined {
+  if (!state) {
+    return undefined;
+  }
+
+  return state.format === destinationFormat
+    ? state.data
+    : encodeReasoningTransportEnvelope(
+        state.format,
+        state.data,
+        state.id,
+        state.kind
+      );
+}
+
+function anthropicBlocksFromReasoningDetails(
+  value: unknown[] | undefined,
+  fallbackFormat?: string,
+  fallbackId?: string
+): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) {
     return [];
   }
@@ -457,14 +571,15 @@ function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Arra
       asOptionalString(record.reasoning) ||
       asOptionalString(record.summary);
     const data = asOptionalString(record.data) || asOptionalString(record.encrypted_content);
+    const format = asOptionalString(record.format) || fallbackFormat;
+    const id = asOptionalString(record.id) || fallbackId;
 
     if (type === 'reasoning.encrypted' || type === 'redacted_thinking' || (!thinking && data)) {
-      if (data) {
-        const id = asOptionalString(record.id);
+      if (data && format) {
         const encodedData =
-          asOptionalString(record.format) === OPENAI_RESPONSES_REASONING_FORMAT && id
-            ? encodeOpenAIResponsesReasoningEnvelope(id, data)
-            : data;
+          format === ANTHROPIC_CLAUDE_REASONING_FORMAT
+            ? data
+            : encodeReasoningTransportEnvelope(format, data, id, 'encrypted');
         blocks.push({
           type: 'redacted_thinking',
           data: encodedData
@@ -482,8 +597,11 @@ function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Arra
       thinking
     };
     const signature = asOptionalString(record.signature);
-    if (signature) {
-      block.signature = signature;
+    if (signature && format) {
+      block.signature =
+        format === ANTHROPIC_CLAUDE_REASONING_FORMAT
+          ? signature
+          : encodeReasoningTransportEnvelope(format, signature, id, 'signature');
     }
     blocks.push(block);
   }
@@ -526,7 +644,7 @@ function collectOpenAIChatReasoning(response: StandardResponse): {
         type: 'reasoning.summary',
         summary: summary.text,
         id: item.id,
-        format: 'openai-responses-v1',
+        format: OPENAI_RESPONSES_REASONING_FORMAT,
         index
       });
     }
@@ -536,7 +654,7 @@ function collectOpenAIChatReasoning(response: StandardResponse): {
         type: 'reasoning.text',
         text: reasoningContent,
         id: item.id,
-        format: 'openai-responses-v1',
+        format: OPENAI_RESPONSES_REASONING_FORMAT,
         index
       });
     }
@@ -546,7 +664,7 @@ function collectOpenAIChatReasoning(response: StandardResponse): {
         type: 'reasoning.encrypted',
         data: item.encrypted_content,
         id: item.id,
-        format: 'openai-responses-v1',
+        format: OPENAI_RESPONSES_REASONING_FORMAT,
         index
       });
     }

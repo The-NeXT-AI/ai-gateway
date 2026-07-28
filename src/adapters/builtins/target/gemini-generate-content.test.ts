@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { StandardRequest, StandardResponse } from '../../../types';
 import {
-  decodeOpenAIResponsesReasoningEnvelope,
+  decodeReasoningTransportEnvelope,
+  GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
   OPENAI_RESPONSES_REASONING_FORMAT
 } from '../reasoning-envelope';
 import { formatAnthropicMessagesResponse, formatGeminiGenerateContentResponse } from '../source/formatters';
@@ -236,6 +238,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
           content: [
             {
               type: 'reasoning',
+              source_format: GEMINI_INTERACTIONS_REASONING_FORMAT,
               summary: 'Need weather data.',
               encrypted_content: 'interaction-thinking-signature'
             },
@@ -766,7 +769,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
     });
   });
 
-  it('maps Anthropic thinking and tool calls into Gemini content parts', () => {
+  it('keeps Anthropic opaque reasoning out of Gemini content parts', () => {
     const parsed = parseAnthropicMessagesRequest({
       model: 'gemini-2.5-pro',
       max_tokens: 1024,
@@ -855,11 +858,6 @@ describe('geminiGenerateContentTargetAdapter', () => {
         role: 'model',
         parts: [
           {
-            text: 'Need to call the weather tool.',
-            thought: true
-          },
-          {
-            thoughtSignature: 'gemini-function-signature',
             functionCall: {
               id: 'toolu_1',
               name: 'get_weather',
@@ -906,7 +904,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
     ]);
   });
 
-  it('maps encrypted reasoning-only history into Gemini thought signatures', () => {
+  it('does not map foreign encrypted reasoning into Gemini thought signatures', () => {
     const openAIParsed = parseOpenAIResponsesRequest({
       model: 'gemini-2.5-pro',
       input: [
@@ -950,10 +948,6 @@ describe('geminiGenerateContentTargetAdapter', () => {
       {
         role: 'model',
         parts: [
-          {
-            thought: true,
-            thoughtSignature: 'openai-encrypted-thinking'
-          },
           {
             functionCall: {
               id: 'call_lookup',
@@ -1019,7 +1013,6 @@ describe('geminiGenerateContentTargetAdapter', () => {
         role: 'model',
         parts: [
           {
-            thoughtSignature: 'anthropic-redacted-thinking',
             functionCall: {
               id: 'toolu_lookup',
               name: 'lookup_value',
@@ -1033,7 +1026,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
     ]);
   });
 
-  it('keeps Responses reasoning envelopes separate when building Gemini requests', () => {
+  it('keeps Responses encrypted reasoning out of Gemini requests', () => {
     const standardRequest: StandardRequest = {
       model: 'gemini-2.5-pro',
       input: [
@@ -1082,9 +1075,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
       parts: Array<Record<string, unknown>>;
     }>;
     const generateParts = generateContents[0]?.parts || [];
-    expect(generateParts).toHaveLength(2);
-    expect(generateParts[0]).toMatchObject({ thought: true });
-    expect(generateParts[1]).toEqual({
+    expect(generateParts).toEqual([{
       functionCall: {
         id: 'call_lookup',
         name: 'lookup_value',
@@ -1092,14 +1083,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
           key: 'live'
         }
       }
-    });
-    expect(generateParts[1]).not.toHaveProperty('thoughtSignature');
-    expect(
-      decodeOpenAIResponsesReasoningEnvelope(String(generateParts[0]?.thoughtSignature))
-    ).toEqual({
-      id: 'rs_original',
-      encryptedContent: 'encrypted-original'
-    });
+    }]);
 
     const interactionsBuilt = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
       request: {
@@ -1125,18 +1109,11 @@ describe('geminiGenerateContentTargetAdapter', () => {
     const interactionInput = (interactionsBuilt.value.body as Record<string, unknown>).input as Array<
       Record<string, unknown>
     >;
-    expect(interactionInput).toHaveLength(2);
-    expect(interactionInput[0]).toMatchObject({ type: 'thought' });
-    expect(interactionInput[1]).toMatchObject({
+    expect(interactionInput).toHaveLength(1);
+    expect(interactionInput[0]).toMatchObject({
       type: 'function_call',
       id: 'call_lookup',
       name: 'lookup_value'
-    });
-    expect(
-      decodeOpenAIResponsesReasoningEnvelope(String(interactionInput[0]?.signature))
-    ).toEqual({
-      id: 'rs_original',
-      encryptedContent: 'encrypted-original'
     });
   });
 
@@ -1152,6 +1129,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
           id: 'rs_1',
           type: 'reasoning',
           status: 'completed',
+          source_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
           summary: [{ type: 'summary_text', text: 'Need a lookup.' }],
           content: [{ type: 'reasoning_text', text: 'Call lookup before answering.' }],
           encrypted_content: 'gemini-response-thinking-signature'
@@ -1386,17 +1364,19 @@ describe('geminiGenerateContentTargetAdapter', () => {
         call_id: 'toolu_sig',
         name: 'get_weather',
         thought_signature: 'gemini-function-signature',
+        thought_signature_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
         arguments: '{"city":"Shanghai"}'
       })
     ]);
 
     const anthropic = formatAnthropicMessagesResponse(parsed.value);
     expect(anthropic.stop_reason).toBe('tool_use');
-    expect(anthropic.content).toEqual([
+    const anthropicContent = anthropic.content as Array<Record<string, unknown>>;
+    expect(anthropicContent).toEqual([
       {
         type: 'thinking',
         thinking: 'Need to call the weather tool.',
-        signature: 'gemini-function-signature'
+        signature: expect.any(String)
       },
       {
         type: 'tool_use',
@@ -1407,6 +1387,14 @@ describe('geminiGenerateContentTargetAdapter', () => {
         }
       }
     ]);
+    const thinkingBlock = anthropicContent[0]!;
+    expect(
+      decodeReasoningTransportEnvelope(String(thinkingBlock.signature))
+    ).toMatchObject({
+      format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+      data: 'gemini-function-signature',
+      kind: 'signature'
+    });
   });
 
   it('replays cached Gemini thought signatures when Anthropic follow-up omits the extension field', () => {

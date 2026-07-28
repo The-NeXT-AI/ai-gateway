@@ -1,4 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import {
+  ANTHROPIC_CLAUDE_REASONING_FORMAT,
+  decodeOpenAIResponsesReasoningEnvelope,
+  OPENAI_RESPONSES_REASONING_FORMAT
+} from '../adapters/builtins/reasoning-envelope';
 import { anthropicMessagesTargetAdapter } from '../adapters/builtins/target/anthropic-messages';
 import { openAIResponsesTargetAdapter } from '../adapters/builtins/target/openai-responses';
 import {
@@ -11,7 +16,8 @@ import {
 import {
   collectAnthropicNonStreamPayloadFromEventStream,
   collectOpenAINonStreamPayloadFromEventStream,
-  relayConvertedStreamFromStandardResponse
+  relayConvertedStreamFromStandardResponse,
+  relayConvertedStreamFromUpstreamResponse
 } from './streaming-conversion';
 
 describe('resolveBillingResponseSnapshot', () => {
@@ -413,6 +419,7 @@ describe('resolveBillingResponseSnapshot', () => {
             id: 'rs_123',
             type: 'reasoning',
             status: 'completed',
+            source_format: ANTHROPIC_CLAUDE_REASONING_FORMAT,
             summary: [],
             content: [
               {
@@ -424,7 +431,8 @@ describe('resolveBillingResponseSnapshot', () => {
               {
                 type: 'thinking',
                 thinking: 'think first',
-                signature: 'sig_123'
+                signature: 'sig_123',
+                format: ANTHROPIC_CLAUDE_REASONING_FORMAT
               }
             ]
           },
@@ -459,6 +467,208 @@ describe('resolveBillingResponseSnapshot', () => {
     expect(body).toContain('"type":"thinking_delta","thinking":"think first"');
     expect(body).toContain('"type":"signature_delta","signature":"sig_123"');
     expect(body).toContain('"type":"text_delta","text":"answer"');
+  });
+
+  it('streams Responses reasoning envelopes as independent Gemini Interactions thought steps', async () => {
+    const stream = relayConvertedStreamFromStandardResponse(
+      {
+        code() {
+          return this;
+        },
+        header() {
+          return this;
+        },
+        send(payload: unknown) {
+          return payload;
+        }
+      } as never,
+      {
+        adapterKey: 'gemini_interactions'
+      } as never,
+      {
+        id: 'resp_interactions_buffered',
+        object: 'response',
+        status: 'completed',
+        model: 'responses-model',
+        output_text: '',
+        output: [
+          {
+            id: 'rs_interactions_buffered',
+            type: 'reasoning',
+            status: 'completed',
+            summary: [],
+            content: [],
+            encrypted_content: 'encrypted-buffered',
+            source_format: OPENAI_RESPONSES_REASONING_FORMAT
+          },
+          {
+            id: 'rs_interactions_buffered_second',
+            type: 'reasoning',
+            status: 'completed',
+            summary: [],
+            content: [],
+            encrypted_content: 'encrypted-buffered-second',
+            source_format: OPENAI_RESPONSES_REASONING_FORMAT
+          },
+          {
+            id: 'fc_interactions_buffered',
+            type: 'function_call',
+            call_id: 'call_interactions_buffered',
+            name: 'lookup_value',
+            arguments: '{"key":"buffered"}',
+            status: 'completed'
+          }
+        ],
+        usage: {
+          input_tokens: 2,
+          output_tokens: 1,
+          total_tokens: 3
+        },
+        finish_reason: 'tool_use'
+      }
+    ) as unknown as AsyncIterable<string | Buffer>;
+
+    let body = '';
+    for await (const chunk of stream) {
+      body += chunk.toString();
+    }
+
+    const events = parseSseJsonFrames(body);
+    const signatureEvents = events.filter(
+      (event) =>
+        (event.delta as Record<string, unknown> | undefined)?.type === 'thought_signature'
+    );
+    const functionCallStart = events.find(
+      (event) =>
+        event.event_type === 'step.start' &&
+        (event.step as Record<string, unknown> | undefined)?.type === 'function_call'
+    );
+    expect(signatureEvents).toHaveLength(2);
+    expect(
+      signatureEvents.map((event) =>
+        decodeOpenAIResponsesReasoningEnvelope(
+          String((event.delta as Record<string, unknown>).signature)
+        )
+      )
+    ).toEqual([
+      {
+        id: 'rs_interactions_buffered',
+        encryptedContent: 'encrypted-buffered'
+      },
+      {
+        id: 'rs_interactions_buffered_second',
+        encryptedContent: 'encrypted-buffered-second'
+      }
+    ]);
+    expect(signatureEvents[0]?.index).not.toBe(signatureEvents[1]?.index);
+    expect(signatureEvents[0]?.index).not.toBe(functionCallStart?.index);
+    expect(signatureEvents[1]?.index).not.toBe(functionCallStart?.index);
+  });
+
+  it('preserves completed Responses reasoning in live Gemini Interactions streams', async () => {
+    const upstreamResponse = createSseResponse([
+      `data: ${JSON.stringify({
+        type: 'response.created',
+        response: {
+          id: 'resp_interactions_live',
+          model: 'responses-model'
+        }
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        type: 'response.output_item.added',
+        output_index: 1,
+        item: {
+          id: 'fc_interactions_live',
+          type: 'function_call',
+          call_id: 'call_interactions_live',
+          name: 'lookup_value',
+          arguments: ''
+        }
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        type: 'response.output_item.done',
+        output_index: 1,
+        item: {
+          id: 'fc_interactions_live',
+          type: 'function_call',
+          call_id: 'call_interactions_live',
+          name: 'lookup_value',
+          arguments: '{"key":"live"}'
+        }
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        type: 'response.completed',
+        response: {
+          id: 'resp_interactions_live',
+          model: 'responses-model',
+          status: 'completed',
+          output: [
+            {
+              id: 'rs_interactions_live',
+              type: 'reasoning',
+              encrypted_content: 'encrypted-live'
+            },
+            {
+              id: 'fc_interactions_live',
+              type: 'function_call',
+              call_id: 'call_interactions_live',
+              name: 'lookup_value',
+              arguments: '{"key":"live"}'
+            }
+          ],
+          usage: {
+            input_tokens: 2,
+            output_tokens: 1,
+            total_tokens: 3
+          }
+        }
+      })}\n\n`,
+      'data: [DONE]\n\n'
+    ]);
+    const stream = relayConvertedStreamFromUpstreamResponse(
+      {
+        code() {
+          return this;
+        },
+        header() {
+          return this;
+        },
+        send(payload: unknown) {
+          return payload;
+        }
+      } as never,
+      {
+        adapterKey: 'gemini_interactions'
+      } as never,
+      upstreamResponse
+    ) as unknown as AsyncIterable<string | Buffer>;
+
+    let body = '';
+    for await (const chunk of stream) {
+      body += chunk.toString();
+    }
+
+    const events = parseSseJsonFrames(body);
+    const signatureEvent = events.find(
+      (event) =>
+        (event.delta as Record<string, unknown> | undefined)?.type === 'thought_signature'
+    );
+    const functionCallStart = events.find(
+      (event) =>
+        event.event_type === 'step.start' &&
+        (event.step as Record<string, unknown> | undefined)?.type === 'function_call'
+    );
+    const signature = String(
+      (signatureEvent?.delta as Record<string, unknown> | undefined)?.signature
+    );
+
+    expect(decodeOpenAIResponsesReasoningEnvelope(signature)).toEqual({
+      id: 'rs_interactions_live',
+      encryptedContent: 'encrypted-live'
+    });
+    expect(signatureEvent?.index).not.toBe(functionCallStart?.index);
+    expect(body).toContain('event: interaction.completed');
+    expect(body).toContain('event: done');
   });
 });
 
@@ -1098,4 +1308,19 @@ function createSseResponse(chunks: string[]): Response {
       'content-type': 'text/event-stream; charset=utf-8'
     }
   });
+}
+
+function parseSseJsonFrames(body: string): Array<Record<string, unknown>> {
+  const frames: Array<Record<string, unknown>> = [];
+  for (const line of body.split(/\r?\n/)) {
+    if (!line.startsWith('data: ')) {
+      continue;
+    }
+    const data = line.slice('data: '.length);
+    if (!data || data === '[DONE]') {
+      continue;
+    }
+    frames.push(JSON.parse(data) as Record<string, unknown>);
+  }
+  return frames;
 }

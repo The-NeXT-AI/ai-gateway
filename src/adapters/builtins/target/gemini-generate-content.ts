@@ -15,8 +15,8 @@ import { err, ok } from '../../../types';
 import { asBoolean, asNumber, asString, collectStandardInputMessages, isObject } from '../../../utils';
 import { buildGeminiInteractionsUrl, buildGeminiUrl } from '../common';
 import {
-  encodeOpenAIResponsesReasoningEnvelope,
-  OPENAI_RESPONSES_REASONING_FORMAT
+  GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+  GEMINI_INTERACTIONS_REASONING_FORMAT
 } from '../reasoning-envelope';
 import { parseGeminiToStandardResponse } from './shared';
 import {
@@ -34,12 +34,14 @@ const geminiSchemaNumberKeys = new Set(['maximum', 'minimum', 'maxItems', 'minIt
 const geminiSchemaArrayKeys = new Set(['enum', 'required', 'propertyOrdering']);
 const maxGeminiThoughtSignatureCacheEntries = 4096;
 const geminiThoughtSignaturesByToolUseId = new Map<string, string>();
+const GEMINI_SYNTHETIC_FUNCTION_CALL_SIGNATURE = 'skip_thought_signature_validator';
 
 interface GeminiContentConversionState {
   pendingThoughtSignature?: string;
   pendingThoughtPart?: Record<string, unknown>;
   toolNamesById: Map<string, string>;
   thoughtSignatureCacheScope: string;
+  targetModel: string;
 }
 
 export const geminiGenerateContentTargetAdapter: TargetAdapter = {
@@ -95,7 +97,8 @@ export const geminiGenerateContentTargetAdapter: TargetAdapter = {
       contents: standardInputToGeminiContents(
         input.standardRequest.input,
         input.standardRequest.tools,
-        buildGeminiThoughtSignatureCacheScope(input)
+        buildGeminiThoughtSignatureCacheScope(input),
+        model
       )
     };
 
@@ -213,11 +216,13 @@ function buildGeminiInteractionsRequestFromStandard(input: TargetAdapterRequestI
 function standardInputToGeminiContents(
   input: string | StandardRequestInputMessage[],
   tools: unknown[] | undefined,
-  thoughtSignatureCacheScope: string
+  thoughtSignatureCacheScope: string,
+  targetModel: string
 ): Array<Record<string, unknown>> {
   const state: GeminiContentConversionState = {
     toolNamesById: new Map(),
-    thoughtSignatureCacheScope
+    thoughtSignatureCacheScope,
+    targetModel
   };
 
   return collectStandardInputMessages(input).map((message) => ({
@@ -268,8 +273,14 @@ function standardInputToGeminiInteractionsInput(
       flushText();
 
       if (item.type === 'reasoning' && message.role === 'assistant') {
+        if (standardReasoningFormat(item) !== GEMINI_INTERACTIONS_REASONING_FORMAT) {
+          continue;
+        }
         const summary = standardReasoningText(item);
-        const signature = standardReasoningThoughtSignature(item);
+        const signature = standardReasoningThoughtSignature(
+          item,
+          GEMINI_INTERACTIONS_REASONING_FORMAT
+        );
         if (summary || signature) {
           steps.push({
             type: 'thought',
@@ -586,24 +597,21 @@ function standardContentToGeminiParts(
     flushText();
 
     if (item.type === 'reasoning') {
+      if (standardReasoningFormat(item) !== GEMINI_GENERATE_CONTENT_REASONING_FORMAT) {
+        state.pendingThoughtSignature = undefined;
+        state.pendingThoughtPart = undefined;
+        continue;
+      }
       const reasoningPart = standardReasoningToGeminiThoughtPart(item);
       if (reasoningPart) {
         parts.push(reasoningPart);
         state.pendingThoughtPart = reasoningPart;
       }
-      const thoughtSignature = standardReasoningThoughtSignature(item);
-      if (thoughtSignature && item.source_format === OPENAI_RESPONSES_REASONING_FORMAT) {
-        if (reasoningPart) {
-          reasoningPart.thoughtSignature = thoughtSignature;
-        } else {
-          parts.push({
-            thought: true,
-            thoughtSignature
-          });
-        }
-        state.pendingThoughtSignature = undefined;
-        state.pendingThoughtPart = undefined;
-      } else if (thoughtSignature) {
+      const thoughtSignature = standardReasoningThoughtSignature(
+        item,
+        GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+      );
+      if (thoughtSignature) {
         state.pendingThoughtSignature = thoughtSignature;
       }
       continue;
@@ -643,9 +651,16 @@ function standardContentToGeminiParts(
         args: normalizeGeminiFunctionCallArgs(item.input)
       };
       const thoughtSignature =
-        item.thought_signature ||
+        (
+          item.thought_signature_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+            ? item.thought_signature
+            : undefined
+        ) ||
         state.pendingThoughtSignature ||
-        readCachedGeminiThoughtSignature(state.thoughtSignatureCacheScope, item.id);
+        readCachedGeminiThoughtSignature(state.thoughtSignatureCacheScope, item.id) ||
+        (isGemini3Model(state.targetModel)
+          ? GEMINI_SYNTHETIC_FUNCTION_CALL_SIGNATURE
+          : undefined);
       state.pendingThoughtSignature = undefined;
       state.pendingThoughtPart = undefined;
       const part: Record<string, unknown> = {
@@ -799,33 +814,56 @@ function standardReasoningToGeminiThoughtPart(
 }
 
 function standardReasoningThoughtSignature(
-  item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
+  item: Extract<StandardRequestInputContent, { type: 'reasoning' }>,
+  expectedFormat: string
 ): string | undefined {
   const details = Array.isArray(item.reasoning_details) ? item.reasoning_details : [];
-  let signature: string | undefined;
   for (const detail of details) {
     if (!isObject(detail)) {
       continue;
     }
-    signature =
+    const format = asString(detail.format) || item.source_format;
+    if (format !== expectedFormat) {
+      continue;
+    }
+    const signature =
       asString(detail.signature) ||
       asString(detail.thoughtSignature) ||
       asString(detail.thought_signature) ||
       asString(detail.data) ||
       asString(detail.encrypted_content);
     if (signature) {
-      break;
+      return signature;
     }
   }
-  signature ||= item.encrypted_content;
-  if (
-    signature &&
-    item.source_format === OPENAI_RESPONSES_REASONING_FORMAT &&
-    item.id
-  ) {
-    return encodeOpenAIResponsesReasoningEnvelope(item.id, signature);
+
+  return item.source_format === expectedFormat
+    ? item.encrypted_content
+    : undefined;
+}
+
+function standardReasoningFormat(
+  item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
+): string | undefined {
+  if (item.source_format) {
+    return item.source_format;
   }
-  return signature;
+
+  for (const detail of item.reasoning_details || []) {
+    if (!isObject(detail)) {
+      continue;
+    }
+    const format = asString(detail.format);
+    if (format) {
+      return format;
+    }
+  }
+
+  return undefined;
+}
+
+function isGemini3Model(model: string): boolean {
+  return /(?:^|[/_-])gemini-3(?:[._-]|$)/i.test(model);
 }
 
 function standardReasoningText(

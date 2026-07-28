@@ -9,6 +9,7 @@ import type {
 import { ok } from '../../../types';
 import { asString, collectStandardInputMessages, isObject } from '../../../utils';
 import { buildOpenAIHeaders } from '../common';
+import { OPENAI_RESPONSES_REASONING_FORMAT } from '../reasoning-envelope';
 import {
   applyOpenAIChatStreamUsageOption,
   parseOpenAIToStandardResponse,
@@ -428,8 +429,11 @@ function standardInputToOpenAIChatMessages(
         if (reasoning.text) {
           assistantMessage.reasoning_content = reasoning.text;
         }
-        if (reasoning.reasoning_details && reasoning.reasoning_details.length > 0) {
-          assistantMessage.reasoning_details = reasoning.reasoning_details;
+        const safeReasoningDetails = sanitizeOpenAIChatReasoningDetails(
+          reasoning.reasoning_details
+        );
+        if (safeReasoningDetails.length > 0) {
+          assistantMessage.reasoning_details = safeReasoningDetails;
         }
         if (assistantMessage.content === undefined) {
           assistantMessage.content = '';
@@ -482,26 +486,40 @@ function standardInputToOpenAIResponsesInput(
 
     if (message.role === 'assistant') {
       const reasoning = collectAssistantReasoning(message.content);
+      const replayableReasoning =
+        reasoning?.source_format === OPENAI_RESPONSES_REASONING_FORMAT
+          ? reasoning
+          : undefined;
       const replayableEncryptedContent =
-        reasoning?.encrypted_content && reasoning.id ? reasoning.encrypted_content : undefined;
-      if (reasoning && (reasoning.text || reasoning.summary || replayableEncryptedContent)) {
+        replayableReasoning?.encrypted_content &&
+        replayableReasoning.id
+          ? replayableReasoning.encrypted_content
+          : undefined;
+      if (
+        replayableReasoning &&
+        (
+          replayableReasoning.text ||
+          replayableReasoning.summary ||
+          replayableEncryptedContent
+        )
+      ) {
         items.push({
           type: 'reasoning',
-          id: reasoning.id || `rs_${randomUUID().replace(/-/g, '')}`,
-          summary: reasoning.summary
+          id: replayableReasoning.id || `rs_${randomUUID().replace(/-/g, '')}`,
+          summary: replayableReasoning.summary
             ? [
                 {
                   type: 'summary_text',
-                  text: reasoning.summary
+                  text: replayableReasoning.summary
                 }
               ]
             : [],
-          ...(reasoning.text
+          ...(replayableReasoning.text
             ? {
                 content: [
                   {
                     type: 'reasoning_text',
-                    text: reasoning.text
+                    text: replayableReasoning.text
                   }
                 ]
               }
@@ -700,6 +718,7 @@ function collectAssistantReasoning(content: StandardRequestInputContent[]):
       summary?: string;
       encrypted_content?: string;
       reasoning_details?: unknown[];
+      source_format?: string;
     }
   | undefined {
   const reasoningItems = content.filter((item) => item.type === 'reasoning');
@@ -720,6 +739,9 @@ function collectAssistantReasoning(content: StandardRequestInputContent[]):
   const encryptedItem = reasoningItems.find((item) => item.encrypted_content);
   const encryptedContent = encryptedItem?.encrypted_content;
   const id = encryptedItem?.id || reasoningItems.find((item) => item.id)?.id;
+  const sourceFormat =
+    encryptedItem?.source_format ||
+    reasoningItems.find((item) => item.source_format)?.source_format;
   const reasoningDetails = reasoningItems.flatMap((item) => item.reasoning_details || []);
 
   return {
@@ -727,8 +749,50 @@ function collectAssistantReasoning(content: StandardRequestInputContent[]):
     ...(text ? { text } : {}),
     ...(summary ? { summary } : {}),
     ...(encryptedContent ? { encrypted_content: encryptedContent } : {}),
-    ...(reasoningDetails.length > 0 ? { reasoning_details: reasoningDetails } : {})
+    ...(reasoningDetails.length > 0 ? { reasoning_details: reasoningDetails } : {}),
+    ...(sourceFormat ? { source_format: sourceFormat } : {})
   };
+}
+
+function sanitizeOpenAIChatReasoningDetails(value: unknown[] | undefined): unknown[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const safeDetails: unknown[] = [];
+  for (const detail of value) {
+    if (typeof detail === 'string') {
+      if (detail.trim()) {
+        safeDetails.push(detail);
+      }
+      continue;
+    }
+
+    if (!isObject(detail)) {
+      continue;
+    }
+
+    const type = asString(detail.type);
+    const format = asString(detail.format);
+    const text =
+      asString(detail.text) ||
+      asString(detail.reasoning) ||
+      asString(detail.thinking);
+    const summary = asString(detail.summary);
+    if (!text && !summary) {
+      continue;
+    }
+
+    safeDetails.push({
+      ...(type ? { type } : {}),
+      ...(format ? { format } : {}),
+      ...(text ? { text } : {}),
+      ...(summary ? { summary } : {}),
+      ...(typeof detail.index === 'number' ? { index: detail.index } : {})
+    });
+  }
+
+  return safeDetails;
 }
 
 function collectUserToolResults(

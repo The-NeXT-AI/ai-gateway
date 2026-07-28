@@ -2,6 +2,7 @@ import type { StandardRequestInputContent, StandardRequestInputMessage, TargetAd
 import { ok } from '../../../types';
 import { asString, collectStandardInputMessages, isObject } from '../../../utils';
 import { buildAnthropicHeaders } from '../common';
+import { ANTHROPIC_CLAUDE_REASONING_FORMAT } from '../reasoning-envelope';
 import { parseAnthropicToStandardResponse } from './shared';
 import {
   anthropicWebSearchToolType,
@@ -432,7 +433,14 @@ function normalizeAnthropicToolInput(value: unknown): Record<string, unknown> {
 function standardReasoningToAnthropicBlocks(
   item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
 ): Array<Record<string, unknown>> {
-  const blocks = anthropicBlocksFromReasoningDetails(item.reasoning_details);
+  if (standardReasoningFormat(item) !== ANTHROPIC_CLAUDE_REASONING_FORMAT) {
+    return [];
+  }
+
+  const blocks = anthropicBlocksFromReasoningDetails(
+    item.reasoning_details,
+    ANTHROPIC_CLAUDE_REASONING_FORMAT
+  );
   if (blocks.length > 0) {
     return blocks;
   }
@@ -445,7 +453,10 @@ function standardReasoningToAnthropicBlocks(
     });
   }
 
-  if (item.encrypted_content) {
+  if (
+    item.encrypted_content &&
+    item.source_format === ANTHROPIC_CLAUDE_REASONING_FORMAT
+  ) {
     blocks.push({
       type: 'redacted_thinking',
       data: item.encrypted_content
@@ -455,28 +466,24 @@ function standardReasoningToAnthropicBlocks(
   return blocks;
 }
 
-function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Array<Record<string, unknown>> {
+function anthropicBlocksFromReasoningDetails(
+  value: unknown[] | undefined,
+  expectedFormat: string
+): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) {
     return [];
   }
 
   const blocks: Array<Record<string, unknown>> = [];
   for (const detail of value) {
-    if (typeof detail === 'string') {
-      const thinking = detail.trim();
-      if (thinking) {
-        blocks.push({
-          type: 'thinking',
-          thinking
-        });
-      }
-      continue;
-    }
-
     if (!isObject(detail)) {
       continue;
     }
 
+    const format = asString(detail.format);
+    if (format !== expectedFormat) {
+      continue;
+    }
     const type = asString(detail.type);
     const thinking =
       asString(detail.thinking) ||
@@ -484,6 +491,7 @@ function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Arra
       asString(detail.reasoning) ||
       asString(detail.summary);
     const data = asString(detail.data) || asString(detail.encrypted_content);
+    const signature = asString(detail.signature);
 
     if (type === 'reasoning.encrypted' || type === 'redacted_thinking' || (!thinking && data)) {
       if (data) {
@@ -495,15 +503,14 @@ function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Arra
       continue;
     }
 
-    if (!thinking) {
+    if (!thinking && !signature) {
       continue;
     }
 
     const block: Record<string, unknown> = {
       type: 'thinking',
-      thinking
+      thinking: thinking || ''
     };
-    const signature = asString(detail.signature);
     if (signature) {
       block.signature = signature;
     }
@@ -511,6 +518,26 @@ function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Arra
   }
 
   return blocks;
+}
+
+function standardReasoningFormat(
+  item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
+): string | undefined {
+  if (item.source_format) {
+    return item.source_format;
+  }
+
+  for (const detail of item.reasoning_details || []) {
+    if (!isObject(detail)) {
+      continue;
+    }
+    const format = asString(detail.format);
+    if (format) {
+      return format;
+    }
+  }
+
+  return undefined;
 }
 
 function mapStandardToolsToAnthropicTools(tools: unknown[] | undefined): Record<string, unknown>[] | undefined {

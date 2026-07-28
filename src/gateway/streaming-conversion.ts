@@ -13,7 +13,10 @@ import {
   formatAnthropicMessagesResponse,
   formatGeminiGenerateContentResponse
 } from '../adapters/builtins/source/formatters';
-import { encodeOpenAIResponsesReasoningEnvelope } from '../adapters/builtins/reasoning-envelope';
+import {
+  encodeOpenAIResponsesReasoningEnvelope,
+  OPENAI_RESPONSES_REASONING_FORMAT
+} from '../adapters/builtins/reasoning-envelope';
 import { splitNamespacedToolCallName } from '../adapters/builtins/target/tools';
 import { parseSseChunks } from '../sse';
 import { bindAbortSignalToReadable } from '../upstream/client';
@@ -202,6 +205,11 @@ interface OpenAIReasoningAccumulator {
   summary: string;
   encryptedContent?: string;
   rawDetails: unknown[];
+}
+
+interface OpenAIResponsesEncryptedReasoning {
+  id: string;
+  encryptedContent: string;
 }
 
 interface OpenAINonStreamCollectionState {
@@ -3003,7 +3011,7 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
     return frames;
   }
 
-  if (eventType === 'response.completed') {
+  if (eventType === 'response.completed' || eventType === 'response.incomplete') {
     const response = isObject(payload.response) ? payload.response : undefined;
     updateOpenAIChatRelayIdentityFromOpenAIResponses(state, response);
     updateOpenAIChatRelayUsageFromOpenAIResponses(state, response);
@@ -3016,6 +3024,21 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
         state.emittedTextDelta = true;
         frames.push(buildOpenAIChatRelayDeltaFrame(state, { content: outputText }));
       }
+    }
+
+    const reasoningItems = collectOpenAIResponsesEncryptedReasoning(response);
+    if (reasoningItems.length > 0) {
+      frames.push(
+        buildOpenAIChatRelayDeltaFrame(state, {
+          reasoning_details: reasoningItems.map(({ id, encryptedContent }, index) => ({
+            type: 'reasoning.encrypted',
+            data: encryptedContent,
+            id,
+            format: OPENAI_RESPONSES_REASONING_FORMAT,
+            index
+          }))
+        })
+      );
     }
 
     frames.push(...finalizeOpenAIChatRelay(state));
@@ -3356,7 +3379,8 @@ function emitGeminiFramesFromOpenAIResponsesEvent(
       return [];
     }
 
-    const frames = flushPendingGeminiToolCalls(state);
+    const frames = emitGeminiResponsesReasoningFrames(state, response);
+    frames.push(...flushPendingGeminiToolCalls(state));
     const finalFrame = buildGeminiFinalFrame(state);
     if (finalFrame) {
       frames.push(finalFrame);
@@ -3366,6 +3390,32 @@ function emitGeminiFramesFromOpenAIResponsesEvent(
   }
 
   return [];
+}
+
+function emitGeminiResponsesReasoningFrames(
+  state: GeminiRelayState,
+  response: Record<string, unknown> | undefined
+): string[] {
+  return collectOpenAIResponsesEncryptedReasoning(response).map(({ id, encryptedContent }) => {
+    state.emittedAnyDelta = true;
+    return encodeSseData({
+      candidates: [
+        {
+          index: 0,
+          content: {
+            role: 'model',
+            parts: [
+              {
+                thought: true,
+                thoughtSignature: encodeOpenAIResponsesReasoningEnvelope(id, encryptedContent)
+              }
+            ]
+          }
+        }
+      ],
+      modelVersion: state.model
+    });
+  });
 }
 
 function buildGeminiDeltaFrame(model: string, text: string): string {
@@ -4593,11 +4643,34 @@ function emitAnthropicResponsesReasoningBlocks(
   state: AnthropicRelayState,
   response: Record<string, unknown> | undefined
 ): string[] {
+  const reasoningItems = collectOpenAIResponsesEncryptedReasoning(response);
+  if (reasoningItems.length === 0) {
+    return [];
+  }
+
+  const frames = ensureAnthropicRelayStarted(state);
+  frames.push(...closeActiveAnthropicTextBlock(state));
+  for (const { id, encryptedContent } of reasoningItems) {
+    const blockIndex = state.nextBlockIndex;
+    state.nextBlockIndex += 1;
+    frames.push(
+      ...buildAnthropicStreamContentBlockFrames(blockIndex, {
+        type: 'redacted_thinking',
+        data: encodeOpenAIResponsesReasoningEnvelope(id, encryptedContent)
+      })
+    );
+  }
+  return frames;
+}
+
+function collectOpenAIResponsesEncryptedReasoning(
+  response: Record<string, unknown> | undefined
+): OpenAIResponsesEncryptedReasoning[] {
   if (!response || !Array.isArray(response.output)) {
     return [];
   }
 
-  const envelopes: string[] = [];
+  const reasoningItems: OpenAIResponsesEncryptedReasoning[] = [];
   for (const outputItem of response.output) {
     if (!isObject(outputItem) || asString(outputItem.type) !== 'reasoning') {
       continue;
@@ -4605,29 +4678,11 @@ function emitAnthropicResponsesReasoningBlocks(
 
     const id = asString(outputItem.id);
     const encryptedContent = asString(outputItem.encrypted_content);
-    if (!id || !encryptedContent) {
-      continue;
+    if (id && encryptedContent) {
+      reasoningItems.push({ id, encryptedContent });
     }
-    envelopes.push(encodeOpenAIResponsesReasoningEnvelope(id, encryptedContent));
   }
-
-  if (envelopes.length === 0) {
-    return [];
-  }
-
-  const frames = ensureAnthropicRelayStarted(state);
-  frames.push(...closeActiveAnthropicTextBlock(state));
-  for (const data of envelopes) {
-    const blockIndex = state.nextBlockIndex;
-    state.nextBlockIndex += 1;
-    frames.push(
-      ...buildAnthropicStreamContentBlockFrames(blockIndex, {
-        type: 'redacted_thinking',
-        data
-      })
-    );
-  }
-  return frames;
+  return reasoningItems;
 }
 
 function updateAnthropicRelayIdentity(state: AnthropicRelayState, response: Record<string, unknown> | undefined) {

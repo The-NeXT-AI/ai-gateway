@@ -698,6 +698,407 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it.each([
+    { name: 'non-stream responses', stream: false },
+    { name: 'streamed responses', stream: true }
+  ])('preserves encrypted reasoning IDs across two Chat turns with $name', async ({ stream }) => {
+    const upstreamBodies: Array<Record<string, unknown>> = [];
+    const firstUpstreamResponse = {
+      id: 'resp_chat_reasoning_1',
+      object: 'response',
+      status: 'completed',
+      model: 'gpt-5.6-sol',
+      output_text: 'First Chat answer.',
+      output: [
+        {
+          id: 'rs_chat_reasoning_1',
+          type: 'reasoning',
+          status: 'completed',
+          summary: [],
+          encrypted_content: 'encrypted-chat-reasoning'
+        },
+        {
+          id: 'msg_chat_reasoning_1',
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [
+            {
+              type: 'output_text',
+              text: 'First Chat answer.',
+              annotations: []
+            }
+          ]
+        }
+      ],
+      usage: {
+        input_tokens: 4,
+        output_tokens: 3,
+        total_tokens: 7
+      }
+    };
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>);
+      if (upstreamBodies.length === 1 && stream) {
+        return createSseResponse([
+          `event: response.created\ndata: ${JSON.stringify({
+            type: 'response.created',
+            response: {
+              id: firstUpstreamResponse.id,
+              object: 'response',
+              status: 'in_progress',
+              model: firstUpstreamResponse.model
+            }
+          })}\n\n`,
+          `event: response.output_text.delta\ndata: ${JSON.stringify({
+            type: 'response.output_text.delta',
+            delta: firstUpstreamResponse.output_text
+          })}\n\n`,
+          `event: response.completed\ndata: ${JSON.stringify({
+            type: 'response.completed',
+            response: firstUpstreamResponse
+          })}\n\n`,
+          'data: [DONE]\n\n'
+        ]);
+      }
+
+      const response =
+        upstreamBodies.length === 1
+          ? firstUpstreamResponse
+          : {
+              id: 'resp_chat_reasoning_2',
+              object: 'response',
+              status: 'completed',
+              model: 'gpt-5.6-sol',
+              output_text: 'Second Chat answer.',
+              output: [
+                {
+                  id: 'msg_chat_reasoning_2',
+                  type: 'message',
+                  role: 'assistant',
+                  status: 'completed',
+                  content: [
+                    {
+                      type: 'output_text',
+                      text: 'Second Chat answer.',
+                      annotations: []
+                    }
+                  ]
+                }
+              ],
+              usage: {
+                input_tokens: 8,
+                output_tokens: 3,
+                total_tokens: 11
+              }
+            };
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6-sol'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const firstResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'gpt-5.6-sol',
+          stream,
+          messages: [{ role: 'user', content: 'First Chat turn' }]
+        }
+      });
+
+      expect(firstResponse.statusCode).toBe(200);
+      const firstAssistant = stream
+        ? collectChatAssistantFromSse(firstResponse.body)
+        : ((JSON.parse(firstResponse.body) as Record<string, any>).choices[0]
+            .message as Record<string, unknown>);
+      expect(firstAssistant.content).toBe('First Chat answer.');
+      expect(firstAssistant.reasoning_details).toEqual([
+        {
+          type: 'reasoning.encrypted',
+          data: 'encrypted-chat-reasoning',
+          id: 'rs_chat_reasoning_1',
+          format: 'openai-responses-v1',
+          index: 0
+        }
+      ]);
+
+      const secondResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'gpt-5.6-sol',
+          messages: [
+            { role: 'user', content: 'First Chat turn' },
+            {
+              role: 'assistant',
+              content: firstAssistant.content,
+              reasoning_details: firstAssistant.reasoning_details
+            },
+            { role: 'user', content: 'Second Chat turn' }
+          ]
+        }
+      });
+
+      expect(secondResponse.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(upstreamBodies[1]).toMatchObject({
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'First Chat turn' }]
+          },
+          {
+            type: 'reasoning',
+            id: 'rs_chat_reasoning_1',
+            summary: [],
+            encrypted_content: 'encrypted-chat-reasoning'
+          },
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'First Chat answer.' }]
+          },
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Second Chat turn' }]
+          }
+        ]
+      });
+      const secondInput = upstreamBodies[1]?.input as Array<Record<string, unknown>>;
+      expect(secondInput[1]).not.toHaveProperty('status');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it.each([
+    { name: 'non-stream responses', stream: false },
+    { name: 'streamed responses', stream: true }
+  ])('preserves encrypted reasoning IDs across two Gemini turns with $name', async ({ stream }) => {
+    const upstreamBodies: Array<Record<string, unknown>> = [];
+    const firstUpstreamResponse = {
+      id: 'resp_gemini_reasoning_1',
+      object: 'response',
+      status: 'completed',
+      model: 'gpt-5.6-sol',
+      output_text: 'First Gemini answer.',
+      output: [
+        {
+          id: 'rs_gemini_reasoning_1',
+          type: 'reasoning',
+          status: 'completed',
+          summary: [],
+          encrypted_content: 'encrypted-gemini-reasoning'
+        },
+        {
+          id: 'msg_gemini_reasoning_1',
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [
+            {
+              type: 'output_text',
+              text: 'First Gemini answer.',
+              annotations: []
+            }
+          ]
+        }
+      ],
+      usage: {
+        input_tokens: 4,
+        output_tokens: 3,
+        total_tokens: 7
+      }
+    };
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>);
+      if (upstreamBodies.length === 1 && stream) {
+        return createSseResponse([
+          `event: response.created\ndata: ${JSON.stringify({
+            type: 'response.created',
+            response: {
+              id: firstUpstreamResponse.id,
+              object: 'response',
+              status: 'in_progress',
+              model: firstUpstreamResponse.model
+            }
+          })}\n\n`,
+          `event: response.output_text.delta\ndata: ${JSON.stringify({
+            type: 'response.output_text.delta',
+            delta: firstUpstreamResponse.output_text
+          })}\n\n`,
+          `event: response.completed\ndata: ${JSON.stringify({
+            type: 'response.completed',
+            response: firstUpstreamResponse
+          })}\n\n`,
+          'data: [DONE]\n\n'
+        ]);
+      }
+
+      const response =
+        upstreamBodies.length === 1
+          ? firstUpstreamResponse
+          : {
+              id: 'resp_gemini_reasoning_2',
+              object: 'response',
+              status: 'completed',
+              model: 'gpt-5.6-sol',
+              output_text: 'Second Gemini answer.',
+              output: [
+                {
+                  id: 'msg_gemini_reasoning_2',
+                  type: 'message',
+                  role: 'assistant',
+                  status: 'completed',
+                  content: [
+                    {
+                      type: 'output_text',
+                      text: 'Second Gemini answer.',
+                      annotations: []
+                    }
+                  ]
+                }
+              ],
+              usage: {
+                input_tokens: 8,
+                output_tokens: 3,
+                total_tokens: 11
+              }
+            };
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6-sol'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const firstResponse = await app.inject({
+        method: 'POST',
+        url: stream
+          ? '/v1/models/openai-main/gpt-5.6-sol:streamGenerateContent?alt=sse'
+          : '/v1/models/openai-main/gpt-5.6-sol:generateContent',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: 'First Gemini turn' }]
+            }
+          ]
+        }
+      });
+
+      expect(firstResponse.statusCode).toBe(200);
+      const firstParts = stream
+        ? collectGeminiPartsFromSse(firstResponse.body)
+        : (((JSON.parse(firstResponse.body) as Record<string, any>).candidates[0].content
+            .parts as Array<Record<string, unknown>>));
+      const thoughtPart = firstParts.find(
+        (part) => part.thought === true && typeof part.thoughtSignature === 'string'
+      );
+      if (!thoughtPart) {
+        throw new Error('Expected a Gemini thought part with a reasoning signature.');
+      }
+      expect(thoughtPart.thoughtSignature).toEqual(
+        expect.stringMatching(/^ccr-openai-responses-reasoning-v1:/)
+      );
+      expect(thoughtPart.thoughtSignature).not.toBe('encrypted-gemini-reasoning');
+      const firstText = firstParts
+        .map((part) => (part.thought === true ? '' : String(part.text || '')))
+        .join('');
+      expect(firstText).toBe('First Gemini answer.');
+
+      const secondResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/models/openai-main/gpt-5.6-sol:generateContent',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: 'First Gemini turn' }]
+            },
+            {
+              role: 'model',
+              parts: [thoughtPart, { text: firstText }]
+            },
+            {
+              role: 'user',
+              parts: [{ text: 'Second Gemini turn' }]
+            }
+          ]
+        }
+      });
+
+      expect(secondResponse.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(upstreamBodies[1]).toMatchObject({
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'First Gemini turn' }]
+          },
+          {
+            type: 'reasoning',
+            id: 'rs_gemini_reasoning_1',
+            summary: [],
+            encrypted_content: 'encrypted-gemini-reasoning'
+          },
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'First Gemini answer.' }]
+          },
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Second Gemini turn' }]
+          }
+        ]
+      });
+      const secondInput = upstreamBodies[1]?.input as Array<Record<string, unknown>>;
+      expect(secondInput[1]).not.toHaveProperty('status');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('converts Anthropic deferred tool history to native Responses tool search', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(
@@ -10522,6 +10923,45 @@ function parseJsonSseEvents(body: string): Array<{
     });
   }
   return events;
+}
+
+function collectChatAssistantFromSse(body: string): Record<string, unknown> {
+  const content: string[] = [];
+  const reasoningDetails: unknown[] = [];
+  for (const event of parseJsonSseEvents(body)) {
+    const delta = event.data.choices?.[0]?.delta as Record<string, unknown> | undefined;
+    if (!delta) {
+      continue;
+    }
+    if (typeof delta.content === 'string') {
+      content.push(delta.content);
+    }
+    if (Array.isArray(delta.reasoning_details)) {
+      reasoningDetails.push(...delta.reasoning_details);
+    }
+  }
+
+  return {
+    role: 'assistant',
+    content: content.join(''),
+    reasoning_details: reasoningDetails
+  };
+}
+
+function collectGeminiPartsFromSse(body: string): Array<Record<string, unknown>> {
+  const parts: Array<Record<string, unknown>> = [];
+  for (const event of parseJsonSseEvents(body)) {
+    const eventParts = event.data.candidates?.[0]?.content?.parts;
+    if (!Array.isArray(eventParts)) {
+      continue;
+    }
+    for (const part of eventParts) {
+      if (typeof part === 'object' && part !== null && !Array.isArray(part)) {
+        parts.push(part as Record<string, unknown>);
+      }
+    }
+  }
+  return parts;
 }
 
 function createTrackedJsonResponse(payload: unknown, status: number, onCancel: () => void): Response {

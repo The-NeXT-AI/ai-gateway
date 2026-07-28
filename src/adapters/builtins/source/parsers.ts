@@ -1124,6 +1124,12 @@ function normalizeOpenAIChatAssistantReasoning(message: Record<string, unknown>)
   const reasoning: StandardRequestInputContent = {
     type: 'reasoning'
   };
+  if (details.id) {
+    reasoning.id = details.id;
+  }
+  if (details.sourceFormat) {
+    reasoning.source_format = details.sourceFormat;
+  }
   const mergedText = mergeDistinctReasoningText(details.text, text);
   if (mergedText) {
     reasoning.text = mergedText;
@@ -1143,12 +1149,16 @@ function normalizeOpenAIChatAssistantReasoning(message: Record<string, unknown>)
 }
 
 function normalizeOpenAIChatReasoningDetails(value: unknown): {
+  id?: string;
+  sourceFormat?: string;
   text?: string;
   summary?: string;
   encryptedContent?: string;
   rawDetails: unknown[];
 } {
   const normalized: {
+    id?: string;
+    sourceFormat?: string;
     text?: string;
     summary?: string;
     encryptedContent?: string;
@@ -1177,9 +1187,19 @@ function normalizeOpenAIChatReasoningDetails(value: unknown): {
     }
 
     const type = asString(detail.type);
+    const id = asString(detail.id);
+    const format = asString(detail.format);
     const summary = asString(detail.summary);
     const text = asString(detail.text) || asString(detail.reasoning) || asString(detail.thinking);
     const encryptedContent = asString(detail.encrypted_content) || asString(detail.data);
+    if (format === OPENAI_RESPONSES_REASONING_FORMAT) {
+      if (id && !normalized.id) {
+        normalized.id = id;
+      }
+      if (!normalized.sourceFormat) {
+        normalized.sourceFormat = format;
+      }
+    }
 
     if (type === 'reasoning.summary' || (summary && !text)) {
       if (summary || text) {
@@ -1663,26 +1683,40 @@ function normalizeGeminiThoughtPart(
   if (!text && !thoughtSignature) {
     return null;
   }
+  const envelope = thoughtSignature
+    ? decodeOpenAIResponsesReasoningEnvelope(thoughtSignature)
+    : undefined;
+  const encryptedContent = envelope?.encryptedContent || thoughtSignature;
+  const sourceFormat = envelope
+    ? OPENAI_RESPONSES_REASONING_FORMAT
+    : 'google-generate-content-v1';
 
   const reasoning: StandardRequestInputContent = {
     type: 'reasoning',
+    ...(envelope
+      ? {
+          id: envelope.id,
+          source_format: OPENAI_RESPONSES_REASONING_FORMAT
+        }
+      : {}),
     reasoning_details: [
       ...(text
         ? [
             {
               type: 'reasoning.text',
               text,
-              format: 'google-generate-content-v1',
+              format: sourceFormat,
               index
             }
           ]
         : []),
-      ...(thoughtSignature
+      ...(encryptedContent
         ? [
             {
               type: 'reasoning.encrypted',
-              data: thoughtSignature,
-              format: 'google-generate-content-v1',
+              data: encryptedContent,
+              ...(envelope ? { id: envelope.id } : {}),
+              format: sourceFormat,
               index
             }
           ]
@@ -1693,8 +1727,8 @@ function normalizeGeminiThoughtPart(
   if (text) {
     reasoning.text = text;
   }
-  if (thoughtSignature) {
-    reasoning.encrypted_content = thoughtSignature;
+  if (encryptedContent) {
+    reasoning.encrypted_content = encryptedContent;
   }
 
   return reasoning;

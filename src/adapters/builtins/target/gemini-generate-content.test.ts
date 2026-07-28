@@ -1098,6 +1098,58 @@ describe('geminiGenerateContentTargetAdapter', () => {
     });
   });
 
+  it('keeps Responses reasoning envelopes separate from Gemini function calls', () => {
+    const response: StandardResponse = {
+      id: 'resp_responses_reasoning',
+      object: 'response',
+      status: 'completed',
+      model: 'gpt-5.6-sol',
+      output_text: '',
+      output: [
+        {
+          id: 'rs_responses_reasoning_1',
+          type: 'reasoning',
+          status: 'completed',
+          summary: [],
+          source_format: 'openai-responses-v1',
+          encrypted_content: 'encrypted-responses-reasoning'
+        },
+        {
+          id: 'call_lookup',
+          type: 'function_call',
+          call_id: 'call_lookup',
+          name: 'lookup_value',
+          arguments: '{"key":"live"}',
+          status: 'completed'
+        }
+      ],
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        total_tokens: 15
+      },
+      finish_reason: 'tool_use'
+    };
+
+    const payload = formatGeminiGenerateContentResponse(response) as Record<string, any>;
+    const parts = payload.candidates[0].content.parts as Array<Record<string, unknown>>;
+
+    expect(parts[0]).toMatchObject({
+      thought: true,
+      thoughtSignature: expect.stringMatching(/^ccr-openai-responses-reasoning-v1:/)
+    });
+    expect(parts[0]?.thoughtSignature).not.toBe('encrypted-responses-reasoning');
+    expect(parts[1]).toEqual({
+      functionCall: {
+        id: 'call_lookup',
+        name: 'lookup_value',
+        args: {
+          key: 'live'
+        }
+      }
+    });
+  });
+
   it('parses Gemini Interaction responses into standard output, reasoning, tool calls, and usage', () => {
     const parsed = geminiGenerateContentTargetAdapter.toStandardResponse({
       id: 'int_123',

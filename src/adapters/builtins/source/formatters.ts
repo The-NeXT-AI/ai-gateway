@@ -249,7 +249,22 @@ function collectGeminiParts(response: StandardResponse): Array<Record<string, un
         parts.push(thoughtPart);
         pendingThoughtPart = thoughtPart;
       }
-      pendingThoughtSignature = readReasoningThoughtSignature(item) || pendingThoughtSignature;
+      const thoughtSignature = readReasoningThoughtSignature(item);
+      if (thoughtSignature && item.source_format === OPENAI_RESPONSES_REASONING_FORMAT) {
+        // Keep the Responses envelope on a thought part instead of letting a later function call consume it.
+        if (thoughtPart) {
+          thoughtPart.thoughtSignature = thoughtSignature;
+        } else {
+          parts.push({
+            thought: true,
+            thoughtSignature
+          });
+        }
+        pendingThoughtPart = undefined;
+        pendingThoughtSignature = undefined;
+      } else {
+        pendingThoughtSignature = thoughtSignature || pendingThoughtSignature;
+      }
       continue;
     }
 
@@ -381,6 +396,7 @@ function collectGeminiReasoningText(item: StandardResponseReasoning): string {
 }
 
 function readReasoningThoughtSignature(item: StandardResponseReasoning): string | undefined {
+  let signature: string | undefined;
   if (Array.isArray(item.reasoning_details)) {
     for (const detail of item.reasoning_details) {
       if (typeof detail !== 'object' || detail === null || Array.isArray(detail)) {
@@ -388,19 +404,27 @@ function readReasoningThoughtSignature(item: StandardResponseReasoning): string 
       }
 
       const record = detail as Record<string, unknown>;
-      const signature =
+      signature =
         asOptionalString(record.signature) ||
         asOptionalString(record.thoughtSignature) ||
         asOptionalString(record.thought_signature) ||
         asOptionalString(record.data) ||
         asOptionalString(record.encrypted_content);
       if (signature) {
-        return signature;
+        break;
       }
     }
   }
 
-  return item.encrypted_content;
+  signature ||= item.encrypted_content;
+  if (
+    signature &&
+    item.source_format === OPENAI_RESPONSES_REASONING_FORMAT &&
+    item.id
+  ) {
+    return encodeOpenAIResponsesReasoningEnvelope(item.id, signature);
+  }
+  return signature;
 }
 
 function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Array<Record<string, unknown>> {

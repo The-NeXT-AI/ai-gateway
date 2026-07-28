@@ -555,6 +555,52 @@ describe('parseOpenAIChatCompletionsRequest', () => {
     ]);
   });
 
+  it('restores Responses reasoning IDs from chat reasoning_details', () => {
+    const result = parseOpenAIChatCompletionsRequest({
+      model: 'gpt-5.6-sol',
+      messages: [
+        {
+          role: 'assistant',
+          content: 'first answer',
+          reasoning_details: [
+            {
+              type: 'reasoning.encrypted',
+              data: 'encrypted-chat-reasoning',
+              id: 'rs_chat_reasoning_1',
+              format: 'openai-responses-v1',
+              index: 0
+            }
+          ]
+        },
+        {
+          role: 'user',
+          content: 'continue'
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    expect(result.value.input[0]?.content).toContainEqual({
+      type: 'reasoning',
+      id: 'rs_chat_reasoning_1',
+      source_format: 'openai-responses-v1',
+      encrypted_content: 'encrypted-chat-reasoning',
+      reasoning_details: [
+        {
+          type: 'reasoning.encrypted',
+          data: 'encrypted-chat-reasoning',
+          id: 'rs_chat_reasoning_1',
+          format: 'openai-responses-v1',
+          index: 0
+        }
+      ]
+    });
+  });
+
   it('keeps OpenAI-compatible reasoning_effort as standard reasoning effort', () => {
     const result = parseOpenAIChatCompletionsRequest({
       model: 'glm-5.2',
@@ -794,5 +840,61 @@ describe('parseGeminiGenerateContentRequest', () => {
         ]
       }
     ]);
+  });
+
+  it('restores Responses reasoning IDs from Gemini thought signatures', () => {
+    const envelope =
+      'ccr-openai-responses-reasoning-v1:' +
+      Buffer.from(
+        JSON.stringify({
+          id: 'rs_gemini_reasoning_1',
+          encrypted_content: 'encrypted-gemini-reasoning'
+        }),
+        'utf8'
+      ).toString('base64url');
+    const result = parseGeminiGenerateContentRequest(
+      {
+        contents: [
+          {
+            role: 'model',
+            parts: [
+              {
+                thought: true,
+                thoughtSignature: envelope
+              },
+              {
+                text: 'first answer'
+              }
+            ]
+          },
+          {
+            role: 'user',
+            parts: [{ text: 'continue' }]
+          }
+        ]
+      },
+      'gpt-5.6-sol'
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    expect(result.value.input[0]?.content).toContainEqual({
+      type: 'reasoning',
+      id: 'rs_gemini_reasoning_1',
+      source_format: 'openai-responses-v1',
+      encrypted_content: 'encrypted-gemini-reasoning',
+      reasoning_details: [
+        {
+          type: 'reasoning.encrypted',
+          data: 'encrypted-gemini-reasoning',
+          id: 'rs_gemini_reasoning_1',
+          format: 'openai-responses-v1',
+          index: 0
+        }
+      ]
+    });
   });
 });

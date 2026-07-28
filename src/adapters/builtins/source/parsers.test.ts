@@ -525,10 +525,6 @@ describe('parseOpenAIChatCompletionsRequest', () => {
         role: 'assistant',
         content: [
           {
-            type: 'input_text',
-            text: 'visible answer'
-          },
-          {
             type: 'reasoning',
             id: 'reasoning-text-1',
             source_format: 'anthropic-claude-v1',
@@ -542,6 +538,10 @@ describe('parseOpenAIChatCompletionsRequest', () => {
                 index: 0
               }
             ]
+          },
+          {
+            type: 'input_text',
+            text: 'visible answer'
           }
         ]
       },

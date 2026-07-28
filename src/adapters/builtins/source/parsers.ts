@@ -1121,17 +1121,16 @@ function extractOpenAIChatMessageContent(message: Record<string, unknown>): Stan
 
   const normalized: StandardRequestInputContent[] = [];
   const text = extractMessageText(message.content);
-  if (text) {
-    normalized.push({ type: 'input_text', text });
-  }
-
   if (normalizeMessageRole(message.role) !== 'assistant') {
+    if (text) {
+      normalized.push({ type: 'input_text', text });
+    }
     return normalized;
   }
 
-  const reasoning = normalizeOpenAIChatAssistantReasoning(message);
-  if (reasoning) {
-    normalized.push(reasoning);
+  normalized.push(...normalizeOpenAIChatAssistantReasoning(message));
+  if (text) {
+    normalized.push({ type: 'input_text', text });
   }
   normalized.push(...normalizeOpenAIChatAssistantToolCalls(message.tool_calls));
 
@@ -1143,13 +1142,48 @@ function extractOpenAIChatMessageContent(message: Record<string, unknown>): Stan
   return normalized;
 }
 
-function normalizeOpenAIChatAssistantReasoning(message: Record<string, unknown>): StandardRequestInputContent | null {
+function normalizeOpenAIChatAssistantReasoning(
+  message: Record<string, unknown>
+): StandardRequestInputContent[] {
   const text =
     asString(message.reasoning_content) ||
     asString(message.reasoning) ||
     asString(message.thinking);
-  const details = normalizeOpenAIChatReasoningDetails(message.reasoning_details);
+  const indexedDetailGroups = groupOpenAIChatReasoningDetailsByIndex(
+    message.reasoning_details
+  );
+  if (indexedDetailGroups) {
+    const reasoningItems = indexedDetailGroups
+      .map((group) =>
+        buildOpenAIChatAssistantReasoning(
+          undefined,
+          normalizeOpenAIChatReasoningDetails(group)
+        )
+      )
+      .filter((item): item is StandardRequestInputContent => Boolean(item));
+    if (reasoningItems.length > 0) {
+      return reasoningItems;
+    }
+  }
 
+  const details = normalizeOpenAIChatReasoningDetails(message.reasoning_details);
+  const reasoning = buildOpenAIChatAssistantReasoning(text, details);
+  return reasoning ? [reasoning] : [];
+}
+
+interface NormalizedOpenAIChatReasoningDetails {
+  id?: string;
+  sourceFormat?: string;
+  text?: string;
+  summary?: string;
+  encryptedContent?: string;
+  rawDetails: unknown[];
+}
+
+function buildOpenAIChatAssistantReasoning(
+  text: string | undefined,
+  details: NormalizedOpenAIChatReasoningDetails
+): StandardRequestInputContent | null {
   if (!text && !details.text && !details.summary && !details.encryptedContent && details.rawDetails.length === 0) {
     return null;
   }
@@ -1181,22 +1215,37 @@ function normalizeOpenAIChatAssistantReasoning(message: Record<string, unknown>)
   return reasoning;
 }
 
-function normalizeOpenAIChatReasoningDetails(value: unknown): {
-  id?: string;
-  sourceFormat?: string;
-  text?: string;
-  summary?: string;
-  encryptedContent?: string;
-  rawDetails: unknown[];
-} {
-  const normalized: {
-    id?: string;
-    sourceFormat?: string;
-    text?: string;
-    summary?: string;
-    encryptedContent?: string;
-    rawDetails: unknown[];
-  } = {
+function groupOpenAIChatReasoningDetailsByIndex(value: unknown): unknown[][] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const groups = new Map<number, unknown[]>();
+  for (const detail of value) {
+    if (!isObject(detail)) {
+      return undefined;
+    }
+
+    const index = asNumber(detail.index);
+    if (index === undefined) {
+      return undefined;
+    }
+
+    const group = groups.get(index);
+    if (group) {
+      group.push(detail);
+    } else {
+      groups.set(index, [detail]);
+    }
+  }
+
+  return groups.size > 1 ? [...groups.values()] : undefined;
+}
+
+function normalizeOpenAIChatReasoningDetails(
+  value: unknown
+): NormalizedOpenAIChatReasoningDetails {
+  const normalized: NormalizedOpenAIChatReasoningDetails = {
     rawDetails: []
   };
 

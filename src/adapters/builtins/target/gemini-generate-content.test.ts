@@ -6,10 +6,15 @@ import {
   GEMINI_INTERACTIONS_REASONING_FORMAT,
   OPENAI_RESPONSES_REASONING_FORMAT
 } from '../reasoning-envelope';
-import { formatAnthropicMessagesResponse, formatGeminiGenerateContentResponse } from '../source/formatters';
+import {
+  formatAnthropicMessagesResponse,
+  formatGeminiGenerateContentResponse,
+  formatOpenAIChatCompletionsResponse
+} from '../source/formatters';
 import {
   parseAnthropicMessagesRequest,
   parseGeminiGenerateContentRequest,
+  parseOpenAIChatCompletionsRequest,
   parseOpenAIResponsesRequest
 } from '../source/parsers';
 import { geminiGenerateContentTargetAdapter } from './gemini-generate-content';
@@ -1275,6 +1280,61 @@ describe('geminiGenerateContentTargetAdapter', () => {
 
     const formatted = formatGeminiGenerateContentResponse(parsed.value) as Record<string, any>;
     expect(formatted.candidates[0].content.parts).toEqual([
+      {
+        text: 'First thought summary.',
+        thought: true,
+        thoughtSignature: 'gemini-thought-signature-1'
+      },
+      {
+        text: 'Second thought summary.',
+        thought: true,
+        thoughtSignature: 'gemini-thought-signature-2'
+      },
+      {
+        text: 'Visible answer.'
+      }
+    ]);
+
+    const chatResponse = formatOpenAIChatCompletionsResponse(parsed.value) as Record<
+      string,
+      any
+    >;
+    const chatRequest = parseOpenAIChatCompletionsRequest({
+      model: 'gemini-3.5-flash',
+      messages: [
+        chatResponse.choices[0].message,
+        {
+          role: 'user',
+          content: 'Continue.'
+        }
+      ]
+    });
+    expect(chatRequest.ok).toBe(true);
+    if (!chatRequest.ok) {
+      return;
+    }
+
+    const rebuilt = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-3.5-flash:generateContent'
+      } as never,
+      standardRequest: chatRequest.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+    expect(rebuilt.ok).toBe(true);
+    if (!rebuilt.ok) {
+      return;
+    }
+
+    const rebuiltContents = (rebuilt.value.body as Record<string, unknown>).contents as Array<{
+      parts: Array<Record<string, unknown>>;
+    }>;
+    expect(rebuiltContents[0]?.parts).toEqual([
       {
         text: 'First thought summary.',
         thought: true,

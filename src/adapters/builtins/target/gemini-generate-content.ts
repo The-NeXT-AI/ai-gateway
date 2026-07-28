@@ -14,6 +14,10 @@ import type {
 import { err, ok } from '../../../types';
 import { asBoolean, asNumber, asString, collectStandardInputMessages, isObject } from '../../../utils';
 import { buildGeminiInteractionsUrl, buildGeminiUrl } from '../common';
+import {
+  encodeOpenAIResponsesReasoningEnvelope,
+  OPENAI_RESPONSES_REASONING_FORMAT
+} from '../reasoning-envelope';
 import { parseGeminiToStandardResponse } from './shared';
 import {
   appendToolReferencesToResultContent,
@@ -588,7 +592,18 @@ function standardContentToGeminiParts(
         state.pendingThoughtPart = reasoningPart;
       }
       const thoughtSignature = standardReasoningThoughtSignature(item);
-      if (thoughtSignature) {
+      if (thoughtSignature && item.source_format === OPENAI_RESPONSES_REASONING_FORMAT) {
+        if (reasoningPart) {
+          reasoningPart.thoughtSignature = thoughtSignature;
+        } else {
+          parts.push({
+            thought: true,
+            thoughtSignature
+          });
+        }
+        state.pendingThoughtSignature = undefined;
+        state.pendingThoughtPart = undefined;
+      } else if (thoughtSignature) {
         state.pendingThoughtSignature = thoughtSignature;
       }
       continue;
@@ -787,21 +802,30 @@ function standardReasoningThoughtSignature(
   item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
 ): string | undefined {
   const details = Array.isArray(item.reasoning_details) ? item.reasoning_details : [];
+  let signature: string | undefined;
   for (const detail of details) {
     if (!isObject(detail)) {
       continue;
     }
-    const signature =
+    signature =
       asString(detail.signature) ||
       asString(detail.thoughtSignature) ||
       asString(detail.thought_signature) ||
       asString(detail.data) ||
       asString(detail.encrypted_content);
     if (signature) {
-      return signature;
+      break;
     }
   }
-  return item.encrypted_content;
+  signature ||= item.encrypted_content;
+  if (
+    signature &&
+    item.source_format === OPENAI_RESPONSES_REASONING_FORMAT &&
+    item.id
+  ) {
+    return encodeOpenAIResponsesReasoningEnvelope(item.id, signature);
+  }
+  return signature;
 }
 
 function standardReasoningText(

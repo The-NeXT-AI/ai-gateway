@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { StandardRequest, StandardResponse } from '../../../types';
+import {
+  decodeOpenAIResponsesReasoningEnvelope,
+  OPENAI_RESPONSES_REASONING_FORMAT
+} from '../reasoning-envelope';
 import { formatAnthropicMessagesResponse, formatGeminiGenerateContentResponse } from '../source/formatters';
 import { parseAnthropicMessagesRequest, parseOpenAIResponsesRequest } from '../source/parsers';
 import { geminiGenerateContentTargetAdapter } from './gemini-generate-content';
@@ -947,7 +951,10 @@ describe('geminiGenerateContentTargetAdapter', () => {
         role: 'model',
         parts: [
           {
-            thoughtSignature: 'openai-encrypted-thinking',
+            thought: true,
+            thoughtSignature: 'openai-encrypted-thinking'
+          },
+          {
             functionCall: {
               id: 'call_lookup',
               name: 'lookup_value',
@@ -1024,6 +1031,113 @@ describe('geminiGenerateContentTargetAdapter', () => {
         ]
       }
     ]);
+  });
+
+  it('keeps Responses reasoning envelopes separate when building Gemini requests', () => {
+    const standardRequest: StandardRequest = {
+      model: 'gemini-2.5-pro',
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'reasoning',
+              id: 'rs_original',
+              source_format: OPENAI_RESPONSES_REASONING_FORMAT,
+              encrypted_content: 'encrypted-original'
+            },
+            {
+              type: 'tool_use',
+              id: 'call_lookup',
+              name: 'lookup_value',
+              input: {
+                key: 'live'
+              }
+            }
+          ]
+        }
+      ]
+    };
+
+    const generateBuilt = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-pro:generateContent'
+      } as never,
+      standardRequest,
+      config: {
+        geminiApiKey: 'test-key',
+        geminiBaseUrl: 'https://provider.example',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(generateBuilt.ok).toBe(true);
+    if (!generateBuilt.ok) {
+      return;
+    }
+
+    const generateContents = (generateBuilt.value.body as Record<string, unknown>).contents as Array<{
+      parts: Array<Record<string, unknown>>;
+    }>;
+    const generateParts = generateContents[0]?.parts || [];
+    expect(generateParts).toHaveLength(2);
+    expect(generateParts[0]).toMatchObject({ thought: true });
+    expect(generateParts[1]).toEqual({
+      functionCall: {
+        id: 'call_lookup',
+        name: 'lookup_value',
+        args: {
+          key: 'live'
+        }
+      }
+    });
+    expect(generateParts[1]).not.toHaveProperty('thoughtSignature');
+    expect(
+      decodeOpenAIResponsesReasoningEnvelope(String(generateParts[0]?.thoughtSignature))
+    ).toEqual({
+      id: 'rs_original',
+      encryptedContent: 'encrypted-original'
+    });
+
+    const interactionsBuilt = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/interactions'
+      } as never,
+      standardRequest,
+      config: {
+        geminiApiKey: 'test-key',
+        geminiBaseUrl: 'https://provider.example',
+        geminiApiVersion: 'v1beta'
+      } as never,
+      targetProviderConfig: {
+        type: 'gemini_interactions'
+      } as never
+    });
+
+    expect(interactionsBuilt.ok).toBe(true);
+    if (!interactionsBuilt.ok) {
+      return;
+    }
+
+    const interactionInput = (interactionsBuilt.value.body as Record<string, unknown>).input as Array<
+      Record<string, unknown>
+    >;
+    expect(interactionInput).toHaveLength(2);
+    expect(interactionInput[0]).toMatchObject({ type: 'thought' });
+    expect(interactionInput[1]).toMatchObject({
+      type: 'function_call',
+      id: 'call_lookup',
+      name: 'lookup_value'
+    });
+    expect(
+      decodeOpenAIResponsesReasoningEnvelope(String(interactionInput[0]?.signature))
+    ).toEqual({
+      id: 'rs_original',
+      encryptedContent: 'encrypted-original'
+    });
   });
 
   it('formats standard reasoning as Gemini thought parts', () => {

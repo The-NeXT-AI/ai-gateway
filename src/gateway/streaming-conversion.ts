@@ -13,6 +13,7 @@ import {
   formatAnthropicMessagesResponse,
   formatGeminiGenerateContentResponse
 } from '../adapters/builtins/source/formatters';
+import { encodeOpenAIResponsesReasoningEnvelope } from '../adapters/builtins/reasoning-envelope';
 import { splitNamespacedToolCallName } from '../adapters/builtins/target/tools';
 import { parseSseChunks } from '../sse';
 import { bindAbortSignalToReadable } from '../upstream/client';
@@ -4574,13 +4575,59 @@ function emitAnthropicFramesFromOpenAIResponsesEvent(
     const response = isObject(payload.response) ? payload.response : undefined;
     updateAnthropicRelayIdentity(state, response);
     updateAnthropicRelayUsage(state, isObject(response?.usage) ? response.usage : undefined);
+    const reasoningFrames = emitAnthropicResponsesReasoningBlocks(state, response);
     collectOpenAIResponsesToolCalls(state, response);
 
     state.finishReason = asString(response?.finish_reason) || extractResponsesFinishReason(response);
-    return [...flushPendingAnthropicToolCalls(state), ...finalizeAnthropicRelay(state)];
+    return [
+      ...reasoningFrames,
+      ...flushPendingAnthropicToolCalls(state),
+      ...finalizeAnthropicRelay(state)
+    ];
   }
 
   return [];
+}
+
+function emitAnthropicResponsesReasoningBlocks(
+  state: AnthropicRelayState,
+  response: Record<string, unknown> | undefined
+): string[] {
+  if (!response || !Array.isArray(response.output)) {
+    return [];
+  }
+
+  const envelopes: string[] = [];
+  for (const outputItem of response.output) {
+    if (!isObject(outputItem) || asString(outputItem.type) !== 'reasoning') {
+      continue;
+    }
+
+    const id = asString(outputItem.id);
+    const encryptedContent = asString(outputItem.encrypted_content);
+    if (!id || !encryptedContent) {
+      continue;
+    }
+    envelopes.push(encodeOpenAIResponsesReasoningEnvelope(id, encryptedContent));
+  }
+
+  if (envelopes.length === 0) {
+    return [];
+  }
+
+  const frames = ensureAnthropicRelayStarted(state);
+  frames.push(...closeActiveAnthropicTextBlock(state));
+  for (const data of envelopes) {
+    const blockIndex = state.nextBlockIndex;
+    state.nextBlockIndex += 1;
+    frames.push(
+      ...buildAnthropicStreamContentBlockFrames(blockIndex, {
+        type: 'redacted_thinking',
+        data
+      })
+    );
+  }
+  return frames;
 }
 
 function updateAnthropicRelayIdentity(state: AnthropicRelayState, response: Record<string, unknown> | undefined) {

@@ -112,6 +112,8 @@ describe('parseOpenAIResponsesRequest', () => {
         content: [
           {
             type: 'reasoning',
+            id: 'rs_123',
+            source_format: 'openai-responses-v1',
             text: 'need a tool',
             reasoning_details: [
               {
@@ -179,6 +181,8 @@ describe('parseOpenAIResponsesRequest', () => {
         content: [
           {
             type: 'reasoning',
+            id: 'rs_123',
+            source_format: 'openai-responses-v1',
             text: 'private reasoning text',
             summary: 'short reasoning summary',
             reasoning_details: [

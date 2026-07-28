@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { formatAnthropicMessagesResponse } from '../source/formatters';
 import { parseAnthropicMessagesRequest, parseOpenAIResponsesRequest } from '../source/parsers';
 import {
   buildOpenAIResponsesBodyFromStandardRequest,
@@ -203,6 +204,135 @@ describe('openAIResponsesTargetAdapter', () => {
         content: [{ type: 'input_text', text: 'hello' }]
       }
     ]);
+  });
+
+  it('drops legacy encrypted assistant reasoning that has no original Responses item ID', () => {
+    const body = buildAnthropicOpenAITargetBody(
+      {
+        model: 'gpt-5.6-sol',
+        max_tokens: 8192,
+        messages: [
+          {
+            role: 'user',
+            content: 'first turn'
+          },
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'redacted_thinking',
+                data: 'encrypted-reasoning'
+              },
+              {
+                type: 'text',
+                text: 'done'
+              }
+            ]
+          },
+          {
+            role: 'user',
+            content: 'second turn'
+          }
+        ]
+      },
+      {
+        name: 'codex-api',
+        type: 'openai_responses',
+        models: ['gpt-5.6-sol']
+      }
+    );
+
+    const input = body.input as Array<Record<string, unknown>>;
+    const reasoning = input.find((item) => item.type === 'reasoning');
+    expect(reasoning).toBeUndefined();
+    expect(input).toContainEqual({
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'done' }]
+    });
+  });
+
+  it('preserves encrypted Responses reasoning IDs across Anthropic history round trips', () => {
+    const parsedResponse = openAIResponsesTargetAdapter.toStandardResponse({
+      id: 'resp_first_turn',
+      object: 'response',
+      status: 'completed',
+      model: 'gpt-5.6-sol',
+      output_text: 'done',
+      output: [
+        {
+          type: 'reasoning',
+          id: 'rs_original_reasoning_item',
+          status: 'completed',
+          summary: [],
+          encrypted_content: 'encrypted-reasoning'
+        },
+        {
+          type: 'message',
+          id: 'msg_first_turn',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text: 'done', annotations: [] }]
+        }
+      ],
+      usage: {
+        input_tokens: 10,
+        output_tokens: 4,
+        total_tokens: 14
+      }
+    });
+
+    expect(parsedResponse.ok).toBe(true);
+    if (!parsedResponse.ok) {
+      return;
+    }
+
+    const anthropicResponse = formatAnthropicMessagesResponse(parsedResponse.value);
+    const responseContent = anthropicResponse.content as Array<Record<string, unknown>>;
+    expect(responseContent[0]).toMatchObject({
+      type: 'redacted_thinking'
+    });
+    expect(responseContent[0]?.data).not.toBe('encrypted-reasoning');
+
+    const body = buildAnthropicOpenAITargetBody(
+      {
+        model: 'gpt-5.6-sol',
+        max_tokens: 8192,
+        messages: [
+          {
+            role: 'user',
+            content: 'first turn'
+          },
+          {
+            role: 'assistant',
+            content: responseContent
+          },
+          {
+            role: 'user',
+            content: 'second turn'
+          }
+        ]
+      },
+      {
+        name: 'codex-api',
+        type: 'openai_responses',
+        models: ['gpt-5.6-sol']
+      }
+    );
+
+    const input = body.input as Array<Record<string, unknown>>;
+    expect(input[1]).toEqual({
+      type: 'reasoning',
+      id: 'rs_original_reasoning_item',
+      summary: [],
+      encrypted_content: 'encrypted-reasoning'
+    });
+    expect(input[1]).not.toHaveProperty('status');
+    expect(input[2]).toEqual({
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'done' }]
+    });
   });
 
   it('keeps supported reasoning efforts and selects the closest supported fallback', () => {

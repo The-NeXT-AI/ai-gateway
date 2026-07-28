@@ -479,26 +479,15 @@ function standardInputToOpenAIResponsesInput(
   for (const message of collectStandardInputMessages(input)) {
     const role = message.role === 'assistant' ? 'assistant' : 'user';
     const text = extractStandardInputTextContent(message.content);
-    if (text) {
-      items.push({
-        type: 'message',
-        role,
-        content: [
-          {
-            type: role === 'assistant' ? 'output_text' : 'input_text',
-            text
-          }
-        ]
-      });
-    }
 
     if (message.role === 'assistant') {
       const reasoning = collectAssistantReasoning(message.content);
-      if (reasoning) {
+      const replayableEncryptedContent =
+        reasoning?.encrypted_content && reasoning.id ? reasoning.encrypted_content : undefined;
+      if (reasoning && (reasoning.text || reasoning.summary || replayableEncryptedContent)) {
         items.push({
           type: 'reasoning',
-          id: `rs_${randomUUID().replace(/-/g, '')}`,
-          status: 'completed',
+          id: reasoning.id || `rs_${randomUUID().replace(/-/g, '')}`,
           summary: reasoning.summary
             ? [
                 {
@@ -517,7 +506,20 @@ function standardInputToOpenAIResponsesInput(
                 ]
               }
             : {}),
-          ...(reasoning.encrypted_content ? { encrypted_content: reasoning.encrypted_content } : {})
+          ...(replayableEncryptedContent ? { encrypted_content: replayableEncryptedContent } : {})
+        });
+      }
+
+      if (text) {
+        items.push({
+          type: 'message',
+          role,
+          content: [
+            {
+              type: 'output_text',
+              text
+            }
+          ]
         });
       }
 
@@ -561,6 +563,19 @@ function standardInputToOpenAIResponsesInput(
         });
       }
       continue;
+    }
+
+    if (text) {
+      items.push({
+        type: 'message',
+        role,
+        content: [
+          {
+            type: 'input_text',
+            text
+          }
+        ]
+      });
     }
 
     for (const item of message.content) {
@@ -680,6 +695,7 @@ function collectAssistantToolCalls(
 
 function collectAssistantReasoning(content: StandardRequestInputContent[]):
   | {
+      id?: string;
       text?: string;
       summary?: string;
       encrypted_content?: string;
@@ -701,10 +717,13 @@ function collectAssistantReasoning(content: StandardRequestInputContent[]):
     .filter(Boolean)
     .join('\n')
     .trim();
-  const encryptedContent = reasoningItems.find((item) => item.encrypted_content)?.encrypted_content;
+  const encryptedItem = reasoningItems.find((item) => item.encrypted_content);
+  const encryptedContent = encryptedItem?.encrypted_content;
+  const id = encryptedItem?.id || reasoningItems.find((item) => item.id)?.id;
   const reasoningDetails = reasoningItems.flatMap((item) => item.reasoning_details || []);
 
   return {
+    ...(id ? { id } : {}),
     ...(text ? { text } : {}),
     ...(summary ? { summary } : {}),
     ...(encryptedContent ? { encrypted_content: encryptedContent } : {}),

@@ -400,7 +400,7 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
-  it('encodes Anthropic assistant history as output_text on the second OpenAI Responses turn', async () => {
+  it('preserves encrypted reasoning IDs in Anthropic history on the second OpenAI Responses turn', async () => {
     const upstreamBodies: Array<Record<string, unknown>> = [];
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
       const upstreamBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
@@ -416,6 +416,13 @@ describe('gateway routes protocol conversion', () => {
           model: 'gpt-5.6-sol',
           output_text: text,
           output: [
+            {
+              id: `rs_anthropic_history_${turn}`,
+              type: 'reasoning',
+              status: 'completed',
+              summary: [],
+              encrypted_content: `encrypted-reasoning-${turn}`
+            },
             {
               id: `msg_anthropic_history_${turn}`,
               type: 'message',
@@ -476,13 +483,19 @@ describe('gateway routes protocol conversion', () => {
     try {
       const firstResponse = await sendTurn([{ role: 'user', content: 'First turn' }]);
       expect(firstResponse.statusCode).toBe(200);
-      const firstBody = JSON.parse(firstResponse.body) as { content: unknown };
-      expect(firstBody.content).toEqual([
+      const firstBody = JSON.parse(firstResponse.body) as {
+        content: Array<Record<string, unknown>>;
+      };
+      expect(firstBody.content[0]).toMatchObject({
+        type: 'redacted_thinking'
+      });
+      expect(firstBody.content[0]?.data).not.toBe('encrypted-reasoning-1');
+      expect(firstBody.content[1]).toEqual(
         {
           type: 'text',
           text: 'Hello from the first turn.'
         }
-      ]);
+      );
 
       const secondResponse = await sendTurn([
         {
@@ -515,6 +528,12 @@ describe('gateway routes protocol conversion', () => {
             content: [{ type: 'input_text', text: 'First turn' }]
           },
           {
+            type: 'reasoning',
+            id: 'rs_anthropic_history_1',
+            summary: [],
+            encrypted_content: 'encrypted-reasoning-1'
+          },
+          {
             type: 'message',
             role: 'assistant',
             content: [{ type: 'output_text', text: 'Hello from the first turn.' }]
@@ -526,6 +545,8 @@ describe('gateway routes protocol conversion', () => {
           }
         ]
       });
+      const secondInput = upstreamBodies[1]?.input as Array<Record<string, unknown>>;
+      expect(secondInput[1]).not.toHaveProperty('status');
     } finally {
       await app.close();
     }

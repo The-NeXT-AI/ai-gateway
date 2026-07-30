@@ -11,6 +11,11 @@ import {
 import {
   collectAnthropicNonStreamPayloadFromEventStream,
   collectOpenAINonStreamPayloadFromEventStream,
+  createOptimisticOpenAIChatStreamRelay,
+  finalizeOptimisticOpenAIChatStreamRelay,
+  relayOptimisticAnthropicDeferredContent,
+  relayOptimisticAnthropicMessagesStreamTurn,
+  relayOptimisticOpenAIChatStreamToolCalls,
   relayConvertedStreamFromStandardResponse
 } from './streaming-conversion';
 
@@ -1079,6 +1084,301 @@ describe('virtual model multimodal reference rewriting', () => {
       prompt:
         'compare https://example.com/image.png with data:application/pdf;base64,QUJDRA=='
     });
+  });
+});
+
+describe('optimistic stream conversion', () => {
+  it('emits buffered client tool calls through an OpenAI Responses relay', () => {
+    const relay = createOptimisticOpenAIChatStreamRelay(
+      { adapterKey: 'openai_responses' },
+      {
+        input: 'Check the weather',
+        tools: [
+          {
+            type: 'function',
+            name: 'get_weather',
+            parameters: {
+              type: 'object',
+              properties: {
+                city: {
+                  type: 'string'
+                }
+              }
+            }
+          }
+        ]
+      }
+    );
+    if (!relay) {
+      throw new Error('Expected an OpenAI Responses optimistic relay.');
+    }
+
+    const body = [
+      ...relayOptimisticOpenAIChatStreamToolCalls(relay, [
+        {
+          id: 'call_weather_1',
+          type: 'function_call',
+          call_id: 'call_weather_1',
+          name: 'get_weather',
+          arguments: '{"city":"Shanghai"}',
+          status: 'completed'
+        }
+      ]),
+      ...finalizeOptimisticOpenAIChatStreamRelay(
+        relay,
+        {
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'tool_calls'
+            }
+          ]
+        },
+        {
+          input_tokens: 7,
+          output_tokens: 4,
+          total_tokens: 11
+        }
+      )
+    ].join('');
+
+    expect(body).toContain('"type":"response.output_item.added"');
+    expect(body).toContain('"type":"response.function_call_arguments.delta"');
+    expect(body).toContain('"type":"response.function_call_arguments.done"');
+    expect(body).toContain('"type":"response.output_item.done"');
+    expect(body).toContain('"type":"response.completed"');
+    expect(body).toContain('"call_id":"call_weather_1"');
+    expect(body).toContain('"name":"get_weather"');
+    expect(body).toContain('"arguments":"{\\"city\\":\\"Shanghai\\"}"');
+    expect(body).toContain('data: [DONE]');
+
+    const sequenceNumbers = body
+      .split('\n')
+      .filter((line) => line.startsWith('data: ') && line !== 'data: [DONE]')
+      .map((line) => JSON.parse(line.slice('data: '.length)).sequence_number);
+    expect(sequenceNumbers).toEqual(sequenceNumbers.map((_, index) => index));
+  });
+
+  it('preserves native Anthropic managed-tool events, citations, and stop metadata', async () => {
+    const relay = createOptimisticOpenAIChatStreamRelay({
+      adapterKey: 'anthropic_messages'
+    });
+    if (!relay) {
+      throw new Error('Expected an Anthropic Messages optimistic relay.');
+    }
+
+    const upstreamResponse = createSseResponse([
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_native_events","type":"message","role":"assistant","model":"claude-sonnet-4","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"output_tokens":0}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_search_1","name":"web_search","input":{}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"query\\":\\"gateway\\"}"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_search_1","content":[{"type":"web_search_result","url":"https://example.com","title":"Gateway","encrypted_content":"encrypted"}]}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"Result"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,"delta":{"type":"citations_delta","citation":{"type":"web_search_result_location","url":"https://example.com","title":"Gateway","cited_text":"Result"}}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":2}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"stop_sequence","stop_sequence":"<END>"},"usage":{"output_tokens":6,"server_tool_use":{"web_search_requests":1}}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    ]);
+    const result: { upstreamPayload?: Record<string, unknown> } = {};
+    const frames: string[] = [];
+    for await (const frame of relayOptimisticAnthropicMessagesStreamTurn(
+      upstreamResponse,
+      relay,
+      result
+    )) {
+      frames.push(frame);
+    }
+    if (!result.upstreamPayload) {
+      throw new Error('Expected a collected Anthropic payload.');
+    }
+    frames.push(
+      ...finalizeOptimisticOpenAIChatStreamRelay(relay, result.upstreamPayload)
+    );
+    const body = frames.join('');
+
+    expect(body).toContain('"type":"server_tool_use"');
+    expect(body).toContain('"type":"web_search_tool_result"');
+    expect(body).toContain('"type":"web_search_result"');
+    expect(body).toContain('"type":"citations_delta"');
+    expect(body).toContain('"stop_reason":"stop_sequence"');
+    expect(body).toContain('"stop_sequence":"<END>"');
+    expect(body).toContain('"web_search_requests":1');
+  });
+
+  it('keeps Anthropic upstream read-ahead bounded while the consumer is paused', async () => {
+    const relay = createOptimisticOpenAIChatStreamRelay({
+      adapterKey: 'anthropic_messages'
+    });
+    if (!relay) {
+      throw new Error('Expected an Anthropic Messages optimistic relay.');
+    }
+
+    const events = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_backpressure","type":"message","role":"assistant","model":"claude-sonnet-4","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      ...Array.from(
+        { length: 2_000 },
+        (_, index) =>
+          `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"chunk-${index.toString().padStart(4, '0')}"}}\n\n`
+      ),
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2000}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    ];
+    let nextEventIndex = 0;
+    const upstreamResponse = new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (nextEventIndex >= events.length) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(new TextEncoder().encode(events[nextEventIndex]));
+          nextEventIndex += 1;
+        }
+      }),
+      {
+        status: 200,
+        headers: {
+          'content-type': 'text/event-stream'
+        }
+      }
+    );
+    const result: { upstreamPayload?: Record<string, unknown> } = {};
+    const iterator = relayOptimisticAnthropicMessagesStreamTurn(
+      upstreamResponse,
+      relay,
+      result
+    );
+
+    const firstFrame = await iterator.next();
+    expect(firstFrame.value).toContain('"type":"message_start"');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(nextEventIndex).toBeLessThan(events.length);
+    await iterator.return(undefined);
+  });
+
+  it('replays content after an Anthropic tool_use in original block order', async () => {
+    const relay = createOptimisticOpenAIChatStreamRelay({
+      adapterKey: 'anthropic_messages'
+    });
+    if (!relay) {
+      throw new Error('Expected an Anthropic Messages optimistic relay.');
+    }
+
+    const upstreamResponse = createSseResponse([
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ordered_blocks","type":"message","role":"assistant","model":"claude-sonnet-4","content":[],"usage":{"input_tokens":4,"output_tokens":0}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"text A"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_ordered","name":"get_weather","input":{}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"city\\":\\"Shanghai\\"}"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"text B"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":2}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":8}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    ]);
+    const result: { upstreamPayload?: Record<string, unknown> } = {};
+    const liveFrames: string[] = [];
+    for await (const frame of relayOptimisticAnthropicMessagesStreamTurn(
+      upstreamResponse,
+      relay,
+      result
+    )) {
+      liveFrames.push(frame);
+    }
+
+    const liveBody = liveFrames.join('');
+    expect(liveBody).toContain('"text":"text A"');
+    expect(liveBody).not.toContain('"text":"text B"');
+    expect(liveBody).not.toContain('toolu_ordered');
+
+    const deferredFrames = relayOptimisticAnthropicDeferredContent(relay, result, [
+      {
+        id: 'toolu_ordered',
+        type: 'function_call',
+        call_id: 'toolu_ordered',
+        name: 'get_weather',
+        arguments: '{"city":"Shanghai"}',
+        status: 'completed'
+      }
+    ]);
+    const body = [...liveFrames, ...deferredFrames].join('');
+    const firstTextPosition = body.indexOf('"text":"text A"');
+    const toolPosition = body.indexOf('"id":"toolu_ordered"');
+    const secondTextPosition = body.indexOf('"text":"text B"');
+
+    expect(firstTextPosition).toBeGreaterThanOrEqual(0);
+    expect(toolPosition).toBeGreaterThan(firstTextPosition);
+    expect(secondTextPosition).toBeGreaterThan(toolPosition);
+  });
+
+  it('treats an Anthropic error event as terminal without creating a success payload', async () => {
+    const relay = createOptimisticOpenAIChatStreamRelay({
+      adapterKey: 'anthropic_messages'
+    });
+    if (!relay) {
+      throw new Error('Expected an Anthropic Messages optimistic relay.');
+    }
+
+    const result: {
+      upstreamPayload?: Record<string, unknown>;
+      upstreamErrorForwarded?: boolean;
+    } = {};
+    const frames: string[] = [];
+    for await (const frame of relayOptimisticAnthropicMessagesStreamTurn(
+      createSseResponse([
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_error","type":"message","role":"assistant","model":"claude-sonnet-4","content":[],"usage":{"input_tokens":2,"output_tokens":0}}}\n\n',
+        'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n'
+      ]),
+      relay,
+      result
+    )) {
+      frames.push(frame);
+    }
+    const body = frames.join('');
+
+    expect(result.upstreamErrorForwarded).toBe(true);
+    expect(result.upstreamPayload).toBeUndefined();
+    expect(body.match(/event: error/g)).toHaveLength(1);
+    expect(body).toContain('"type":"overloaded_error"');
+    expect(body).not.toContain('event: message_delta');
+    expect(body).not.toContain('event: message_stop');
+  });
+
+  it('rejects an Anthropic stream that ends before message_stop', async () => {
+    const relay = createOptimisticOpenAIChatStreamRelay({
+      adapterKey: 'anthropic_messages'
+    });
+    if (!relay) {
+      throw new Error('Expected an Anthropic Messages optimistic relay.');
+    }
+
+    const result: { upstreamPayload?: Record<string, unknown> } = {};
+    const frames: string[] = [];
+    const consume = async () => {
+      for await (const frame of relayOptimisticAnthropicMessagesStreamTurn(
+        createSseResponse([
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_truncated","type":"message","role":"assistant","model":"claude-sonnet-4","content":[],"usage":{"input_tokens":2,"output_tokens":0}}}\n\n',
+          'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n'
+        ]),
+        relay,
+        result
+      )) {
+        frames.push(frame);
+      }
+    };
+
+    await expect(consume()).rejects.toThrow('Anthropic stream ended before message_stop.');
+    expect(frames.join('')).toContain('"text":"partial"');
+    expect(result.upstreamPayload).toBeUndefined();
+    expect(frames.join('')).not.toContain('event: message_delta');
+    expect(frames.join('')).not.toContain('event: message_stop');
   });
 });
 

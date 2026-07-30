@@ -54,6 +54,10 @@ import {
   collectOpenAINonStreamPayloadFromEventStream,
   createOptimisticOpenAIChatStreamRelay,
   finalizeOptimisticOpenAIChatStreamRelay,
+  type OptimisticOpenAIChatStreamTurnResult,
+  relayOptimisticAnthropicDeferredContent,
+  relayOptimisticAnthropicMessagesStreamTurn,
+  relayOptimisticOpenAIChatStreamToolCalls,
   relayOptimisticOpenAIChatStreamTurn,
   relayConvertedStreamFromStandardResponse,
   relayConvertedStreamFromUpstreamResponse
@@ -2294,7 +2298,6 @@ async function handleVirtualModelRequest(
           targetProvider,
           targetProviderConfig,
           upstreamResponse,
-          mergedToolingResult.toolOwners,
           providerPlugins
         )
       ) {
@@ -2822,10 +2825,6 @@ function shouldConsumeClientWebSearchDeclaration(
 function isClientWebSearchFunctionTool(tool: unknown): boolean {
   const toolName = extractStandardToolName(tool);
   return Boolean(toolName && isVirtualWebSearchToolName(toolName));
-}
-
-function hasClientVisibleVirtualToolOwners(toolOwners: Map<string, VirtualToolOwner>): boolean {
-  return [...toolOwners.values()].some((owner) => owner.visibility !== 'internal');
 }
 
 async function executeInternalVirtualToolCalls(
@@ -3603,14 +3602,20 @@ function shouldUseOptimisticVirtualModelStream(
   targetProvider: Provider,
   targetProviderConfig: ProviderConfig | undefined,
   upstreamResponse: Response,
-  toolOwners: Map<string, VirtualToolOwner>,
   providerPlugins: ProviderPlugin[]
 ): boolean {
   if (!streaming || profile.execution.streamMode !== 'optimistic') {
     return false;
   }
 
-  if (targetProvider !== 'openai' || targetProviderConfig?.type !== 'openai_chat_completions') {
+  const usesOpenAIChatTarget =
+    targetProvider === 'openai' &&
+    targetProviderConfig?.type === 'openai_chat_completions';
+  const usesNativeAnthropicTarget =
+    targetProvider === 'anthropic' &&
+    targetProviderConfig?.type === 'anthropic_messages' &&
+    source.adapterKey === 'anthropic_messages';
+  if (!usesOpenAIChatTarget && !usesNativeAnthropicTarget) {
     return false;
   }
 
@@ -3619,10 +3624,6 @@ function shouldUseOptimisticVirtualModelStream(
     !isEventStreamResponse(upstreamResponse) ||
     !canRelayOptimisticOpenAIChatStream(source)
   ) {
-    return false;
-  }
-
-  if (hasClientVisibleVirtualToolOwners(toolOwners)) {
     return false;
   }
 
@@ -3710,17 +3711,32 @@ async function* runOptimisticVirtualModelStream(input: {
   let lastAttemptSequence = input.lastAttemptSequence;
   let aggregatedUsage: StandardUsage = {};
   let internalToolCalls = 0;
+  const usesNativeAnthropicTarget =
+    input.targetProvider === 'anthropic' &&
+    input.targetProviderConfig?.type === 'anthropic_messages';
 
   try {
     for (let turn = 0; turn < input.virtualModel.profile.execution.maxTurns; turn += 1) {
-      const turnResult: { upstreamPayload?: Record<string, unknown> } = {};
-      yield* relayOptimisticOpenAIChatStreamTurn(
-        upstreamResponse,
-        relay,
-        turnResult,
-        input.providerPluginContext.clientAbortSignal
-      );
+      const turnResult: OptimisticOpenAIChatStreamTurnResult = {};
+      if (usesNativeAnthropicTarget) {
+        yield* relayOptimisticAnthropicMessagesStreamTurn(
+          upstreamResponse,
+          relay,
+          turnResult,
+          input.providerPluginContext.clientAbortSignal
+        );
+      } else {
+        yield* relayOptimisticOpenAIChatStreamTurn(
+          upstreamResponse,
+          relay,
+          turnResult,
+          input.providerPluginContext.clientAbortSignal
+        );
+      }
       if (input.providerPluginContext.clientAbortSignal?.aborted) {
+        return;
+      }
+      if (turnResult.upstreamErrorForwarded) {
         return;
       }
       const upstreamPayload = turnResult.upstreamPayload;
@@ -3754,9 +3770,35 @@ async function* runOptimisticVirtualModelStream(input: {
       );
 
       if (callPartition.client.length > 0 || callPartition.unknown.length > 0) {
-        yield* buildOptimisticVirtualModelStreamErrorFrames(
-          input.source,
-          'Optimistic virtual model streams do not support client-visible tool calls.'
+        // Client-owned calls take precedence for a mixed turn: the gateway cannot
+        // continue an internal tool loop until the client has supplied its results.
+        const finalResponse = filterInternalToolCallsFromStandardResponse(
+          lastResponse,
+          input.mergedToolingResult.toolOwners,
+          aggregatedUsage
+        );
+        publishOptimisticVirtualModelBillingEvent(
+          input,
+          finalResponse,
+          lastAttemptSequence
+        );
+        const visibleFunctionCalls = extractFunctionCallsFromStandardResponse(finalResponse);
+        if (usesNativeAnthropicTarget) {
+          yield* relayOptimisticAnthropicDeferredContent(
+            relay,
+            turnResult,
+            visibleFunctionCalls
+          );
+        } else {
+          yield* relayOptimisticOpenAIChatStreamToolCalls(
+            relay,
+            visibleFunctionCalls
+          );
+        }
+        yield* finalizeOptimisticOpenAIChatStreamRelay(
+          relay,
+          upstreamPayload,
+          finalResponse.usage
         );
         return;
       }
@@ -3772,10 +3814,16 @@ async function* runOptimisticVirtualModelStream(input: {
           finalResponse,
           lastAttemptSequence
         );
+        if (usesNativeAnthropicTarget) {
+          yield* relayOptimisticAnthropicDeferredContent(relay, turnResult, []);
+        }
         yield* finalizeOptimisticOpenAIChatStreamRelay(relay, upstreamPayload, finalResponse.usage);
         return;
       }
 
+      if (usesNativeAnthropicTarget) {
+        yield* relayOptimisticAnthropicDeferredContent(relay, turnResult, []);
+      }
       internalToolCalls += callPartition.internal.length;
       if (internalToolCalls > input.virtualModel.profile.execution.maxToolCalls) {
         yield* buildOptimisticVirtualModelStreamErrorFrames(

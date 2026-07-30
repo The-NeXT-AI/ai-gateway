@@ -108,6 +108,29 @@ interface ProviderAttemptFailure {
   upstreamResponseBody?: unknown;
 }
 
+interface StandardResponseParseRetrySuccess {
+  ok: true;
+  aborted?: false;
+  upstreamAttemptSequence: number;
+  attemptSequence: number;
+  upstreamRequest: UpstreamRequest;
+  upstreamResponse: Response;
+  upstreamPayload: unknown;
+  transformedPayload: unknown;
+  standardPayload: unknown;
+  standardResponse: StandardResponse;
+}
+
+interface StandardResponseParseRetryFailure {
+  ok: false;
+  upstreamAttemptSequence: number;
+  aborted?: boolean;
+}
+
+type StandardResponseParseRetryResult =
+  | StandardResponseParseRetrySuccess
+  | StandardResponseParseRetryFailure;
+
 interface TargetProviderRoute {
   provider: Provider;
   providerConfig?: ProviderConfig;
@@ -984,29 +1007,26 @@ export async function handleGatewayRequest(
         continue;
       }
 
-      const transformedPayload = responsePluginResult.value;
-      const standardPayload = await normalizeOpenAIPayloadForResponseParseRecovery(
+      let transformedPayload = responsePluginResult.value;
+      let standardPayload = await normalizeOpenAIPayloadForResponseParseRecovery(
         request,
         targetProvider,
         transformedPayload
       );
-      const standardResponseResult = targetAdapter.toStandardResponse(standardPayload, {
+      let standardResponseResult = targetAdapter.toStandardResponse(standardPayload, {
         request,
         standardRequest,
         config,
         targetProviderConfig
       });
       if (!standardResponseResult.ok) {
-        const attempt: ProviderAttemptFailure = {
-          provider: targetProvider,
-          providerName: targetProviderConfig?.name,
-          stage: 'response_parse',
-          message: standardResponseResult.error,
-          status: 502,
-          details: standardPayload,
-          upstreamRequest,
-          upstreamResponseBody: standardPayload,
-        };
+        const attempt = buildResponseParseAttempt(
+          targetProvider,
+          targetProviderConfig,
+          standardResponseResult.error,
+          standardPayload,
+          upstreamRequest
+        );
         attempts.push(attempt);
         publishFailedAttemptEventSafe(
           request,
@@ -1020,10 +1040,44 @@ export async function handleGatewayRequest(
           attempts,
           targetProviderConfig,
         );
-        if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
-          break;
+        if (shouldRetryEmptyOutputResponseParseFailure(config, attempt)) {
+          const retryResult = await retryEmptyOutputResponseParseFailure({
+            request,
+            reply,
+            config,
+            providerPluginContext,
+            targetProvider,
+            targetProviderConfig,
+            targetAdapter,
+            baseUpstreamRequest,
+            standardRequest,
+            model,
+            attempts,
+            upstreamAttemptSequence
+          });
+          upstreamAttemptSequence = retryResult.upstreamAttemptSequence;
+          if (retryResult.aborted) {
+            return;
+          }
+          if (retryResult.ok) {
+            transformedPayload = retryResult.transformedPayload;
+            standardPayload = retryResult.standardPayload;
+            standardResponseResult = {
+              ok: true,
+              value: retryResult.standardResponse
+            };
+          } else if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempts[attempts.length - 1])) {
+            break;
+          } else {
+            continue;
+          }
         }
-        continue;
+        if (!standardResponseResult.ok) {
+          if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+            break;
+          }
+          continue;
+        }
       }
 
       const sourceStandardResponse = prepareStandardResponseForSource(
@@ -1296,29 +1350,28 @@ export async function handleGatewayRequest(
       continue;
     }
 
-    const transformedPayload = responsePluginResult.value;
-    const standardPayload = await normalizeOpenAIPayloadForResponseParseRecovery(
+    let responseUpstreamRequest = upstreamRequest;
+    let responseAttemptSequence = currentAttemptSequence;
+    let transformedPayload = responsePluginResult.value;
+    let standardPayload = await normalizeOpenAIPayloadForResponseParseRecovery(
       request,
       targetProvider,
       transformedPayload
     );
-    const standardResponseResult = targetAdapter.toStandardResponse(standardPayload, {
+    let standardResponseResult = targetAdapter.toStandardResponse(standardPayload, {
       request,
       standardRequest,
       config,
       targetProviderConfig
     });
     if (!standardResponseResult.ok) {
-      const attempt: ProviderAttemptFailure = {
-        provider: targetProvider,
-        providerName: targetProviderConfig?.name,
-        stage: 'response_parse',
-        message: standardResponseResult.error,
-        status: 502,
-        details: standardPayload,
-        upstreamRequest,
-        upstreamResponseBody: standardPayload,
-      };
+      const attempt = buildResponseParseAttempt(
+        targetProvider,
+        targetProviderConfig,
+        standardResponseResult.error,
+        standardPayload,
+        upstreamRequest
+      );
       attempts.push(attempt);
       publishFailedAttemptEventSafe(
         request,
@@ -1332,10 +1385,46 @@ export async function handleGatewayRequest(
         attempts,
         targetProviderConfig,
       );
-      if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
-        break;
+      if (shouldRetryEmptyOutputResponseParseFailure(config, attempt)) {
+        const retryResult = await retryEmptyOutputResponseParseFailure({
+          request,
+          reply,
+          config,
+          providerPluginContext,
+          targetProvider,
+          targetProviderConfig,
+          targetAdapter,
+          baseUpstreamRequest,
+          standardRequest,
+          model,
+          attempts,
+          upstreamAttemptSequence
+        });
+        upstreamAttemptSequence = retryResult.upstreamAttemptSequence;
+        if (retryResult.aborted) {
+          return;
+        }
+        if (retryResult.ok) {
+          responseUpstreamRequest = retryResult.upstreamRequest;
+          responseAttemptSequence = retryResult.attemptSequence;
+          transformedPayload = retryResult.transformedPayload;
+          standardPayload = retryResult.standardPayload;
+          standardResponseResult = {
+            ok: true,
+            value: retryResult.standardResponse
+          };
+        } else if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempts[attempts.length - 1])) {
+          break;
+        } else {
+          continue;
+        }
       }
-      continue;
+      if (!standardResponseResult.ok) {
+        if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+          break;
+        }
+        continue;
+      }
     }
 
     const transparentToolExecutionResult = await runTransparentToolExecutionLoop({
@@ -1352,9 +1441,9 @@ export async function handleGatewayRequest(
       model,
       initialStandardRequest: standardRequest,
       initialStandardResponse: standardResponseResult.value,
-      initialUpstreamRequest: upstreamRequest,
+      initialUpstreamRequest: responseUpstreamRequest,
       initialUpstreamResponseBody: transformedPayload,
-      initialAttemptSequence: currentAttemptSequence,
+      initialAttemptSequence: responseAttemptSequence,
       state: {
         attempts,
         upstreamAttemptSequence
@@ -1763,16 +1852,13 @@ async function runTransparentToolExecutionLoop(input: {
       targetProviderConfig: input.targetProviderConfig
     });
     if (!standardResponseResult.ok) {
-      const attempt: ProviderAttemptFailure = {
-        provider: input.targetProvider,
-        providerName: input.targetProviderConfig?.name,
-        stage: 'response_parse',
-        message: standardResponseResult.error,
-        status: 502,
-        details: standardPayload,
-        upstreamRequest,
-        upstreamResponseBody: standardPayload
-      };
+      const attempt = buildResponseParseAttempt(
+        input.targetProvider,
+        input.targetProviderConfig,
+        standardResponseResult.error,
+        standardPayload,
+        upstreamRequest
+      );
       input.state.attempts.push(attempt);
       publishFailedAttemptEventSafe(
         input.request,
@@ -1786,6 +1872,34 @@ async function runTransparentToolExecutionLoop(input: {
         input.state.attempts,
         input.targetProviderConfig
       );
+      if (shouldRetryEmptyOutputResponseParseFailure(input.config, attempt)) {
+        const retryResult = await retryEmptyOutputResponseParseFailure({
+          request: input.request,
+          reply: input.reply,
+          config: input.config,
+          providerPluginContext: input.providerPluginContext,
+          targetProvider: input.targetProvider,
+          targetProviderConfig: input.targetProviderConfig,
+          targetAdapter: input.targetAdapter,
+          baseUpstreamRequest,
+          standardRequest: workingRequest,
+          model: input.model,
+          attempts: input.state.attempts,
+          upstreamAttemptSequence
+        });
+        upstreamAttemptSequence = retryResult.upstreamAttemptSequence;
+        if (retryResult.aborted) {
+          return { ok: false, upstreamAttemptSequence };
+        }
+        if (retryResult.ok) {
+          lastUpstreamRequest = retryResult.upstreamRequest;
+          lastUpstreamResponseBody = retryResult.transformedPayload;
+          lastAttemptSequence = retryResult.attemptSequence;
+          lastResponse = retryResult.standardResponse;
+          aggregatedUsage = mergeStandardUsage(aggregatedUsage, lastResponse.usage);
+          continue;
+        }
+      }
       return { ok: false, upstreamAttemptSequence };
     }
 
@@ -2284,7 +2398,7 @@ async function handleVirtualModelRequest(
         break;
       }
 
-      const transformedPayload = responsePluginResult.value;
+      let transformedPayload = responsePluginResult.value;
       const standardPayload = await normalizeOpenAIPayloadForResponseParseRecovery(
         request,
         targetProvider,
@@ -2296,18 +2410,18 @@ async function handleVirtualModelRequest(
         config,
         targetProviderConfig
       });
+      let parsedStandardResponse = standardResponseResult.ok
+        ? standardResponseResult.value
+        : undefined;
       if (!standardResponseResult.ok) {
         loopExhausted = false;
-        const attempt: ProviderAttemptFailure = {
-          provider: targetProvider,
-          providerName: targetProviderConfig?.name,
-          stage: 'response_parse',
-          message: standardResponseResult.error,
-          status: 502,
-          details: standardPayload,
-          upstreamRequest,
-          upstreamResponseBody: standardPayload
-        };
+        const attempt = buildResponseParseAttempt(
+          targetProvider,
+          targetProviderConfig,
+          standardResponseResult.error,
+          standardPayload,
+          upstreamRequest
+        );
         attempts.push(attempt);
         publishFailedAttemptEventSafe(
           request,
@@ -2321,10 +2435,51 @@ async function handleVirtualModelRequest(
           attempts,
           targetProviderConfig
         );
-        break;
+        if (shouldRetryEmptyOutputResponseParseFailure(config, attempt)) {
+          const retryResult = await retryEmptyOutputResponseParseFailure({
+            request,
+            reply,
+            config,
+            providerPluginContext,
+            targetProvider,
+            targetProviderConfig,
+            targetAdapter,
+            baseUpstreamRequest,
+            standardRequest: workingRequest,
+            model,
+            attempts,
+            upstreamAttemptSequence,
+            readPayload: (response, signal) =>
+              isEventStreamResponse(response)
+                ? collectVirtualModelEventStreamPayload(
+                    request,
+                    targetProvider,
+                    targetProviderConfig,
+                    response,
+                    signal
+                  )
+                : safeReadUpstreamPayload(request, targetProvider, response, signal)
+          });
+          upstreamAttemptSequence = retryResult.upstreamAttemptSequence;
+          if (retryResult.aborted) {
+            return;
+          }
+          if (retryResult.ok) {
+            lastUpstreamRequest = retryResult.upstreamRequest;
+            lastAttemptSequence = retryResult.attemptSequence;
+            transformedPayload = retryResult.transformedPayload;
+            parsedStandardResponse = retryResult.standardResponse;
+          }
+        }
+        if (!parsedStandardResponse) {
+          break;
+        }
       }
 
-      lastResponse = standardResponseResult.value;
+      if (!parsedStandardResponse) {
+        break;
+      }
+      lastResponse = parsedStandardResponse;
       aggregatedUsage = mergeStandardUsage(aggregatedUsage, lastResponse.usage);
       const functionCalls = extractFunctionCallsFromStandardResponse(lastResponse);
       const callPartition = partitionVirtualFunctionCalls(
@@ -5071,6 +5226,272 @@ function buildApiKeyModelRestrictionAttempt(
     stage: 'api_key_model_restriction',
     message: result.error,
     status: result.statusCode
+  };
+}
+
+function buildResponseParseAttempt(
+  provider: Provider,
+  providerConfig: ProviderConfig | undefined,
+  message: string,
+  standardPayload: unknown,
+  upstreamRequest: UpstreamRequest
+): ProviderAttemptFailure {
+  return {
+    provider,
+    providerName: providerConfig?.name,
+    stage: 'response_parse',
+    message,
+    status: 502,
+    details: withRetryableEmptyOutputDetails(message, standardPayload),
+    upstreamRequest,
+    upstreamResponseBody: standardPayload
+  };
+}
+
+function withRetryableEmptyOutputDetails(message: string, standardPayload: unknown): unknown {
+  if (!isEmptyOutputResponseParseMessage(message)) {
+    return standardPayload;
+  }
+
+  if (isPlainObject(standardPayload)) {
+    return {
+      ...standardPayload,
+      gateway_error: {
+        code: 'empty_model_output',
+        retryable: true
+      }
+    };
+  }
+
+  return {
+    gateway_error: {
+      code: 'empty_model_output',
+      retryable: true
+    },
+    payload: standardPayload
+  };
+}
+
+function isEmptyOutputResponseParseFailure(attempt: ProviderAttemptFailure): boolean {
+  return attempt.stage === 'response_parse' && isEmptyOutputResponseParseMessage(attempt.message);
+}
+
+function isEmptyOutputResponseParseMessage(message: string): boolean {
+  return /response does not contain text output, reasoning output, or tool calls\./i.test(message);
+}
+
+function shouldRetryEmptyOutputResponseParseFailure(
+  config: GatewayConfig,
+  attempt: ProviderAttemptFailure
+): boolean {
+  return (
+    isEmptyOutputResponseParseFailure(attempt) &&
+    config.upstreamRetry.enabled &&
+    config.upstreamRetry.maxAttempts > 1
+  );
+}
+
+async function retryEmptyOutputResponseParseFailure(input: {
+  request: FastifyRequest;
+  reply: FastifyReply;
+  config: GatewayConfig;
+  providerPluginContext: ProviderPluginExecutionContext;
+  targetProvider: Provider;
+  targetProviderConfig?: ProviderConfig;
+  targetAdapter: TargetAdapter;
+  baseUpstreamRequest: UpstreamRequest;
+  standardRequest: StandardRequest;
+  model: string;
+  attempts: ProviderAttemptFailure[];
+  upstreamAttemptSequence: number;
+  readPayload?: (
+    upstreamResponse: Response,
+    clientAbortSignal?: AbortSignal
+  ) => Promise<unknown>;
+}): Promise<StandardResponseParseRetryResult> {
+  let upstreamAttemptSequence = input.upstreamAttemptSequence;
+  input.request.log.warn(
+    {
+      provider: input.targetProvider,
+      providerName: input.targetProviderConfig?.name,
+      model: input.model
+    },
+    'Retrying upstream request after empty model output.'
+  );
+
+  const upstreamDispatchResult = await dispatchUpstreamRequest(
+    input.providerPluginContext,
+    input.baseUpstreamRequest,
+    input.config.upstreamTimeoutMs,
+    input.standardRequest
+  );
+  if (input.providerPluginContext.clientAbortSignal?.aborted) {
+    return { ok: false, upstreamAttemptSequence, aborted: true };
+  }
+  if (!upstreamDispatchResult.ok) {
+    const attempt: ProviderAttemptFailure = {
+      provider: input.targetProvider,
+      providerName: input.targetProviderConfig?.name,
+      stage: upstreamDispatchResult.stage,
+      message: upstreamDispatchResult.message,
+      status: upstreamDispatchResult.status,
+      details: upstreamDispatchResult.details,
+      upstreamRequest: upstreamDispatchResult.upstreamRequest,
+      upstreamResponseBody:
+        upstreamDispatchResult.details !== undefined
+          ? {
+              error: {
+                message: upstreamDispatchResult.message,
+                details: upstreamDispatchResult.details
+              }
+            }
+          : undefined
+    };
+    input.attempts.push(attempt);
+    if (upstreamDispatchResult.upstreamRequest) {
+      upstreamAttemptSequence += 1;
+      publishFailedAttemptEventSafe(
+        input.request,
+        input.reply,
+        input.config,
+        input.providerPluginContext.sourceProvider,
+        input.providerPluginContext.sourceAdapterKey,
+        attempt,
+        input.model,
+        upstreamAttemptSequence,
+        input.attempts,
+        input.targetProviderConfig
+      );
+    }
+    return { ok: false, upstreamAttemptSequence };
+  }
+
+  const { upstreamRequest, upstreamResponse } = upstreamDispatchResult;
+  upstreamAttemptSequence += 1;
+  const attemptSequence = upstreamAttemptSequence;
+  const readPayload =
+    input.readPayload ??
+    ((response: Response, clientAbortSignal?: AbortSignal) =>
+      readBufferedUpstreamPayload(
+        input.request,
+        input.targetProvider,
+        input.targetProviderConfig,
+        response,
+        clientAbortSignal
+      ));
+  const upstreamPayload = await readPayload(
+    upstreamResponse,
+    input.providerPluginContext.clientAbortSignal
+  );
+  if (input.providerPluginContext.clientAbortSignal?.aborted) {
+    return { ok: false, upstreamAttemptSequence, aborted: true };
+  }
+  if (!upstreamResponse.ok) {
+    const attempt: ProviderAttemptFailure = {
+      provider: input.targetProvider,
+      providerName: input.targetProviderConfig?.name,
+      stage: 'upstream_response',
+      message: 'Upstream request failed.',
+      status: upstreamResponse.status,
+      details: upstreamPayload,
+      upstreamRequest,
+      upstreamResponseBody: upstreamPayload
+    };
+    input.attempts.push(attempt);
+    publishFailedAttemptEventSafe(
+      input.request,
+      input.reply,
+      input.config,
+      input.providerPluginContext.sourceProvider,
+      input.providerPluginContext.sourceAdapterKey,
+      attempt,
+      input.model,
+      attemptSequence,
+      input.attempts,
+      input.targetProviderConfig
+    );
+    return { ok: false, upstreamAttemptSequence };
+  }
+
+  const responsePluginResult = await applyProviderResponsePlugins(
+    input.providerPluginContext,
+    upstreamRequest,
+    upstreamResponse,
+    upstreamPayload,
+    input.standardRequest
+  );
+  if (!responsePluginResult.ok) {
+    const attempt: ProviderAttemptFailure = {
+      provider: input.targetProvider,
+      providerName: input.targetProviderConfig?.name,
+      stage: responsePluginResult.stage,
+      message: responsePluginResult.message,
+      status: responsePluginResult.status,
+      upstreamRequest,
+      upstreamResponseBody: upstreamPayload
+    };
+    input.attempts.push(attempt);
+    publishFailedAttemptEventSafe(
+      input.request,
+      input.reply,
+      input.config,
+      input.providerPluginContext.sourceProvider,
+      input.providerPluginContext.sourceAdapterKey,
+      attempt,
+      input.model,
+      attemptSequence,
+      input.attempts,
+      input.targetProviderConfig
+    );
+    return { ok: false, upstreamAttemptSequence };
+  }
+
+  const transformedPayload = responsePluginResult.value;
+  const standardPayload = await normalizeOpenAIPayloadForResponseParseRecovery(
+    input.request,
+    input.targetProvider,
+    transformedPayload
+  );
+  const standardResponseResult = input.targetAdapter.toStandardResponse(standardPayload, {
+    request: input.request,
+    standardRequest: input.standardRequest,
+    config: input.config,
+    targetProviderConfig: input.targetProviderConfig
+  });
+  if (!standardResponseResult.ok) {
+    const attempt = buildResponseParseAttempt(
+      input.targetProvider,
+      input.targetProviderConfig,
+      standardResponseResult.error,
+      standardPayload,
+      upstreamRequest
+    );
+    input.attempts.push(attempt);
+    publishFailedAttemptEventSafe(
+      input.request,
+      input.reply,
+      input.config,
+      input.providerPluginContext.sourceProvider,
+      input.providerPluginContext.sourceAdapterKey,
+      attempt,
+      input.model,
+      attemptSequence,
+      input.attempts,
+      input.targetProviderConfig
+    );
+    return { ok: false, upstreamAttemptSequence };
+  }
+
+  return {
+    ok: true,
+    upstreamAttemptSequence,
+    attemptSequence,
+    upstreamRequest,
+    upstreamResponse,
+    upstreamPayload,
+    transformedPayload,
+    standardPayload,
+    standardResponse: standardResponseResult.value
   };
 }
 

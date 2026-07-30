@@ -5677,6 +5677,88 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('retries empty model output parse failures across providers', async () => {
+    let upstreamCalls = 0;
+    const fetchMock = vi.fn(async () => {
+      upstreamCalls += 1;
+      if (upstreamCalls === 1) {
+        return new Response(
+          JSON.stringify({
+            id: 'msg_empty_output',
+            type: 'message',
+            role: 'assistant',
+            model: 'claude-sonnet-4',
+            content: [],
+            stop_reason: 'end_turn',
+            usage: {
+              input_tokens: 3,
+              output_tokens: 0
+            }
+          }),
+          {
+            status: 200,
+            headers: {
+              'content-type': 'application/json'
+            }
+          }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'msg_retry_success',
+          type: 'message',
+          role: 'assistant',
+          model: 'claude-sonnet-4',
+          content: [{ type: 'text', text: 'retry-ok' }],
+          stop_reason: 'end_turn',
+          usage: {
+            input_tokens: 3,
+            output_tokens: 2
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('anthropic-main', 'anthropic_messages', ['claude-sonnet-4'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'anthropic-main'
+        },
+        payload: {
+          model: 'claude-sonnet-4',
+          messages: [{ role: 'user', content: 'hello' }],
+          stream: false
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const body = JSON.parse(response.body);
+      expect(body.choices?.[0]?.message?.content).toBe('retry-ok');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('rejects requests when model is not configured for the target provider', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(JSON.stringify({ ok: true }), {

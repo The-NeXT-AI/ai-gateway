@@ -28,6 +28,7 @@ import type {
   GatewaySourceContext,
   StandardRequest,
   StandardResponse,
+  StandardResponseFunctionCall,
   StandardResponseReasoning,
   StandardUsage
 } from '../types';
@@ -121,6 +122,9 @@ interface AnthropicRelayState {
     web_fetch_requests?: number;
   };
   finishReason?: string;
+  nativeStopReason?: string;
+  nativeStopSequence?: string | null;
+  preserveNativeStopMetadata?: boolean;
   activeBlockType?: AnthropicContentBlockType;
   activeBlockIndex?: number;
   nextBlockIndex: number;
@@ -255,8 +259,35 @@ interface AnthropicStreamThinkingAccumulator {
   signature?: string;
 }
 
+interface AnthropicNonStreamCollectionState {
+  id: string;
+  model: string;
+  outputText: string;
+  stopReason?: string;
+  stopSequence?: string | null;
+  usage: Record<string, unknown>;
+  toolBlocks: Map<number, AnthropicStreamToolUseAccumulator>;
+  thinkingBlocks: Map<number, AnthropicStreamThinkingAccumulator>;
+  activeToolBlockIndex?: number;
+  activeThinkingBlockIndex?: number;
+}
+
+interface OptimisticAnthropicDeferredEvent {
+  eventName: string;
+  payload: Record<string, unknown>;
+}
+
+interface OptimisticAnthropicDeferredBlock {
+  kind: 'native' | 'tool_use';
+  toolCallId?: string;
+  toolName?: string;
+  events: OptimisticAnthropicDeferredEvent[];
+}
+
 export interface OptimisticOpenAIChatStreamTurnResult {
   upstreamPayload?: Record<string, unknown>;
+  upstreamErrorForwarded?: boolean;
+  deferredAnthropicBlocks?: OptimisticAnthropicDeferredBlock[];
 }
 
 type OptimisticOpenAIChatRelay =
@@ -419,6 +450,306 @@ export async function* relayOptimisticOpenAIChatStreamTurn(
   result.upstreamPayload = buildOpenAINonStreamPayloadFromCollectionState(collectionState);
 }
 
+export async function* relayOptimisticAnthropicMessagesStreamTurn(
+  upstreamResponse: Response,
+  relay: OptimisticOpenAIChatRelay,
+  result: OptimisticOpenAIChatStreamTurnResult,
+  abortSignal?: AbortSignal
+): AsyncGenerator<string> {
+  if (relay.sourceAdapterKey !== 'anthropic_messages') {
+    throw new Error('Native Anthropic optimistic relay requires an Anthropic Messages source.');
+  }
+
+  const collectionState = createAnthropicNonStreamCollectionState();
+  const upstreamBlocks = new Map<
+    number,
+    {
+      downstreamIndex?: number;
+      withheld: boolean;
+      deferredBlock?: OptimisticAnthropicDeferredBlock;
+    }
+  >();
+  const deferredBlocks: OptimisticAnthropicDeferredBlock[] = [];
+  let deferFollowingContent = false;
+  let sawMessageStop = false;
+
+  for await (const chunk of parseSseChunks(upstreamResponse, abortSignal)) {
+    const data = chunk.data.trim();
+    if (!data || data === '[DONE]') {
+      continue;
+    }
+
+    let payload: unknown;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+
+    if (!isObject(payload)) {
+      continue;
+    }
+
+    const eventType = asString(payload.type) || chunk.event || '';
+    if (eventType === 'error') {
+      yield encodeSseEvent(chunk.event || eventType, payload);
+      result.upstreamErrorForwarded = true;
+      return;
+    }
+
+    collectAnthropicNonStreamEvent(collectionState, payload, chunk.event);
+
+    if (eventType === 'message_start') {
+      const message = isObject(payload.message) ? payload.message : undefined;
+      const messageId = asString(message?.id);
+      if (messageId && !relay.state.started) {
+        relay.state.messageId = messageId;
+      }
+      const model = asString(message?.model);
+      if (model) {
+        relay.state.model = model;
+      }
+      updateAnthropicRelayUsage(
+        relay.state,
+        isObject(message?.usage) ? message.usage : undefined
+      );
+      yield* ensureAnthropicRelayStarted(relay.state);
+      continue;
+    }
+
+    if (eventType === 'content_block_start') {
+      const upstreamIndex = asNumber(payload.index);
+      const block = isObject(payload.content_block) ? payload.content_block : undefined;
+      const blockType = asString(block?.type) || '';
+      if (upstreamIndex === undefined) {
+        continue;
+      }
+
+      // Only ordinary tool_use blocks need ownership classification. Anthropic-managed
+      // server tools, result blocks, citations, and future native block types stay visible.
+      const withheld = blockType === 'tool_use';
+      if (withheld) {
+        deferFollowingContent = true;
+        const deferredBlock: OptimisticAnthropicDeferredBlock = {
+          kind: 'tool_use',
+          toolCallId: asString(block?.id),
+          toolName: asString(block?.name),
+          events: []
+        };
+        deferredBlocks.push(deferredBlock);
+        upstreamBlocks.set(upstreamIndex, {
+          withheld,
+          deferredBlock
+        });
+        continue;
+      }
+
+      if (deferFollowingContent) {
+        const deferredBlock: OptimisticAnthropicDeferredBlock = {
+          kind: 'native',
+          events: [
+            {
+              eventName: chunk.event || eventType,
+              payload
+            }
+          ]
+        };
+        deferredBlocks.push(deferredBlock);
+        upstreamBlocks.set(upstreamIndex, {
+          withheld,
+          deferredBlock
+        });
+        continue;
+      }
+
+      yield* closeActiveAnthropicTextBlock(relay.state);
+      yield* ensureAnthropicRelayStarted(relay.state);
+      const downstreamIndex = relay.state.nextBlockIndex;
+      relay.state.nextBlockIndex += 1;
+      upstreamBlocks.set(upstreamIndex, {
+        downstreamIndex,
+        withheld
+      });
+      yield encodeSseEvent(chunk.event || eventType, {
+        ...payload,
+        index: downstreamIndex
+      });
+      continue;
+    }
+
+    if (eventType === 'content_block_delta') {
+      const upstreamIndex = asNumber(payload.index);
+      const upstreamBlock =
+        upstreamIndex === undefined ? undefined : upstreamBlocks.get(upstreamIndex);
+      if (upstreamBlock?.deferredBlock) {
+        if (upstreamBlock.deferredBlock.kind === 'native') {
+          upstreamBlock.deferredBlock.events.push({
+            eventName: chunk.event || eventType,
+            payload
+          });
+        }
+        continue;
+      }
+      if (upstreamBlock?.withheld || upstreamBlock?.downstreamIndex === undefined) {
+        continue;
+      }
+
+      yield encodeSseEvent(chunk.event || eventType, {
+        ...payload,
+        index: upstreamBlock.downstreamIndex
+      });
+      continue;
+    }
+
+    if (eventType === 'content_block_stop') {
+      const upstreamIndex = asNumber(payload.index);
+      const upstreamBlock =
+        upstreamIndex === undefined ? undefined : upstreamBlocks.get(upstreamIndex);
+      if (upstreamBlock?.deferredBlock) {
+        if (upstreamBlock.deferredBlock.kind === 'native') {
+          upstreamBlock.deferredBlock.events.push({
+            eventName: chunk.event || eventType,
+            payload
+          });
+        }
+        continue;
+      }
+      if (upstreamBlock?.withheld || upstreamBlock?.downstreamIndex === undefined) {
+        continue;
+      }
+
+      yield encodeSseEvent(chunk.event || eventType, {
+        ...payload,
+        index: upstreamBlock.downstreamIndex
+      });
+      continue;
+    }
+
+    if (eventType === 'message_delta') {
+      updateAnthropicRelayUsage(
+        relay.state,
+        isObject(payload.usage) ? payload.usage : undefined
+      );
+      continue;
+    }
+
+    if (eventType === 'message_stop') {
+      sawMessageStop = true;
+      break;
+    }
+
+    if (eventType) {
+      yield encodeSseEvent(chunk.event || eventType, payload);
+    }
+  }
+
+  if (abortSignal?.aborted) {
+    return;
+  }
+  if (!sawMessageStop) {
+    throw new Error('Anthropic stream ended before message_stop.');
+  }
+
+  result.deferredAnthropicBlocks = deferredBlocks;
+  result.upstreamPayload = buildAnthropicNonStreamPayload(collectionState);
+}
+
+export function relayOptimisticOpenAIChatStreamToolCalls(
+  relay: OptimisticOpenAIChatRelay,
+  toolCalls: StandardResponseFunctionCall[]
+): string[] {
+  if (toolCalls.length === 0) {
+    return [];
+  }
+
+  const payload: Record<string, unknown> = {
+    id:
+      relay.sourceAdapterKey === 'openai_responses'
+        ? relay.state.responseId
+        : relay.state.messageId,
+    object: 'chat.completion.chunk',
+    model: relay.state.model,
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: toolCalls.map((toolCall, index) => ({
+            index,
+            id: toolCall.call_id || toolCall.id,
+            type: 'function',
+            function: {
+              name: toolCall.name,
+              arguments: toolCall.arguments
+            }
+          }))
+        }
+      }
+    ]
+  };
+
+  const frames =
+    relay.sourceAdapterKey === 'openai_responses'
+      ? emitOpenAIResponsesFramesFromChatChunk(relay.state, payload, relay.tools)
+      : emitAnthropicFramesFromOpenAIChatChunk(relay.state, payload);
+  return relay.sourceAdapterKey === 'openai_responses'
+    ? frames.map((frame) => normalizeOpenAIResponsesSseFrame(relay.state, frame))
+    : frames;
+}
+
+export function relayOptimisticAnthropicDeferredContent(
+  relay: OptimisticOpenAIChatRelay,
+  result: OptimisticOpenAIChatStreamTurnResult,
+  visibleToolCalls: StandardResponseFunctionCall[]
+): string[] {
+  if (relay.sourceAdapterKey !== 'anthropic_messages') {
+    return [];
+  }
+
+  const frames: string[] = [];
+  const unmatchedToolCalls = [...visibleToolCalls];
+  for (const block of result.deferredAnthropicBlocks || []) {
+    if (block.kind === 'tool_use') {
+      const matchingIndex = unmatchedToolCalls.findIndex((toolCall) => {
+        const toolCallId = toolCall.call_id || toolCall.id;
+        if (block.toolCallId && toolCallId) {
+          return block.toolCallId === toolCallId;
+        }
+        return Boolean(block.toolName && block.toolName === toolCall.name);
+      });
+      if (matchingIndex < 0) {
+        continue;
+      }
+
+      const [toolCall] = unmatchedToolCalls.splice(matchingIndex, 1);
+      if (toolCall) {
+        frames.push(...flushPendingAnthropicToolCalls(relay.state));
+        frames.push(...relayOptimisticOpenAIChatStreamToolCalls(relay, [toolCall]));
+      }
+      continue;
+    }
+
+    frames.push(...flushPendingAnthropicToolCalls(relay.state));
+    frames.push(...closeActiveAnthropicTextBlock(relay.state));
+    frames.push(...ensureAnthropicRelayStarted(relay.state));
+    const downstreamIndex = relay.state.nextBlockIndex;
+    relay.state.nextBlockIndex += 1;
+    for (const event of block.events) {
+      frames.push(
+        encodeSseEvent(event.eventName, {
+          ...event.payload,
+          index: downstreamIndex
+        })
+      );
+    }
+  }
+
+  for (const toolCall of unmatchedToolCalls) {
+    frames.push(...flushPendingAnthropicToolCalls(relay.state));
+    frames.push(...relayOptimisticOpenAIChatStreamToolCalls(relay, [toolCall]));
+  }
+  return frames;
+}
+
 export function finalizeOptimisticOpenAIChatStreamRelay(
   relay: OptimisticOpenAIChatRelay,
   finalPayload: Record<string, unknown>,
@@ -427,7 +758,12 @@ export function finalizeOptimisticOpenAIChatStreamRelay(
   const firstChoice = Array.isArray(finalPayload.choices) && isObject(finalPayload.choices[0])
     ? finalPayload.choices[0]
     : undefined;
-  const finishReason = asString(firstChoice?.finish_reason);
+  const finishReason =
+    asString(firstChoice?.finish_reason) ||
+    asString(finalPayload.stop_reason);
+  const isNativeAnthropicPayload =
+    asString(finalPayload.type) === 'message' &&
+    Object.prototype.hasOwnProperty.call(finalPayload, 'stop_reason');
 
   if (relay.sourceAdapterKey === 'openai_responses') {
     if (usage) {
@@ -444,7 +780,11 @@ export function finalizeOptimisticOpenAIChatStreamRelay(
   if (usage) {
     applyStandardUsageToAnthropicRelayState(relay.state, usage);
   }
-  if (finishReason) {
+  if (isNativeAnthropicPayload) {
+    relay.state.preserveNativeStopMetadata = true;
+    relay.state.nativeStopReason = asString(finalPayload.stop_reason);
+    relay.state.nativeStopSequence = asString(finalPayload.stop_sequence) ?? null;
+  } else if (finishReason) {
     relay.state.finishReason = finishReason;
   }
   return [...flushPendingAnthropicToolCalls(relay.state), ...finalizeAnthropicRelay(relay.state)];
@@ -650,24 +990,7 @@ export async function collectAnthropicNonStreamPayloadFromEventStream(
   upstreamResponse: Response,
   abortSignal?: AbortSignal
 ): Promise<Record<string, unknown>> {
-  const state: {
-    id: string;
-    model: string;
-    outputText: string;
-    stopReason?: string;
-    usage: Record<string, unknown>;
-    toolBlocks: Map<number, AnthropicStreamToolUseAccumulator>;
-    thinkingBlocks: Map<number, AnthropicStreamThinkingAccumulator>;
-    activeToolBlockIndex?: number;
-    activeThinkingBlockIndex?: number;
-  } = {
-    id: `msg_${randomUUID()}`,
-    model: 'unknown',
-    outputText: '',
-    usage: {},
-    toolBlocks: new Map(),
-    thinkingBlocks: new Map()
-  };
+  const state = createAnthropicNonStreamCollectionState();
 
   for await (const chunk of parseSseChunks(upstreamResponse, abortSignal)) {
     const data = chunk.data.trim();
@@ -682,112 +1005,138 @@ export async function collectAnthropicNonStreamPayloadFromEventStream(
       continue;
     }
 
-    if (!isObject(payload)) {
-      continue;
-    }
-
-    const eventType = asString(payload.type) || chunk.event || '';
-    if (eventType === 'message_start') {
-      const message = isObject(payload.message) ? payload.message : undefined;
-      const id = asString(message?.id);
-      if (id) {
-        state.id = id;
-      }
-
-      const model = asString(message?.model);
-      if (model) {
-        state.model = model;
-      }
-
-      mergeAnthropicUsageSnapshot(state.usage, isObject(message?.usage) ? message.usage : undefined);
-      continue;
-    }
-
-    if (eventType === 'content_block_start') {
-      const blockIndex = asNumber(payload.index);
-      const block = isObject(payload.content_block) ? payload.content_block : undefined;
-      if (asString(block?.type) === 'text') {
-        const text = asString(block?.text);
-        if (text) {
-          state.outputText += text;
-        }
-      } else if (asString(block?.type) === 'tool_use' && blockIndex !== undefined) {
-        const name = asString(block?.name);
-        if (name) {
-          state.toolBlocks.set(blockIndex, {
-            id: asString(block?.id) || `toolu_${randomUUID().replace(/-/g, '')}`,
-            name,
-            inputJson: normalizeAnthropicToolStartInput(block?.input)
-          });
-          state.activeToolBlockIndex = blockIndex;
-        }
-      } else if (asString(block?.type) === 'thinking' && blockIndex !== undefined) {
-        state.thinkingBlocks.set(blockIndex, {
-          type: 'thinking',
-          thinking: asString(block?.thinking) || '',
-          signature: asString(block?.signature)
-        });
-        state.activeThinkingBlockIndex = blockIndex;
-      } else if (asString(block?.type) === 'redacted_thinking' && blockIndex !== undefined) {
-        state.thinkingBlocks.set(blockIndex, {
-          type: 'redacted_thinking',
-          thinking: '',
-          data: asString(block?.data)
-        });
-        state.activeThinkingBlockIndex = blockIndex;
-      }
-      continue;
-    }
-
-    if (eventType === 'content_block_delta') {
-      const delta = isObject(payload.delta) ? payload.delta : undefined;
-      if (asString(delta?.type) === 'text_delta') {
-        const text = asString(delta?.text);
-        if (text) {
-          state.outputText += text;
-        }
-      } else if (asString(delta?.type) === 'thinking_delta') {
-        const blockIndex = asNumber(payload.index) ?? state.activeThinkingBlockIndex;
-        const thinking = asString(delta?.thinking);
-        if (blockIndex !== undefined && thinking) {
-          const thinkingBlock = state.thinkingBlocks.get(blockIndex);
-          if (thinkingBlock) {
-            thinkingBlock.thinking += thinking;
-          }
-        }
-      } else if (asString(delta?.type) === 'signature_delta') {
-        const blockIndex = asNumber(payload.index) ?? state.activeThinkingBlockIndex;
-        const signature = asString(delta?.signature);
-        if (blockIndex !== undefined && signature) {
-          const thinkingBlock = state.thinkingBlocks.get(blockIndex);
-          if (thinkingBlock) {
-            thinkingBlock.signature = signature;
-          }
-        }
-      } else if (asString(delta?.type) === 'input_json_delta') {
-        const blockIndex = asNumber(payload.index) ?? state.activeToolBlockIndex;
-        const partialJson = asString(delta?.partial_json);
-        if (blockIndex !== undefined && partialJson) {
-          const toolBlock = state.toolBlocks.get(blockIndex);
-          if (toolBlock) {
-            toolBlock.inputJson += partialJson;
-          }
-        }
-      }
-      continue;
-    }
-
-    if (eventType === 'message_delta') {
-      const delta = isObject(payload.delta) ? payload.delta : undefined;
-      const stopReason = asString(delta?.stop_reason);
-      if (stopReason) {
-        state.stopReason = stopReason;
-      }
-
-      mergeAnthropicUsageSnapshot(state.usage, isObject(payload.usage) ? payload.usage : undefined);
+    if (isObject(payload)) {
+      collectAnthropicNonStreamEvent(state, payload, chunk.event);
     }
   }
 
+  return buildAnthropicNonStreamPayload(state);
+}
+
+function createAnthropicNonStreamCollectionState(): AnthropicNonStreamCollectionState {
+  return {
+    id: `msg_${randomUUID()}`,
+    model: 'unknown',
+    outputText: '',
+    usage: {},
+    toolBlocks: new Map(),
+    thinkingBlocks: new Map()
+  };
+}
+
+function collectAnthropicNonStreamEvent(
+  state: AnthropicNonStreamCollectionState,
+  payload: Record<string, unknown>,
+  sseEvent?: string
+): void {
+  const eventType = asString(payload.type) || sseEvent || '';
+  if (eventType === 'message_start') {
+    const message = isObject(payload.message) ? payload.message : undefined;
+    const id = asString(message?.id);
+    if (id) {
+      state.id = id;
+    }
+
+    const model = asString(message?.model);
+    if (model) {
+      state.model = model;
+    }
+
+    mergeAnthropicUsageSnapshot(state.usage, isObject(message?.usage) ? message.usage : undefined);
+    return;
+  }
+
+  if (eventType === 'content_block_start') {
+    const blockIndex = asNumber(payload.index);
+    const block = isObject(payload.content_block) ? payload.content_block : undefined;
+    if (asString(block?.type) === 'text') {
+      const text = asString(block?.text);
+      if (text) {
+        state.outputText += text;
+      }
+    } else if (asString(block?.type) === 'tool_use' && blockIndex !== undefined) {
+      const name = asString(block?.name);
+      if (name) {
+        state.toolBlocks.set(blockIndex, {
+          id: asString(block?.id) || `toolu_${randomUUID().replace(/-/g, '')}`,
+          name,
+          inputJson: normalizeAnthropicToolStartInput(block?.input)
+        });
+        state.activeToolBlockIndex = blockIndex;
+      }
+    } else if (asString(block?.type) === 'thinking' && blockIndex !== undefined) {
+      state.thinkingBlocks.set(blockIndex, {
+        type: 'thinking',
+        thinking: asString(block?.thinking) || '',
+        signature: asString(block?.signature)
+      });
+      state.activeThinkingBlockIndex = blockIndex;
+    } else if (asString(block?.type) === 'redacted_thinking' && blockIndex !== undefined) {
+      state.thinkingBlocks.set(blockIndex, {
+        type: 'redacted_thinking',
+        thinking: '',
+        data: asString(block?.data)
+      });
+      state.activeThinkingBlockIndex = blockIndex;
+    }
+    return;
+  }
+
+  if (eventType === 'content_block_delta') {
+    const delta = isObject(payload.delta) ? payload.delta : undefined;
+    if (asString(delta?.type) === 'text_delta') {
+      const text = asString(delta?.text);
+      if (text) {
+        state.outputText += text;
+      }
+    } else if (asString(delta?.type) === 'thinking_delta') {
+      const blockIndex = asNumber(payload.index) ?? state.activeThinkingBlockIndex;
+      const thinking = asString(delta?.thinking);
+      if (blockIndex !== undefined && thinking) {
+        const thinkingBlock = state.thinkingBlocks.get(blockIndex);
+        if (thinkingBlock) {
+          thinkingBlock.thinking += thinking;
+        }
+      }
+    } else if (asString(delta?.type) === 'signature_delta') {
+      const blockIndex = asNumber(payload.index) ?? state.activeThinkingBlockIndex;
+      const signature = asString(delta?.signature);
+      if (blockIndex !== undefined && signature) {
+        const thinkingBlock = state.thinkingBlocks.get(blockIndex);
+        if (thinkingBlock) {
+          thinkingBlock.signature = signature;
+        }
+      }
+    } else if (asString(delta?.type) === 'input_json_delta') {
+      const blockIndex = asNumber(payload.index) ?? state.activeToolBlockIndex;
+      const partialJson = asString(delta?.partial_json);
+      if (blockIndex !== undefined && partialJson) {
+        const toolBlock = state.toolBlocks.get(blockIndex);
+        if (toolBlock) {
+          toolBlock.inputJson += partialJson;
+        }
+      }
+    }
+    return;
+  }
+
+  if (eventType === 'message_delta') {
+    const delta = isObject(payload.delta) ? payload.delta : undefined;
+    const stopReason = asString(delta?.stop_reason);
+    if (stopReason) {
+      state.stopReason = stopReason;
+    }
+    if (delta && Object.prototype.hasOwnProperty.call(delta, 'stop_sequence')) {
+      state.stopSequence = asString(delta.stop_sequence) ?? null;
+    }
+
+    mergeAnthropicUsageSnapshot(state.usage, isObject(payload.usage) ? payload.usage : undefined);
+  }
+}
+
+function buildAnthropicNonStreamPayload(
+  state: AnthropicNonStreamCollectionState
+): Record<string, unknown> {
   const content: Array<Record<string, unknown>> = [];
   for (const thinkingBlock of [...state.thinkingBlocks.entries()].sort((a, b) => a[0] - b[0])) {
     const block = thinkingBlock[1];
@@ -832,6 +1181,7 @@ export async function collectAnthropicNonStreamPayloadFromEventStream(
     model: state.model,
     content,
     stop_reason: state.stopReason,
+    stop_sequence: state.stopSequence ?? null,
     usage: state.usage
   };
 }
@@ -5338,8 +5688,12 @@ function finalizeAnthropicRelay(state: AnthropicRelayState): string[] {
     encodeSseEvent('message_delta', {
       type: 'message_delta',
       delta: {
-        stop_reason: mapFinishReasonToAnthropic(state.finishReason),
-        stop_sequence: null
+        stop_reason: state.preserveNativeStopMetadata
+          ? state.nativeStopReason || mapFinishReasonToAnthropic(state.finishReason)
+          : mapFinishReasonToAnthropic(state.finishReason),
+        stop_sequence: state.preserveNativeStopMetadata
+          ? state.nativeStopSequence ?? null
+          : null
       },
       usage: buildAnthropicMessageDeltaUsage(state)
     })

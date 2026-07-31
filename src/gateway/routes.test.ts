@@ -1,5 +1,6 @@
 import { createCipheriv, randomBytes } from 'node:crypto';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Fastify from 'fastify';
@@ -6102,6 +6103,88 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('retries empty model output parse failures across providers', async () => {
+    let upstreamCalls = 0;
+    const fetchMock = vi.fn(async () => {
+      upstreamCalls += 1;
+      if (upstreamCalls === 1) {
+        return new Response(
+          JSON.stringify({
+            id: 'msg_empty_output',
+            type: 'message',
+            role: 'assistant',
+            model: 'claude-sonnet-4',
+            content: [],
+            stop_reason: 'end_turn',
+            usage: {
+              input_tokens: 3,
+              output_tokens: 0
+            }
+          }),
+          {
+            status: 200,
+            headers: {
+              'content-type': 'application/json'
+            }
+          }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'msg_retry_success',
+          type: 'message',
+          role: 'assistant',
+          model: 'claude-sonnet-4',
+          content: [{ type: 'text', text: 'retry-ok' }],
+          stop_reason: 'end_turn',
+          usage: {
+            input_tokens: 3,
+            output_tokens: 2
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('anthropic-main', 'anthropic_messages', ['claude-sonnet-4'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'anthropic-main'
+        },
+        payload: {
+          model: 'claude-sonnet-4',
+          messages: [{ role: 'user', content: 'hello' }],
+          stream: false
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const body = JSON.parse(response.body);
+      expect(body.choices?.[0]?.message?.content).toBe('retry-ok');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('rejects requests when model is not configured for the target provider', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(JSON.stringify({ ok: true }), {
@@ -9552,6 +9635,372 @@ export function createGatewayPlugin() {
       const completedEvent = JSON.parse(String(completedLine).slice('data: '.length));
       expect(completedEvent.response.id).toBe('chatcmpl_virtual_websearch_optimistic_1');
     } finally {
+      await app.close();
+    }
+  });
+
+  it('prioritizes client-visible calls when an optimistic turn also requests an internal tool', async () => {
+    let releaseUpstream!: () => void;
+    const upstreamRelease = new Promise<void>((resolve) => {
+      releaseUpstream = resolve;
+    });
+    const fetchMock = vi.fn(async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              [
+                'data: {"id":"chatcmpl_virtual_client_tool_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+                'data: {"id":"chatcmpl_virtual_client_tool_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"Checking weather now. "}}]}\n\n'
+              ].join('')
+            )
+          );
+          void upstreamRelease.then(() => {
+            controller.enqueue(
+              new TextEncoder().encode(
+                [
+                  'data: {"id":"chatcmpl_virtual_client_tool_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_weather_optimistic_1","type":"function","function":{"name":"get_weather"}},{"index":1,"id":"call_internal_optimistic_1","type":"function","function":{"name":"internal_lookup"}}]}}]}\n\n',
+                  'data: {"id":"chatcmpl_virtual_client_tool_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"city\\":\\"Shanghai\\"}"}},{"index":1,"function":{"arguments":"{\\"query\\":\\"weather\\"}"}}]}}]}\n\n',
+                  'data: {"id":"chatcmpl_virtual_client_tool_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":4,"total_tokens":11}}\n\n',
+                  'data: [DONE]\n\n'
+                ].join('')
+              )
+            );
+            controller.close();
+          });
+        }
+      });
+
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          'content-type': 'text/event-stream'
+        }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const executeInternal = vi.fn(async () => {
+      throw new Error('internal tool should not execute when a client call takes precedence');
+    });
+    const toolProvider = {
+      listDefinitions: async () => [
+        {
+          name: 'internal_lookup',
+          description: 'Internal lookup',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      ],
+      has: async () => true,
+      execute: executeInternal,
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'virtual-client-tool-optimistic',
+          key: 'client-tool-optimistic',
+          displayName: 'Client Tool Optimistic',
+          enabled: true,
+          match: {
+            exactAliases: [],
+            prefixes: [],
+            suffixes: [':client-tool-optimistic']
+          },
+          baseModel: {
+            mode: 'strip_suffix'
+          },
+          tools: [
+            {
+              name: 'internal_lookup',
+              visibility: 'internal'
+            }
+          ],
+          toolChoice: 'auto',
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 2,
+            maxToolCalls: 2,
+            clientToolsPolicy: 'allow',
+            streamMode: 'optimistic'
+          },
+          materialization: {
+            enabled: true,
+            includeInGatewayModels: true
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.listen({ host: '127.0.0.1', port: 0 });
+
+    const address = app.server.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('Expected Fastify to listen on a TCP port.');
+    }
+
+    const chunks: string[] = [];
+    let responseStatus = 0;
+    const completed = new Promise<string>((resolve, reject) => {
+      const payload = JSON.stringify({
+        model: 'openai-main/glm-5:client-tool-optimistic',
+        max_tokens: 128,
+        stream: true,
+        messages: [{ role: 'user', content: 'Check weather in Shanghai' }],
+        tools: [
+          {
+            name: 'get_weather',
+            description: 'Get the weather',
+            input_schema: {
+              type: 'object',
+              properties: {
+                city: {
+                  type: 'string'
+                }
+              },
+              required: ['city']
+            }
+          }
+        ]
+      });
+      const request = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: address.port,
+          path: '/v1/messages',
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'content-length': Buffer.byteLength(payload)
+          }
+        },
+        (response) => {
+          responseStatus = response.statusCode || 0;
+          response.setEncoding('utf8');
+          response.on('data', (chunk) => chunks.push(String(chunk)));
+          response.on('end', () => resolve(chunks.join('')));
+          response.on('error', reject);
+        }
+      );
+      request.on('error', reject);
+      request.end(payload);
+    });
+
+    try {
+      await waitForCondition(() => chunks.join('').includes('Checking weather now.'));
+      expect(chunks.join('')).not.toContain('get_weather');
+      releaseUpstream();
+
+      const body = await completed;
+      expect(responseStatus).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(body).toContain('"type":"text_delta","text":"Checking weather now. "');
+      expect(body).toContain('"type":"tool_use","id":"call_weather_optimistic_1","name":"get_weather"');
+      expect(body).toContain('"type":"input_json_delta","partial_json":"{\\"city\\":\\"Shanghai\\"}"');
+      expect(body).toContain('"stop_reason":"tool_use"');
+      expect(body).not.toContain('"name":"internal_lookup"');
+      expect(body).not.toContain('call_internal_optimistic_1');
+      expect(executeInternal).not.toHaveBeenCalled();
+      expect(body).not.toContain('event: error');
+    } finally {
+      releaseUpstream();
+      await app.close();
+    }
+  });
+
+  it('optimistically streams native Anthropic text before a client-visible tool call', async () => {
+    let releaseUpstream!: () => void;
+    const upstreamRelease = new Promise<void>((resolve) => {
+      releaseUpstream = resolve;
+    });
+    const fetchMock = vi.fn(async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              [
+                'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_virtual_anthropic_client_tool_1","type":"message","role":"assistant","model":"glm-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":7,"output_tokens":0}}}\n\n',
+                'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+                'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Checking native weather now. "}}\n\n'
+              ].join('')
+            )
+          );
+          void upstreamRelease.then(() => {
+            controller.enqueue(
+              new TextEncoder().encode(
+                [
+                  'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+                  'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_weather_anthropic_1","name":"get_weather","input":{}}}\n\n',
+                  'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"city\\":\\"Shanghai\\"}"}}\n\n',
+                  'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+                  'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":4}}\n\n',
+                  'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+                ].join('')
+              )
+            );
+            controller.close();
+          });
+        }
+      });
+
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          'content-type': 'text/event-stream'
+        }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const toolProvider = {
+      listDefinitions: async () => [
+        {
+          name: 'internal_lookup',
+          description: 'Internal lookup',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      ],
+      has: async () => true,
+      execute: async () => {
+        throw new Error('internal tool should not execute');
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('anthropic-main', 'anthropic_messages', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'virtual-client-tool-anthropic-optimistic',
+          key: 'client-tool-anthropic-optimistic',
+          displayName: 'Client Tool Anthropic Optimistic',
+          enabled: true,
+          match: {
+            exactAliases: [],
+            prefixes: [],
+            suffixes: [':client-tool-anthropic-optimistic']
+          },
+          baseModel: {
+            mode: 'strip_suffix'
+          },
+          tools: [
+            {
+              name: 'internal_lookup',
+              visibility: 'internal'
+            }
+          ],
+          toolChoice: 'auto',
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 2,
+            maxToolCalls: 2,
+            clientToolsPolicy: 'allow',
+            streamMode: 'optimistic'
+          },
+          materialization: {
+            enabled: true,
+            includeInGatewayModels: true
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.listen({ host: '127.0.0.1', port: 0 });
+
+    const address = app.server.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('Expected Fastify to listen on a TCP port.');
+    }
+
+    const chunks: string[] = [];
+    let responseStatus = 0;
+    const completed = new Promise<string>((resolve, reject) => {
+      const payload = JSON.stringify({
+        model: 'anthropic-main/glm-5:client-tool-anthropic-optimistic',
+        max_tokens: 128,
+        stream: true,
+        messages: [{ role: 'user', content: 'Check weather in Shanghai' }],
+        tools: [
+          {
+            name: 'get_weather',
+            description: 'Get the weather',
+            input_schema: {
+              type: 'object',
+              properties: {
+                city: {
+                  type: 'string'
+                }
+              },
+              required: ['city']
+            }
+          }
+        ]
+      });
+      const request = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: address.port,
+          path: '/v1/messages',
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'content-length': Buffer.byteLength(payload)
+          }
+        },
+        (response) => {
+          responseStatus = response.statusCode || 0;
+          response.setEncoding('utf8');
+          response.on('data', (chunk) => chunks.push(String(chunk)));
+          response.on('end', () => resolve(chunks.join('')));
+          response.on('error', reject);
+        }
+      );
+      request.on('error', reject);
+      request.end(payload);
+    });
+
+    try {
+      await waitForCondition(() => chunks.join('').includes('Checking native weather now.'));
+      expect(chunks.join('')).not.toContain('get_weather');
+      releaseUpstream();
+
+      const body = await completed;
+      expect(responseStatus).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(body).toContain('"type":"text_delta","text":"Checking native weather now. "');
+      expect(body).toContain(
+        '"type":"tool_use","id":"toolu_weather_anthropic_1","name":"get_weather"'
+      );
+      expect(body).toContain(
+        '"type":"input_json_delta","partial_json":"{\\"city\\":\\"Shanghai\\"}"'
+      );
+      expect(body).toContain('"stop_reason":"tool_use"');
+      expect(body).not.toContain('"name":"internal_lookup"');
+      expect(body).not.toContain('event: error');
+    } finally {
+      releaseUpstream();
       await app.close();
     }
   });

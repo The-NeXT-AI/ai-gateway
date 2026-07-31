@@ -335,6 +335,63 @@ describe('openAIResponsesTargetAdapter', () => {
     });
   });
 
+  it('replays every OpenAI Responses reasoning item from one assistant message', () => {
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1/responses'
+      } as never,
+      standardRequest: {
+        model: 'gpt-5.6-sol',
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'reasoning',
+                id: 'rs_one',
+                source_format: 'openai-responses-v1',
+                encrypted_content: 'enc_one'
+              },
+              {
+                type: 'reasoning',
+                id: 'rs_two',
+                source_format: 'openai-responses-v1',
+                encrypted_content: 'enc_two'
+              }
+            ]
+          }
+        ]
+      },
+      config: {
+        openaiApiKey: 'test',
+        openaiBaseUrl: 'https://example.test/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const input = (built.value.body as { input: Array<Record<string, unknown>> }).input;
+    expect(input.filter((item) => item.type === 'reasoning')).toEqual([
+      {
+        type: 'reasoning',
+        id: 'rs_one',
+        summary: [],
+        encrypted_content: 'enc_one'
+      },
+      {
+        type: 'reasoning',
+        id: 'rs_two',
+        summary: [],
+        encrypted_content: 'enc_two'
+      }
+    ]);
+  });
+
   it('keeps supported reasoning efforts and selects the closest supported fallback', () => {
     const allLevelsProvider = {
       modelMetadata: {

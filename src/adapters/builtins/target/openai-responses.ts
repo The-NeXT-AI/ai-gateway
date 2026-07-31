@@ -39,6 +39,10 @@ const openAIResponsesReasoningEffortOrder = [
 ] as const;
 
 type OpenAIResponsesReasoningEffort = (typeof openAIResponsesReasoningEffortOrder)[number];
+type StandardRequestReasoningContent = Extract<
+  StandardRequestInputContent,
+  { type: 'reasoning' }
+>;
 
 interface OpenAIModelReasoningCapability {
   pattern: RegExp;
@@ -485,24 +489,25 @@ function standardInputToOpenAIResponsesInput(
     const text = extractStandardInputTextContent(message.content);
 
     if (message.role === 'assistant') {
-      const reasoning = collectAssistantReasoning(message.content);
-      const replayableReasoning =
-        reasoning?.source_format === OPENAI_RESPONSES_REASONING_FORMAT
-          ? reasoning
-          : undefined;
-      const replayableEncryptedContent =
-        replayableReasoning?.encrypted_content &&
-        replayableReasoning.id
-          ? replayableReasoning.encrypted_content
-          : undefined;
-      if (
-        replayableReasoning &&
-        (
-          replayableReasoning.text ||
-          replayableReasoning.summary ||
-          replayableEncryptedContent
-        )
-      ) {
+      const replayableReasoningItems = message.content.filter(
+        (item): item is StandardRequestReasoningContent =>
+          item.type === 'reasoning' &&
+          item.source_format === OPENAI_RESPONSES_REASONING_FORMAT
+      );
+      for (const replayableReasoning of replayableReasoningItems) {
+        const replayableEncryptedContent =
+          replayableReasoning.encrypted_content &&
+          replayableReasoning.id
+            ? replayableReasoning.encrypted_content
+            : undefined;
+        if (
+          !replayableReasoning.text &&
+          !replayableReasoning.summary &&
+          !replayableEncryptedContent
+        ) {
+          continue;
+        }
+
         items.push({
           type: 'reasoning',
           id: replayableReasoning.id || `rs_${randomUUID().replace(/-/g, '')}`,

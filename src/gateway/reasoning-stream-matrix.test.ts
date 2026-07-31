@@ -101,6 +101,161 @@ describe('live reasoning conversion matrix', () => {
   });
 });
 
+describe('reasoning stream regressions', () => {
+  it('keeps every indexed encrypted reasoning detail from a Chat stream', async () => {
+    const stream = relayConvertedStreamFromUpstreamResponse(
+      createReply(),
+      {
+        adapterKey: 'openai_responses'
+      } as never,
+      createSseResponse([
+        {
+          id: 'chatcmpl_multi_reasoning',
+          object: 'chat.completion.chunk',
+          model: 'chat-model',
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: 'assistant',
+                reasoning_details: [
+                  {
+                    type: 'reasoning.encrypted',
+                    data: 'enc_one',
+                    id: 'rs_one',
+                    format: 'openai-responses-v1',
+                    index: 0
+                  },
+                  {
+                    type: 'reasoning.encrypted',
+                    data: 'enc_two',
+                    id: 'rs_two',
+                    format: 'openai-responses-v1',
+                    index: 1
+                  }
+                ]
+              },
+              finish_reason: null
+            }
+          ]
+        },
+        {
+          id: 'chatcmpl_multi_reasoning',
+          object: 'chat.completion.chunk',
+          model: 'chat-model',
+          choices: [
+            {
+              index: 0,
+              delta: {
+                content: 'answer'
+              },
+              finish_reason: 'stop'
+            }
+          ],
+          usage: {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2
+          }
+        },
+        '[DONE]'
+      ])
+    ) as unknown as AsyncIterable<string | Buffer>;
+
+    let body = '';
+    for await (const chunk of stream) {
+      body += chunk.toString();
+    }
+
+    const completed = parseSseJsonFrames(body).find(
+      (event) => event.type === 'response.completed'
+    );
+    const response = completed?.response as
+      | { output?: Array<Record<string, unknown>> }
+      | undefined;
+    expect(
+      response?.output
+        ?.filter((item) => item.type === 'reasoning')
+        .map((item) => [item.id, item.encrypted_content])
+    ).toEqual([
+      ['rs_one', 'enc_one'],
+      ['rs_two', 'enc_two']
+    ]);
+  });
+
+  it('keeps a Gemini thought summary and its signature in one sequential Interactions step', async () => {
+    const stream = relayConvertedStreamFromUpstreamResponse(
+      createReply(),
+      {
+        adapterKey: 'gemini_interactions'
+      } as never,
+      createSseResponse([
+        {
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [
+                  {
+                    text: 'summary',
+                    thought: true,
+                    thoughtSignature: 'gemini-signature'
+                  },
+                  {
+                    text: 'answer'
+                  }
+                ]
+              },
+              finishReason: 'STOP'
+            }
+          ],
+          modelVersion: 'gemini-3.5-flash'
+        },
+        '[DONE]'
+      ])
+    ) as unknown as AsyncIterable<string | Buffer>;
+
+    let body = '';
+    for await (const chunk of stream) {
+      body += chunk.toString();
+    }
+
+    const events = parseSseJsonFrames(body);
+    const summary = events.find(
+      (event) =>
+        (event.delta as Record<string, unknown> | undefined)?.type ===
+        'thought_summary'
+    );
+    const signature = events.find(
+      (event) =>
+        (event.delta as Record<string, unknown> | undefined)?.type ===
+        'thought_signature'
+    );
+    expect(summary).toBeDefined();
+    expect(signature).toBeDefined();
+    if (!summary || !signature) {
+      return;
+    }
+
+    const thoughtStopPosition = events.findIndex(
+      (event) =>
+        event.event_type === 'step.stop' &&
+        event.index === summary.index
+    );
+    const modelStartPosition = events.findIndex(
+      (event) =>
+        event.event_type === 'step.start' &&
+        (event.step as Record<string, unknown> | undefined)?.type ===
+          'model_output'
+    );
+    expect(summary.index).toBe(signature.index);
+    expect(events.indexOf(summary)).toBeLessThan(events.indexOf(signature));
+    expect(thoughtStopPosition).toBeGreaterThanOrEqual(0);
+    expect(modelStartPosition).toBeGreaterThanOrEqual(0);
+    expect(thoughtStopPosition).toBeLessThan(modelStartPosition);
+  });
+});
+
 function createReply() {
   return {
     code() {

@@ -1,3 +1,5 @@
+import type { ReasoningStateOrigin } from '../../types';
+
 export const OPENAI_RESPONSES_REASONING_FORMAT = 'openai-responses-v1';
 export const ANTHROPIC_CLAUDE_REASONING_FORMAT = 'anthropic-claude-v1';
 export const GEMINI_GENERATE_CONTENT_REASONING_FORMAT = 'google-generate-content-v1';
@@ -5,6 +7,8 @@ export const GEMINI_INTERACTIONS_REASONING_FORMAT = 'google-interactions-v1';
 
 const OPENAI_RESPONSES_REASONING_ENVELOPE_PREFIX = 'ccr-openai-responses-reasoning-v1:';
 const REASONING_TRANSPORT_ENVELOPE_PREFIX = 'ccr-reasoning-transport-v1:';
+const REASONING_TRANSPORT_ENVELOPE_V2_PREFIX = 'ccr-reasoning-transport-v2:';
+export const GEMINI_THOUGHT_SIGNATURE_TOOL_CALL_ID_SEPARATOR = '__thought__';
 
 export interface OpenAIResponsesReasoningEnvelope {
   id: string;
@@ -16,6 +20,7 @@ export interface ReasoningTransportEnvelope {
   data: string;
   id?: string;
   kind?: 'signature' | 'encrypted';
+  origin?: ReasoningStateOrigin;
 }
 
 export function encodeOpenAIResponsesReasoningEnvelope(id: string, encryptedContent: string): string {
@@ -74,7 +79,8 @@ export function encodeReasoningTransportEnvelope(
   format: string,
   data: string,
   id?: string,
-  kind?: ReasoningTransportEnvelope['kind']
+  kind?: ReasoningTransportEnvelope['kind'],
+  origin?: ReasoningStateOrigin
 ): string {
   const normalizedFormat = format.trim();
   const normalizedId = id?.trim();
@@ -82,7 +88,8 @@ export function encodeReasoningTransportEnvelope(
     return data;
   }
 
-  if (normalizedFormat === OPENAI_RESPONSES_REASONING_FORMAT && normalizedId) {
+  const normalizedOrigin = normalizeReasoningStateOrigin(origin);
+  if (!normalizedOrigin && normalizedFormat === OPENAI_RESPONSES_REASONING_FORMAT && normalizedId) {
     return encodeOpenAIResponsesReasoningEnvelope(normalizedId, data);
   }
 
@@ -91,17 +98,27 @@ export function encodeReasoningTransportEnvelope(
       format: normalizedFormat,
       data,
       ...(normalizedId ? { id: normalizedId } : {}),
-      ...(kind ? { kind } : {})
+      ...(kind ? { kind } : {}),
+      ...(normalizedOrigin ? { origin: normalizedOrigin } : {})
     }),
     'utf8'
   ).toString('base64url');
 
-  return `${REASONING_TRANSPORT_ENVELOPE_PREFIX}${payload}`;
+  return `${normalizedOrigin ? REASONING_TRANSPORT_ENVELOPE_V2_PREFIX : REASONING_TRANSPORT_ENVELOPE_PREFIX}${payload}`;
 }
 
 export function decodeReasoningTransportEnvelope(
   value: string
 ): ReasoningTransportEnvelope | undefined {
+  const v2Envelope = decodeReasoningTransportEnvelopeWithPrefix(
+    value,
+    REASONING_TRANSPORT_ENVELOPE_V2_PREFIX,
+    true
+  );
+  if (v2Envelope) {
+    return v2Envelope;
+  }
+
   const openAIEnvelope = decodeOpenAIResponsesReasoningEnvelope(value);
   if (openAIEnvelope) {
     return {
@@ -111,11 +128,90 @@ export function decodeReasoningTransportEnvelope(
     };
   }
 
-  if (!value.startsWith(REASONING_TRANSPORT_ENVELOPE_PREFIX)) {
+  return decodeReasoningTransportEnvelopeWithPrefix(
+    value,
+    REASONING_TRANSPORT_ENVELOPE_PREFIX,
+    false
+  );
+}
+
+export function appendGeminiThoughtSignatureToToolCallId(
+  toolCallId: string,
+  encodedSignature: string
+): string {
+  const envelope = decodeReasoningTransportEnvelope(encodedSignature);
+  if (
+    !toolCallId ||
+    !envelope?.origin ||
+    envelope.format !== GEMINI_GENERATE_CONTENT_REASONING_FORMAT ||
+    envelope.kind !== 'signature'
+  ) {
+    return toolCallId;
+  }
+
+  return `${toolCallId}${GEMINI_THOUGHT_SIGNATURE_TOOL_CALL_ID_SEPARATOR}${encodedSignature}`;
+}
+
+export function decodeGeminiThoughtSignatureToolCallId(value: string):
+  | {
+      toolCallId: string;
+      envelope: ReasoningTransportEnvelope;
+      encodedSignature: string;
+    }
+  | undefined {
+  const separatorIndex = value.lastIndexOf(GEMINI_THOUGHT_SIGNATURE_TOOL_CALL_ID_SEPARATOR);
+  if (separatorIndex <= 0) {
     return undefined;
   }
 
-  const payload = value.slice(REASONING_TRANSPORT_ENVELOPE_PREFIX.length);
+  const toolCallId = value.slice(0, separatorIndex);
+  const encodedSignature = value.slice(
+    separatorIndex + GEMINI_THOUGHT_SIGNATURE_TOOL_CALL_ID_SEPARATOR.length
+  );
+  const envelope = decodeReasoningTransportEnvelope(encodedSignature);
+  if (
+    !toolCallId ||
+    !envelope?.origin ||
+    envelope.format !== GEMINI_GENERATE_CONTENT_REASONING_FORMAT ||
+    envelope.kind !== 'signature'
+  ) {
+    return undefined;
+  }
+
+  return { toolCallId, envelope, encodedSignature };
+}
+
+export function containsReasoningTransportCarrier(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return Boolean(
+      decodeReasoningTransportEnvelope(value) ||
+      decodeGeminiThoughtSignatureToolCallId(value)
+    );
+  }
+
+  if (Array.isArray(value)) {
+    return value.some((item) => containsReasoningTransportCarrier(item));
+  }
+
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  return Object.values(value as Record<string, unknown>).some((item) =>
+    containsReasoningTransportCarrier(item)
+  );
+}
+
+function decodeReasoningTransportEnvelopeWithPrefix(
+  value: string,
+  prefix: string,
+  requireOrigin: boolean
+): ReasoningTransportEnvelope | undefined {
+  if (!value.startsWith(prefix)) {
+    return undefined;
+  }
+
+  const payload = value.slice(prefix.length);
   if (!payload) {
     return undefined;
   }
@@ -134,7 +230,8 @@ export function decodeReasoningTransportEnvelope(
       record.kind === 'signature' || record.kind === 'encrypted'
         ? record.kind
         : undefined;
-    if (!format || !data) {
+    const origin = normalizeReasoningStateOrigin(record.origin);
+    if (!format || !data || (requireOrigin && !origin)) {
       return undefined;
     }
 
@@ -142,9 +239,30 @@ export function decodeReasoningTransportEnvelope(
       format,
       data,
       ...(id ? { id } : {}),
-      ...(kind ? { kind } : {})
+      ...(kind ? { kind } : {}),
+      ...(origin ? { origin } : {})
     };
   } catch {
     return undefined;
   }
+}
+
+function normalizeReasoningStateOrigin(value: unknown): ReasoningStateOrigin | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  const provider = typeof record.provider === 'string' ? record.provider.trim() : '';
+  const endpoint = typeof record.endpoint === 'string' ? record.endpoint.trim() : '';
+  const model = typeof record.model === 'string' ? record.model.trim() : '';
+  if (!provider || !endpoint) {
+    return undefined;
+  }
+
+  return {
+    provider,
+    endpoint,
+    ...(model ? { model } : {})
+  };
 }

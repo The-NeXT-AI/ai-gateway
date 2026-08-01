@@ -631,7 +631,7 @@ describe('gateway routes protocol conversion', () => {
       expect(firstResponse.statusCode).toBe(200);
       expect(firstResponse.headers['content-type']).toContain('text/event-stream');
       expect(firstResponse.body).toContain('"type":"redacted_thinking"');
-      expect(firstResponse.body).toContain('ccr-openai-responses-reasoning-v1:');
+      expect(firstResponse.body).toContain('ccr-reasoning-transport-v2:');
       expect(firstResponse.body).not.toContain('encrypted-stream-reasoning');
 
       const eventPayloads = firstResponse.body
@@ -646,6 +646,12 @@ describe('gateway routes protocol conversion', () => {
       if (!redactedBlock) {
         throw new Error('Expected a streamed redacted_thinking block.');
       }
+      expect(decodeReasoningTransportEnvelope(String(redactedBlock.data))).toMatchObject({
+        format: 'openai-responses-v1',
+        data: 'encrypted-stream-reasoning',
+        id: 'rs_stream_reasoning_1',
+        origin: { provider: 'openai', model: 'gpt-5.6-sol' }
+      });
 
       const secondResponse = await app.inject({
         method: 'POST',
@@ -833,15 +839,20 @@ describe('gateway routes protocol conversion', () => {
         : ((JSON.parse(firstResponse.body) as Record<string, any>).choices[0]
             .message as Record<string, unknown>);
       expect(firstAssistant.content).toBe('First Chat answer.');
-      expect(firstAssistant.reasoning_details).toEqual([
-        {
-          type: 'reasoning.encrypted',
-          data: 'encrypted-chat-reasoning',
-          id: 'rs_chat_reasoning_1',
-          format: 'openai-responses-v1',
-          index: 0
-        }
-      ]);
+      expect(firstAssistant.reasoning_details).toHaveLength(1);
+      const firstReasoningDetail = (firstAssistant.reasoning_details as Array<Record<string, unknown>>)[0];
+      expect(firstReasoningDetail).toMatchObject({
+        type: 'reasoning.encrypted',
+        id: 'rs_chat_reasoning_1',
+        format: 'openai-responses-v1',
+        index: 0
+      });
+      expect(decodeReasoningTransportEnvelope(String(firstReasoningDetail?.data))).toMatchObject({
+        format: 'openai-responses-v1',
+        data: 'encrypted-chat-reasoning',
+        id: 'rs_chat_reasoning_1',
+        origin: { provider: 'openai', model: 'gpt-5.6-sol' }
+      });
 
       const secondResponse = await app.inject({
         method: 'POST',
@@ -1038,8 +1049,14 @@ describe('gateway routes protocol conversion', () => {
         throw new Error('Expected a Gemini thought part with a reasoning signature.');
       }
       expect(thoughtPart.thoughtSignature).toEqual(
-        expect.stringMatching(/^ccr-openai-responses-reasoning-v1:/)
+        expect.stringMatching(/^ccr-reasoning-transport-v2:/)
       );
+      expect(decodeReasoningTransportEnvelope(String(thoughtPart.thoughtSignature))).toMatchObject({
+        format: 'openai-responses-v1',
+        data: 'encrypted-gemini-reasoning',
+        id: 'rs_gemini_reasoning_1',
+        origin: { provider: 'openai', model: 'gpt-5.6-sol' }
+      });
       expect(thoughtPart.thoughtSignature).not.toBe('encrypted-gemini-reasoning');
       const firstText = firstParts
         .map((part) => (part.thought === true ? '' : String(part.text || '')))
@@ -4618,6 +4635,108 @@ describe('gateway routes protocol conversion', () => {
       const upstreamBody = JSON.parse(String(upstreamInit.body));
       expect(upstreamBody.input).toBe('hello native');
       expect(upstreamBody.model).toBe('gpt-4.1-mini');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('wraps same-protocol reasoning state and prevents replay to another service endpoint', async () => {
+    const upstreamBodies: Record<string, unknown>[] = [];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      if (upstreamBodies.length === 1) {
+        return new Response(
+          JSON.stringify({
+            id: 'resp_origin_1',
+            object: 'response',
+            status: 'completed',
+            model: 'gpt-origin-a',
+            output_text: 'first answer',
+            output: [
+              {
+                id: 'rs_origin_1',
+                type: 'reasoning',
+                status: 'completed',
+                summary: [{ type: 'summary_text', text: 'first summary' }],
+                encrypted_content: 'encrypted-state-from-a'
+              },
+              {
+                id: 'msg_origin_1',
+                type: 'message',
+                role: 'assistant',
+                status: 'completed',
+                content: [{ type: 'output_text', text: 'first answer', annotations: [] }]
+              }
+            ],
+            usage: { input_tokens: 8, output_tokens: 4, total_tokens: 12 }
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'resp_origin_2',
+          object: 'response',
+          status: 'completed',
+          model: 'gpt-origin-b',
+          output_text: 'second answer',
+          output: [],
+          usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 }
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const providerA = createProviderConfig('openai-a', 'openai_responses', ['gpt-origin-a']);
+    providerA.baseurl = 'https://service-a.example/v1';
+    const providerB = createProviderConfig('openai-b', 'openai_responses', ['gpt-origin-b']);
+    providerB.baseurl = 'https://service-b.example/v1';
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, createConfig([providerA, providerB]), createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const first = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-a'
+        },
+        payload: { model: 'gpt-origin-a', input: 'first turn' }
+      });
+      expect(first.statusCode).toBe(200);
+      const firstPayload = JSON.parse(first.body) as Record<string, any>;
+      const carrier = firstPayload.output[0].encrypted_content as string;
+      expect(carrier).toMatch(/^ccr-reasoning-transport-v2:/);
+      expect(decodeReasoningTransportEnvelope(carrier)).toMatchObject({
+        data: 'encrypted-state-from-a',
+        origin: { provider: 'openai', model: 'gpt-origin-a' }
+      });
+      expect(carrier).not.toContain('service-a.example');
+
+      const second = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-b'
+        },
+        payload: {
+          model: 'gpt-origin-b',
+          input: [
+            ...firstPayload.output,
+            { role: 'user', content: 'second turn' }
+          ]
+        }
+      });
+      expect(second.statusCode).toBe(200);
+      expect(upstreamBodies).toHaveLength(2);
+      expect(JSON.stringify(upstreamBodies[1])).not.toContain('encrypted-state-from-a');
+      expect(JSON.stringify(upstreamBodies[1])).not.toContain('ccr-reasoning-transport');
+      expect(JSON.stringify(upstreamBodies[1])).toContain('second turn');
     } finally {
       await app.close();
     }

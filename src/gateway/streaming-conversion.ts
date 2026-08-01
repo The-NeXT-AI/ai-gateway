@@ -13,9 +13,10 @@ import {
   formatAnthropicMessagesResponse,
   formatGeminiGenerateContentResponse
 } from '../adapters/builtins/source/formatters';
+import { prepareOpenAIResponsesClientResponse } from '../adapters/builtins/source/openai-responses';
 import {
   ANTHROPIC_CLAUDE_REASONING_FORMAT,
-  encodeOpenAIResponsesReasoningEnvelope,
+  appendGeminiThoughtSignatureToToolCallId,
   encodeReasoningTransportEnvelope,
   GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
   GEMINI_INTERACTIONS_REASONING_FORMAT,
@@ -26,6 +27,7 @@ import { parseSseChunks } from '../sse';
 import { bindAbortSignalToReadable } from '../upstream/client';
 import type {
   GatewaySourceContext,
+  ReasoningStateOrigin,
   StandardRequest,
   StandardResponse,
   StandardResponseFunctionCall,
@@ -35,6 +37,7 @@ import type {
 import { asBoolean, asNumber, asString, extractTextFromPart, isObject } from '../utils';
 
 interface OpenAIResponsesRelayState {
+  reasoningOrigin?: ReasoningStateOrigin;
   createdAt: number;
   nextSequenceNumber: number;
   started: boolean;
@@ -88,6 +91,7 @@ interface PendingOpenAIResponsesToolCall {
 }
 
 interface GeminiRelayState {
+  reasoningOrigin?: ReasoningStateOrigin;
   model: string;
   outputText: string;
   finishReason?: string;
@@ -109,6 +113,7 @@ interface PendingGeminiToolCall {
 }
 
 interface AnthropicRelayState {
+  reasoningOrigin?: ReasoningStateOrigin;
   started: boolean;
   finished: boolean;
   messageId: string;
@@ -146,6 +151,7 @@ interface PendingAnthropicToolCall {
 }
 
 interface OpenAIChatRelayState {
+  reasoningOrigin?: ReasoningStateOrigin;
   started: boolean;
   finished: boolean;
   id: string;
@@ -165,6 +171,7 @@ interface OpenAIChatRelayState {
 }
 
 interface GeminiInteractionsRelayState {
+  reasoningOrigin?: ReasoningStateOrigin;
   started: boolean;
   finished: boolean;
   interactionId: string;
@@ -322,7 +329,8 @@ export function relayConvertedStreamFromUpstreamResponse(
   source: GatewaySourceContext,
   upstreamResponse: Response,
   standardRequest?: StandardRequest,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  reasoningOrigin?: ReasoningStateOrigin
 ) {
   reply.code(200);
   reply.header('content-type', 'text/event-stream; charset=utf-8');
@@ -336,15 +344,17 @@ export function relayConvertedStreamFromUpstreamResponse(
 
   let stream: Readable;
   if (source.adapterKey === 'anthropic_messages') {
-    stream = Readable.from(relayAnthropicMessagesFromOpenAIStream(upstreamResponse));
+    stream = Readable.from(relayAnthropicMessagesFromOpenAIStream(upstreamResponse, reasoningOrigin));
   } else if (source.adapterKey === 'openai_responses') {
-    stream = Readable.from(relayOpenAIResponsesFromOpenAIStream(upstreamResponse, standardRequest?.tools));
+    stream = Readable.from(
+      relayOpenAIResponsesFromOpenAIStream(upstreamResponse, standardRequest?.tools, reasoningOrigin)
+    );
   } else if (source.adapterKey === 'gemini_stream') {
-    stream = Readable.from(relayGeminiStreamFromOpenAIStream(upstreamResponse));
+    stream = Readable.from(relayGeminiStreamFromOpenAIStream(upstreamResponse, reasoningOrigin));
   } else if (source.adapterKey === 'gemini_interactions') {
-    stream = Readable.from(relayGeminiInteractionsFromUpstreamStream(upstreamResponse));
+    stream = Readable.from(relayGeminiInteractionsFromUpstreamStream(upstreamResponse, reasoningOrigin));
   } else if (source.adapterKey === 'openai_chat') {
-    stream = Readable.from(relayOpenAIChatFromUpstreamStream(upstreamResponse));
+    stream = Readable.from(relayOpenAIChatFromUpstreamStream(upstreamResponse, reasoningOrigin));
   } else {
     stream = Readable.fromWeb(upstreamResponse.body as unknown as ReadableStream<Uint8Array>);
   }
@@ -1746,6 +1756,7 @@ function buildOpenAIChatStreamFrames(standardResponse: StandardResponse): string
 }
 
 function buildOpenAIResponsesStreamFrames(standardResponse: StandardResponse): string[] {
+  standardResponse = prepareOpenAIResponsesClientResponse(standardResponse);
   const sseState = createOpenAIResponsesSseMetadataState();
   const frames: string[] = [];
   frames.push(
@@ -2041,9 +2052,25 @@ function collectStandardResponseToolCallsForOpenAIChat(
       continue;
     }
 
+    let id = item.call_id || item.id;
+    if (
+      item.thought_signature &&
+      item.thought_signature_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT &&
+      item.thought_signature_origin
+    ) {
+      const encodedSignature = encodeReasoningTransportEnvelope(
+        item.thought_signature_format,
+        item.thought_signature,
+        undefined,
+        'signature',
+        item.thought_signature_origin
+      );
+      id = appendGeminiThoughtSignatureToToolCallId(id, encodedSignature);
+    }
+
     toolCalls.push({
       index,
-      id: item.call_id || item.id,
+      id,
       name: item.name,
       argumentsJson: item.arguments
     });
@@ -2644,13 +2671,17 @@ function standardReasoningSignatureForGeminiInteractions(
     return undefined;
   }
 
-  return format === GEMINI_INTERACTIONS_REASONING_FORMAT
+  return format === GEMINI_INTERACTIONS_REASONING_FORMAT && !item.source_origin
     ? signature
-    : encodeReasoningTransportEnvelope(format, signature, id, kind);
+    : encodeReasoningTransportEnvelope(format, signature, id, kind, item.source_origin);
 }
 
-async function* relayAnthropicMessagesFromOpenAIStream(upstreamResponse: Response): AsyncGenerator<string> {
+async function* relayAnthropicMessagesFromOpenAIStream(
+  upstreamResponse: Response,
+  reasoningOrigin?: ReasoningStateOrigin
+): AsyncGenerator<string> {
   const state: AnthropicRelayState = {
+    reasoningOrigin,
     started: false,
     finished: false,
     messageId: `msg_${randomUUID()}`,
@@ -2722,9 +2753,11 @@ async function* relayAnthropicMessagesFromOpenAIStream(upstreamResponse: Respons
 
 async function* relayOpenAIResponsesFromOpenAIStream(
   upstreamResponse: Response,
-  tools?: unknown[]
+  tools?: unknown[],
+  reasoningOrigin?: ReasoningStateOrigin
 ): AsyncGenerator<string> {
   const state: OpenAIResponsesRelayState = {
+    reasoningOrigin,
     ...createOpenAIResponsesSseMetadataState(),
     started: false,
     finished: false,
@@ -2787,8 +2820,12 @@ async function* relayOpenAIResponsesFromOpenAIStream(
   }
 }
 
-async function* relayGeminiStreamFromOpenAIStream(upstreamResponse: Response): AsyncGenerator<string> {
+async function* relayGeminiStreamFromOpenAIStream(
+  upstreamResponse: Response,
+  reasoningOrigin?: ReasoningStateOrigin
+): AsyncGenerator<string> {
   const state: GeminiRelayState = {
+    reasoningOrigin,
     model: 'unknown',
     outputText: '',
     usage: {},
@@ -2844,8 +2881,12 @@ async function* relayGeminiStreamFromOpenAIStream(upstreamResponse: Response): A
   }
 }
 
-async function* relayGeminiInteractionsFromUpstreamStream(upstreamResponse: Response): AsyncGenerator<string> {
+async function* relayGeminiInteractionsFromUpstreamStream(
+  upstreamResponse: Response,
+  reasoningOrigin?: ReasoningStateOrigin
+): AsyncGenerator<string> {
   const state = createGeminiInteractionsRelayState();
+  state.reasoningOrigin = reasoningOrigin;
 
   for await (const chunk of parseSseChunks(upstreamResponse)) {
     const data = chunk.data.trim();
@@ -2994,7 +3035,13 @@ function emitGeminiInteractionsFramesFromOpenAIResponsesEvent(
     const frames: string[] = [];
     const reasoningSignatures = collectOpenAIResponsesEncryptedReasoning(response).map(
       ({ id: reasoningId, encryptedContent }) =>
-        encodeOpenAIResponsesReasoningEnvelope(reasoningId, encryptedContent)
+        encodeReasoningTransportEnvelope(
+          OPENAI_RESPONSES_REASONING_FORMAT,
+          encryptedContent,
+          reasoningId,
+          'encrypted',
+          state.reasoningOrigin
+        )
     );
     frames.push(...emitGeminiInteractionsStandaloneThoughtSignatures(state, reasoningSignatures));
     if (outputText && !state.outputText) {
@@ -3137,7 +3184,8 @@ function emitGeminiInteractionsFramesFromAnthropicEvent(
                 ANTHROPIC_CLAUDE_REASONING_FORMAT,
                 signature,
                 undefined,
-                'signature'
+                'signature',
+                state.reasoningOrigin
               )
             ]
           : []
@@ -3213,7 +3261,8 @@ function emitGeminiInteractionsFramesFromGeminiGeneratePayload(
           GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
           thoughtSignature,
           undefined,
-          'signature'
+          'signature',
+          state.reasoningOrigin
         )
       : undefined;
     if (functionCall) {
@@ -3287,8 +3336,12 @@ function emitGeminiInteractionsFramesFromGeminiGeneratePayload(
   return frames;
 }
 
-async function* relayOpenAIChatFromUpstreamStream(upstreamResponse: Response): AsyncGenerator<string> {
+async function* relayOpenAIChatFromUpstreamStream(
+  upstreamResponse: Response,
+  reasoningOrigin?: ReasoningStateOrigin
+): AsyncGenerator<string> {
   const state: OpenAIChatRelayState = {
+    reasoningOrigin,
     started: false,
     finished: false,
     id: `chatcmpl_${randomUUID()}`,
@@ -3418,7 +3471,15 @@ function emitOpenAIChatFramesFromAnthropicEvent(
           reasoning_details: [
             {
               type: 'reasoning.text',
-              signature,
+              signature: state.reasoningOrigin
+                ? encodeReasoningTransportEnvelope(
+                    ANTHROPIC_CLAUDE_REASONING_FORMAT,
+                    signature,
+                    undefined,
+                    'signature',
+                    state.reasoningOrigin
+                  )
+                : signature,
               format: ANTHROPIC_CLAUDE_REASONING_FORMAT
             }
           ]
@@ -3443,7 +3504,15 @@ function emitOpenAIChatFramesFromAnthropicEvent(
           reasoning_details: [
             {
               type: 'reasoning.encrypted',
-              data,
+              data: state.reasoningOrigin
+                ? encodeReasoningTransportEnvelope(
+                    ANTHROPIC_CLAUDE_REASONING_FORMAT,
+                    data,
+                    undefined,
+                    'encrypted',
+                    state.reasoningOrigin
+                  )
+                : data,
               format: ANTHROPIC_CLAUDE_REASONING_FORMAT
             }
           ]
@@ -3576,7 +3645,15 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
         buildOpenAIChatRelayDeltaFrame(state, {
           reasoning_details: reasoningItems.map(({ id, encryptedContent }, index) => ({
             type: 'reasoning.encrypted',
-            data: encryptedContent,
+            data: state.reasoningOrigin
+              ? encodeReasoningTransportEnvelope(
+                  OPENAI_RESPONSES_REASONING_FORMAT,
+                  encryptedContent,
+                  id,
+                  'encrypted',
+                  state.reasoningOrigin
+                )
+              : encryptedContent,
             id,
             format: OPENAI_RESPONSES_REASONING_FORMAT,
             index
@@ -3951,7 +4028,13 @@ function emitGeminiResponsesReasoningFrames(
             parts: [
               {
                 thought: true,
-                thoughtSignature: encodeOpenAIResponsesReasoningEnvelope(id, encryptedContent)
+                thoughtSignature: encodeReasoningTransportEnvelope(
+                  OPENAI_RESPONSES_REASONING_FORMAT,
+                  encryptedContent,
+                  id,
+                  'encrypted',
+                  state.reasoningOrigin
+                )
               }
             ]
           }
@@ -4375,13 +4458,14 @@ function emitOpenAIResponsesFramesFromChatChunk(
 
     if (!reasoningItem.encryptedContent) {
       reasoningItem.encryptedContent =
-        encryptedDelta.format === OPENAI_RESPONSES_REASONING_FORMAT
+        encryptedDelta.format === OPENAI_RESPONSES_REASONING_FORMAT && !state.reasoningOrigin
           ? encryptedDelta.content
           : encodeReasoningTransportEnvelope(
               encryptedDelta.format,
               encryptedDelta.content,
               encryptedDelta.id || reasoningItem.itemId,
-              encryptedDelta.kind
+              encryptedDelta.kind,
+              state.reasoningOrigin
             );
     }
     frames.push(
@@ -5311,7 +5395,13 @@ function emitAnthropicResponsesReasoningBlocks(
     frames.push(
       ...buildAnthropicStreamContentBlockFrames(blockIndex, {
         type: 'redacted_thinking',
-        data: encodeOpenAIResponsesReasoningEnvelope(id, encryptedContent)
+        data: encodeReasoningTransportEnvelope(
+          OPENAI_RESPONSES_REASONING_FORMAT,
+          encryptedContent,
+          id,
+          'encrypted',
+          state.reasoningOrigin
+        )
       })
     );
   }
@@ -6308,7 +6398,8 @@ function emitOpenAIResponsesFramesFromGeminiInteractionEvent(
         GEMINI_INTERACTIONS_REASONING_FORMAT,
         signature,
         reasoningItem.itemId,
-        'signature'
+        'signature',
+        state.reasoningOrigin
       );
       return ensureOpenAIResponsesReasoningOutputStarted(state, reasoningItem);
     }
@@ -6428,7 +6519,15 @@ function emitOpenAIChatFramesFromGeminiInteractionEvent(
               reasoning_details: [
                 {
                   type: 'reasoning.encrypted',
-                  data: signature,
+                  data: state.reasoningOrigin
+                    ? encodeReasoningTransportEnvelope(
+                        GEMINI_INTERACTIONS_REASONING_FORMAT,
+                        signature,
+                        undefined,
+                        'signature',
+                        state.reasoningOrigin
+                      )
+                    : signature,
                   format: GEMINI_INTERACTIONS_REASONING_FORMAT
                 }
               ]
@@ -6574,7 +6673,8 @@ function emitAnthropicFramesFromGeminiInteractionEvent(
               GEMINI_INTERACTIONS_REASONING_FORMAT,
               signature,
               undefined,
-              'signature'
+              'signature',
+              state.reasoningOrigin
             )
           }
         })
@@ -6713,7 +6813,8 @@ function emitGeminiFramesFromGeminiInteractionEvent(
                       GEMINI_INTERACTIONS_REASONING_FORMAT,
                       thoughtSignature,
                       undefined,
-                      'signature'
+                      'signature',
+                      state.reasoningOrigin
                     )
                   }
                 ]

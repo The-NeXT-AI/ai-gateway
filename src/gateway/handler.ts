@@ -100,6 +100,15 @@ import {
 } from '../raw-trace';
 import { matchesAnyPattern } from '../shared/pattern';
 import { evaluateApiKeyModelRestriction } from './auth';
+import { containsReasoningTransportCarrier } from '../adapters/builtins/reasoning-envelope';
+import {
+  attachReasoningStateOrigin,
+  buildReasoningStateOrigin,
+  createReasoningAwarePassthroughSseStream,
+  prepareReasoningStateForTarget,
+  resolveReasoningTargetFormat,
+  wrapPassthroughReasoningPayload
+} from './reasoning-state';
 
 interface ProviderAttemptFailure {
   provider: Provider;
@@ -392,6 +401,7 @@ export async function handleGatewayRequest(
         targetProvider,
         targetProviderConfig
       ) &&
+      !containsReasoningTransportCarrier(body) &&
       !shouldUseTransparentToolExecutionPath(config, isStreaming)
     ) {
       const passthroughResult = sourceAdapter.buildPassthroughRequest(adapterInput);
@@ -424,6 +434,12 @@ export async function handleGatewayRequest(
       }
 
       const passthroughModel = passthroughModelResult.value;
+      const passthroughReasoningOrigin = buildReasoningStateOrigin(
+        targetProvider,
+        targetProviderConfig,
+        config,
+        passthroughModel
+      );
       const apiKeyModelRestriction = evaluateApiKeyModelRestriction(request, passthroughModel, {
         provider: targetProvider,
         providerConfig: targetProviderConfig
@@ -676,7 +692,28 @@ export async function handleGatewayRequest(
 
         attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
         if (transformedPayload !== undefined) {
-          return relayUpstreamResponseWithPayload(reply, upstreamResponse, transformedPayload);
+          const wrapped = wrapPassthroughReasoningPayload(
+            transformedPayload,
+            source.adapterKey,
+            passthroughReasoningOrigin
+          );
+          return relayUpstreamResponseWithPayload(reply, upstreamResponse, wrapped.payload);
+        }
+        if (isJsonContentType(upstreamResponse.headers.get('content-type'))) {
+          const passthroughPayload = await safeReadUpstreamPayload(
+            request,
+            targetProvider,
+            upstreamResponse.clone(),
+            clientAbortSignal
+          );
+          const wrapped = wrapPassthroughReasoningPayload(
+            passthroughPayload,
+            source.adapterKey,
+            passthroughReasoningOrigin
+          );
+          if (wrapped.changed) {
+            return relayUpstreamResponseWithPayload(reply, upstreamResponse, wrapped.payload);
+          }
         }
         if (shouldForceEventStreamHeaders(source, isStreaming)) {
           forceEventStreamHeaders(reply);
@@ -714,6 +751,22 @@ export async function handleGatewayRequest(
       }
       if (shouldForceEventStreamHeaders(source, isStreaming)) {
         forceEventStreamHeaders(reply);
+      }
+      if (
+        isStreaming &&
+        resolveReasoningTargetFormat(targetProvider, targetProviderConfig)
+      ) {
+        return relayUpstreamResponseWithReadable(
+          reply,
+          upstreamResponse,
+          createReasoningAwarePassthroughSseStream(
+            upstreamResponse,
+            source.adapterKey,
+            passthroughReasoningOrigin,
+            clientAbortSignal
+          ),
+          clientAbortSignal
+        );
       }
       return relayUpstreamResponse(reply, upstreamResponse, clientAbortSignal);
     }
@@ -776,11 +829,22 @@ export async function handleGatewayRequest(
       }
 
       const supportsLiveStreamConversion = canRelayLiveConvertedStream(source, targetProvider, targetProviderConfig);
-      const standardRequest: StandardRequest = {
+      const unfilteredStandardRequest: StandardRequest = {
         ...baseStandardRequest,
         model,
         stream: supportsLiveStreamConversion
       };
+      const reasoningOrigin = buildReasoningStateOrigin(
+        targetProvider,
+        targetProviderConfig,
+        config,
+        model
+      );
+      const standardRequest = prepareReasoningStateForTarget(
+        unfilteredStandardRequest,
+        resolveReasoningTargetFormat(targetProvider, targetProviderConfig),
+        reasoningOrigin
+      );
 
       const targetRequestResult = targetAdapter.buildRequestFromStandard({
         request,
@@ -955,7 +1019,8 @@ export async function handleGatewayRequest(
           source,
           upstreamResponse,
           standardRequest,
-          clientAbortSignal
+          clientAbortSignal,
+          reasoningOrigin
         );
       }
 
@@ -1084,6 +1149,11 @@ export async function handleGatewayRequest(
         }
       }
 
+      standardResponseResult = {
+        ok: true,
+        value: attachReasoningStateOrigin(standardResponseResult.value, reasoningOrigin)
+      };
+
       const sourceStandardResponse = prepareStandardResponseForSource(
         source,
         standardResponseResult.value,
@@ -1170,10 +1240,21 @@ export async function handleGatewayRequest(
       continue;
     }
 
-    const standardRequest: StandardRequest = {
+    const unfilteredStandardRequest: StandardRequest = {
       ...baseStandardRequest,
       model
     };
+    const reasoningOrigin = buildReasoningStateOrigin(
+      targetProvider,
+      targetProviderConfig,
+      config,
+      model
+    );
+    const standardRequest = prepareReasoningStateForTarget(
+      unfilteredStandardRequest,
+      resolveReasoningTargetFormat(targetProvider, targetProviderConfig),
+      reasoningOrigin
+    );
 
     const targetRequestResult = targetAdapter.buildRequestFromStandard({
       request,
@@ -1431,6 +1512,11 @@ export async function handleGatewayRequest(
       }
     }
 
+    standardResponseResult = {
+      ok: true,
+      value: attachReasoningStateOrigin(standardResponseResult.value, reasoningOrigin)
+    };
+
     const transparentToolExecutionResult = await runTransparentToolExecutionLoop({
       request,
       reply,
@@ -1585,6 +1671,16 @@ async function runTransparentToolExecutionLoop(input: {
   let lastAttemptSequence = input.initialAttemptSequence;
   let lastUpstreamResponseBody = input.initialUpstreamResponseBody;
   let aggregatedUsage = lastResponse.usage;
+  const reasoningOrigin = buildReasoningStateOrigin(
+    input.targetProvider,
+    input.targetProviderConfig,
+    input.config,
+    input.model
+  );
+  const reasoningTargetFormat = resolveReasoningTargetFormat(
+    input.targetProvider,
+    input.targetProviderConfig
+  );
 
   if (!executionConfig?.enabled) {
     return {
@@ -1694,10 +1790,15 @@ async function runTransparentToolExecutionLoop(input: {
       toolResolution.executableCalls,
       toolResults
     );
+    const targetWorkingRequest = prepareReasoningStateForTarget(
+      workingRequest,
+      reasoningTargetFormat,
+      reasoningOrigin
+    );
 
     const targetRequestResult = input.targetAdapter.buildRequestFromStandard({
       request: input.request,
-      standardRequest: workingRequest,
+      standardRequest: targetWorkingRequest,
       config: input.config,
       targetProviderConfig: input.targetProviderConfig
     });
@@ -1722,7 +1823,7 @@ async function runTransparentToolExecutionLoop(input: {
       input.providerPluginContext,
       baseUpstreamRequest,
       input.config.upstreamTimeoutMs,
-      workingRequest
+      targetWorkingRequest
     );
     if (input.providerPluginContext.clientAbortSignal?.aborted) {
       return { ok: false, upstreamAttemptSequence };
@@ -1814,7 +1915,7 @@ async function runTransparentToolExecutionLoop(input: {
       upstreamRequest,
       upstreamResponse,
       upstreamPayload,
-      workingRequest
+      targetWorkingRequest
     );
     if (!responsePluginResult.ok) {
       const attempt: ProviderAttemptFailure = {
@@ -1851,7 +1952,7 @@ async function runTransparentToolExecutionLoop(input: {
     );
     const standardResponseResult = input.targetAdapter.toStandardResponse(standardPayload, {
       request: input.request,
-      standardRequest: workingRequest,
+      standardRequest: targetWorkingRequest,
       config: input.config,
       targetProviderConfig: input.targetProviderConfig
     });
@@ -1886,7 +1987,7 @@ async function runTransparentToolExecutionLoop(input: {
           targetProviderConfig: input.targetProviderConfig,
           targetAdapter: input.targetAdapter,
           baseUpstreamRequest,
-          standardRequest: workingRequest,
+          standardRequest: targetWorkingRequest,
           model: input.model,
           attempts: input.state.attempts,
           upstreamAttemptSequence
@@ -1899,7 +2000,10 @@ async function runTransparentToolExecutionLoop(input: {
           lastUpstreamRequest = retryResult.upstreamRequest;
           lastUpstreamResponseBody = retryResult.transformedPayload;
           lastAttemptSequence = retryResult.attemptSequence;
-          lastResponse = retryResult.standardResponse;
+          lastResponse = attachReasoningStateOrigin(
+            retryResult.standardResponse,
+            reasoningOrigin
+          );
           aggregatedUsage = mergeStandardUsage(aggregatedUsage, lastResponse.usage);
           continue;
         }
@@ -1907,7 +2011,7 @@ async function runTransparentToolExecutionLoop(input: {
       return { ok: false, upstreamAttemptSequence };
     }
 
-    lastResponse = standardResponseResult.value;
+    lastResponse = attachReasoningStateOrigin(standardResponseResult.value, reasoningOrigin);
     aggregatedUsage = mergeStandardUsage(aggregatedUsage, lastResponse.usage);
   }
 }
@@ -2136,6 +2240,16 @@ async function handleVirtualModelRequest(
     }
 
     const providerPlugins = runtime.providerPlugins.resolve(targetProvider, targetProviderConfig?.name);
+    const reasoningOrigin = buildReasoningStateOrigin(
+      targetProvider,
+      targetProviderConfig,
+      config,
+      model
+    );
+    const reasoningTargetFormat = resolveReasoningTargetFormat(
+      targetProvider,
+      targetProviderConfig
+    );
     const providerPluginContext: ProviderPluginExecutionContext = {
       request,
       config,
@@ -2173,9 +2287,14 @@ async function handleVirtualModelRequest(
     }
 
     for (let turn = 0; turn < virtualModel.profile.execution.maxTurns; turn += 1) {
+      const targetWorkingRequest = prepareReasoningStateForTarget(
+        workingRequest,
+        reasoningTargetFormat,
+        reasoningOrigin
+      );
       const targetRequestResult = targetAdapter.buildRequestFromStandard({
         request,
-        standardRequest: workingRequest,
+        standardRequest: targetWorkingRequest,
         config,
         targetProviderConfig
       });
@@ -2201,7 +2320,7 @@ async function handleVirtualModelRequest(
         providerPluginContext,
         baseUpstreamRequest,
         config.upstreamTimeoutMs,
-        workingRequest
+        targetWorkingRequest
       );
       if (clientAbortSignal?.aborted) {
         return;
@@ -2285,8 +2404,9 @@ async function handleVirtualModelRequest(
           reply,
           source,
           upstreamResponse,
-          workingRequest,
-          clientAbortSignal
+          targetWorkingRequest,
+          clientAbortSignal,
+          reasoningOrigin
         );
       }
 
@@ -2372,7 +2492,7 @@ async function handleVirtualModelRequest(
         upstreamRequest,
         upstreamResponse,
         upstreamPayload,
-        workingRequest
+        targetWorkingRequest
       );
       if (!responsePluginResult.ok) {
         loopExhausted = false;
@@ -2409,7 +2529,7 @@ async function handleVirtualModelRequest(
       );
       const standardResponseResult = targetAdapter.toStandardResponse(standardPayload, {
         request,
-        standardRequest: workingRequest,
+        standardRequest: targetWorkingRequest,
         config,
         targetProviderConfig
       });
@@ -2448,7 +2568,7 @@ async function handleVirtualModelRequest(
             targetProviderConfig,
             targetAdapter,
             baseUpstreamRequest,
-            standardRequest: workingRequest,
+            standardRequest: targetWorkingRequest,
             model,
             attempts,
             upstreamAttemptSequence,
@@ -2482,7 +2602,7 @@ async function handleVirtualModelRequest(
       if (!parsedStandardResponse) {
         break;
       }
-      lastResponse = parsedStandardResponse;
+      lastResponse = attachReasoningStateOrigin(parsedStandardResponse, reasoningOrigin);
       aggregatedUsage = mergeStandardUsage(aggregatedUsage, lastResponse.usage);
       const functionCalls = extractFunctionCallsFromStandardResponse(lastResponse);
       const callPartition = partitionVirtualFunctionCalls(
@@ -3711,6 +3831,16 @@ async function* runOptimisticVirtualModelStream(input: {
   let lastAttemptSequence = input.lastAttemptSequence;
   let aggregatedUsage: StandardUsage = {};
   let internalToolCalls = 0;
+  const reasoningOrigin = buildReasoningStateOrigin(
+    input.targetProvider,
+    input.targetProviderConfig,
+    input.config,
+    input.model
+  );
+  const reasoningTargetFormat = resolveReasoningTargetFormat(
+    input.targetProvider,
+    input.targetProviderConfig
+  );
   const usesNativeAnthropicTarget =
     input.targetProvider === 'anthropic' &&
     input.targetProviderConfig?.type === 'anthropic_messages';
@@ -3761,7 +3891,10 @@ async function* runOptimisticVirtualModelStream(input: {
         return;
       }
 
-      const lastResponse = standardResponseResult.value;
+      const lastResponse = attachReasoningStateOrigin(
+        standardResponseResult.value,
+        reasoningOrigin
+      );
       aggregatedUsage = mergeStandardUsage(aggregatedUsage, lastResponse.usage);
       const functionCalls = extractFunctionCallsFromStandardResponse(lastResponse);
       const callPartition = partitionVirtualFunctionCalls(
@@ -3850,10 +3983,15 @@ async function* runOptimisticVirtualModelStream(input: {
         callPartition.internal,
         toolResults
       );
+      const targetWorkingRequest = prepareReasoningStateForTarget(
+        workingRequest,
+        reasoningTargetFormat,
+        reasoningOrigin
+      );
 
       const targetRequestResult = input.targetAdapter.buildRequestFromStandard({
         request: input.request,
-        standardRequest: workingRequest,
+        standardRequest: targetWorkingRequest,
         config: input.config,
         targetProviderConfig: input.targetProviderConfig
       });
@@ -3872,7 +4010,7 @@ async function* runOptimisticVirtualModelStream(input: {
         input.providerPluginContext,
         baseUpstreamRequest,
         input.config.upstreamTimeoutMs,
-        workingRequest
+        targetWorkingRequest
       );
       if (input.providerPluginContext.clientAbortSignal?.aborted) {
         return;
@@ -6913,6 +7051,26 @@ function relayUpstreamResponseWithPayload(
   }
 
   return reply.send(payload);
+}
+
+function relayUpstreamResponseWithReadable(
+  reply: FastifyReply,
+  upstreamResponse: Response,
+  stream: Readable,
+  abortSignal?: AbortSignal
+) {
+  reply.code(upstreamResponse.status);
+  upstreamResponse.headers.forEach((value, key) => {
+    if (!hopByHopResponseHeaders.has(key.toLowerCase())) {
+      if (reply.getHeader(key) === undefined) {
+        reply.header(key, value);
+      }
+    }
+  });
+  bindAbortSignalToReadable(stream, abortSignal, () => {
+    void cancelResponseBody(upstreamResponse);
+  });
+  return reply.send(stream);
 }
 
 function isJsonContentType(value: string | null): boolean {

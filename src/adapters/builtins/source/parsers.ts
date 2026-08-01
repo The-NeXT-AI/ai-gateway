@@ -18,6 +18,7 @@ import {
 } from '../../../utils';
 import {
   ANTHROPIC_CLAUDE_REASONING_FORMAT,
+  decodeGeminiThoughtSignatureToolCallId,
   decodeReasoningTransportEnvelope,
   GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
   GEMINI_INTERACTIONS_REASONING_FORMAT,
@@ -434,6 +435,7 @@ function normalizeGeminiInteractionInputItem(
           type: 'reasoning',
           ...(envelope?.id ? { id: envelope.id } : {}),
           source_format: sourceFormat,
+          ...(envelope?.origin ? { source_origin: envelope.origin } : {}),
           ...(text ? { text } : {}),
           ...(summary ? { summary } : {}),
           ...(encryptedContent ? { encrypted_content: encryptedContent } : {}),
@@ -916,7 +918,8 @@ function normalizeOpenAIResponsesReasoningItem(item: Record<string, unknown>): S
   const id = envelope?.id || asString(item.id);
   const reasoning: StandardRequestInputContent = {
     type: 'reasoning',
-    source_format: envelope?.format || OPENAI_RESPONSES_REASONING_FORMAT
+    source_format: envelope?.format || OPENAI_RESPONSES_REASONING_FORMAT,
+    ...(envelope?.origin ? { source_origin: envelope.origin } : {})
   };
 
   if (id) {
@@ -1174,6 +1177,7 @@ function normalizeOpenAIChatAssistantReasoning(
 interface NormalizedOpenAIChatReasoningDetails {
   id?: string;
   sourceFormat?: string;
+  sourceOrigin?: NonNullable<Extract<StandardRequestInputContent, { type: 'reasoning' }>['source_origin']>;
   text?: string;
   summary?: string;
   encryptedContent?: string;
@@ -1196,6 +1200,9 @@ function buildOpenAIChatAssistantReasoning(
   }
   if (details.sourceFormat) {
     reasoning.source_format = details.sourceFormat;
+  }
+  if (details.sourceOrigin) {
+    reasoning.source_origin = details.sourceOrigin;
   }
   const mergedText = mergeDistinctReasoningText(details.text, text);
   if (mergedText) {
@@ -1256,8 +1263,8 @@ function normalizeOpenAIChatReasoningDetails(
   const textParts: string[] = [];
   const summaryParts: string[] = [];
   for (const detail of value) {
-    normalized.rawDetails.push(detail);
     if (typeof detail === 'string') {
+      normalized.rawDetails.push(detail);
       if (detail) {
         textParts.push(detail);
       }
@@ -1265,20 +1272,50 @@ function normalizeOpenAIChatReasoningDetails(
     }
 
     if (!isObject(detail)) {
+      normalized.rawDetails.push(detail);
       continue;
     }
 
     const type = asString(detail.type);
-    const id = asString(detail.id);
-    const format = asString(detail.format);
+    const rawSignature =
+      asString(detail.signature) ||
+      asString(detail.thoughtSignature) ||
+      asString(detail.thought_signature);
+    const rawEncryptedContent = asString(detail.encrypted_content) || asString(detail.data);
+    const envelope = rawSignature || rawEncryptedContent
+      ? decodeReasoningTransportEnvelope(rawSignature || rawEncryptedContent || '')
+      : undefined;
+    const opaqueContent = envelope?.data || rawSignature || rawEncryptedContent;
+    const id = envelope?.id || asString(detail.id);
+    const format = envelope?.format || asString(detail.format);
     const summary = asString(detail.summary);
     const text = asString(detail.text) || asString(detail.reasoning) || asString(detail.thinking);
-    const encryptedContent = asString(detail.encrypted_content) || asString(detail.data);
+    const normalizedDetail: Record<string, unknown> = {
+      ...detail,
+      ...(format ? { format } : {}),
+      ...(id ? { id } : {})
+    };
+    if (envelope) {
+      delete normalizedDetail.thoughtSignature;
+      delete normalizedDetail.thought_signature;
+      delete normalizedDetail.encrypted_content;
+      if (envelope.kind === 'signature' || rawSignature) {
+        delete normalizedDetail.data;
+        normalizedDetail.signature = envelope.data;
+      } else {
+        delete normalizedDetail.signature;
+        normalizedDetail.data = envelope.data;
+      }
+    }
+    normalized.rawDetails.push(normalizedDetail);
     if (id && !normalized.id) {
       normalized.id = id;
     }
     if (format && !normalized.sourceFormat) {
       normalized.sourceFormat = format;
+    }
+    if (envelope?.origin && !normalized.sourceOrigin) {
+      normalized.sourceOrigin = envelope.origin;
     }
 
     if (type === 'reasoning.summary' || (summary && !text)) {
@@ -1291,8 +1328,8 @@ function normalizeOpenAIChatReasoningDetails(
     if (text) {
       textParts.push(text);
     }
-    if (encryptedContent && !normalized.encryptedContent) {
-      normalized.encryptedContent = encryptedContent;
+    if (opaqueContent && !normalized.encryptedContent) {
+      normalized.encryptedContent = opaqueContent;
     }
   }
 
@@ -1320,10 +1357,11 @@ function mergeDistinctReasoningText(...values: Array<string | undefined>): strin
 }
 
 function normalizeOpenAIChatToolResultMessage(message: Record<string, unknown>): StandardRequestInputContent[] {
-  const toolUseId = asString(message.tool_call_id) || asString(message.id);
-  if (!toolUseId) {
+  const rawToolUseId = asString(message.tool_call_id) || asString(message.id);
+  if (!rawToolUseId) {
     return [];
   }
+  const toolUseId = decodeGeminiThoughtSignatureToolCallId(rawToolUseId)?.toolCallId || rawToolUseId;
 
   const content = normalizeToolResultContent(message.content);
   if (!content) {
@@ -1365,9 +1403,16 @@ function normalizeOpenAIChatAssistantToolCalls(toolCalls: unknown): StandardRequ
     const rawThoughtSignature =
       asString(googleExtra?.thought_signature) ||
       asString(googleExtra?.thoughtSignature);
-    const envelope = rawThoughtSignature
+    const rawToolCallId = asString(toolCall.id) || `chatcmpl_call_${name}`;
+    const toolCallIdCarrier = decodeGeminiThoughtSignatureToolCallId(rawToolCallId);
+    const extensionEnvelope = rawThoughtSignature
       ? decodeReasoningTransportEnvelope(rawThoughtSignature)
       : undefined;
+    const envelope =
+      extensionEnvelope ||
+      (!rawThoughtSignature || rawThoughtSignature === toolCallIdCarrier?.envelope.data
+        ? toolCallIdCarrier?.envelope
+        : undefined);
     const thoughtSignature = envelope?.data || rawThoughtSignature;
     const thoughtSignatureFormat =
       envelope?.format || (thoughtSignature ? GEMINI_GENERATE_CONTENT_REASONING_FORMAT : undefined);
@@ -1380,6 +1425,7 @@ function normalizeOpenAIChatAssistantToolCalls(toolCalls: unknown): StandardRequ
         type: 'reasoning',
         ...(envelope?.id ? { id: envelope.id } : {}),
         source_format: thoughtSignatureFormat,
+        ...(envelope?.origin ? { source_origin: envelope.origin } : {}),
         encrypted_content: thoughtSignature,
         reasoning_details: [
           envelope?.kind === 'signature'
@@ -1401,13 +1447,14 @@ function normalizeOpenAIChatAssistantToolCalls(toolCalls: unknown): StandardRequ
 
     normalized.push({
       type: 'tool_use',
-      id: asString(toolCall.id) || `chatcmpl_call_${name}`,
+      id: toolCallIdCarrier?.toolCallId || rawToolCallId,
       name,
       input: normalizeFunctionArgumentsInput(functionPayload?.arguments ?? toolCall.arguments ?? toolCall.input),
       ...(thoughtSignature && thoughtSignatureFormat === GEMINI_GENERATE_CONTENT_REASONING_FORMAT
         ? {
             thought_signature: thoughtSignature,
-            thought_signature_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+            thought_signature_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+            ...(envelope?.origin ? { thought_signature_origin: envelope.origin } : {})
           }
         : {})
     });
@@ -1574,6 +1621,7 @@ function normalizeAnthropicThinkingBlock(
       type: 'reasoning',
       ...(envelope?.id ? { id: envelope.id } : {}),
       source_format: sourceFormat,
+      ...(envelope?.origin ? { source_origin: envelope.origin } : {}),
       reasoning_details: [detail]
     };
     if (thinking) {
@@ -1595,6 +1643,7 @@ function normalizeAnthropicThinkingBlock(
       type: 'reasoning',
       ...(envelope?.id ? { id: envelope.id } : {}),
       source_format: sourceFormat,
+      ...(envelope?.origin ? { source_origin: envelope.origin } : {}),
       encrypted_content: encryptedContent,
       reasoning_details: [
         {
@@ -1749,6 +1798,7 @@ function extractGeminiMessageContent(
           type: 'reasoning',
           ...(envelope?.id ? { id: envelope.id } : {}),
           source_format: thoughtSignatureFormat,
+          ...(envelope?.origin ? { source_origin: envelope.origin } : {}),
           encrypted_content: thoughtSignature,
           reasoning_details: [
             envelope?.kind === 'signature'
@@ -1771,6 +1821,9 @@ function extractGeminiMessageContent(
       } else if (thoughtSignature) {
         toolUse.thought_signature = thoughtSignature;
         toolUse.thought_signature_format = GEMINI_GENERATE_CONTENT_REASONING_FORMAT;
+        if (envelope?.origin) {
+          toolUse.thought_signature_origin = envelope.origin;
+        }
       }
       normalized.push(toolUse);
       trackGeminiToolUseId(state, name, id);
@@ -1856,6 +1909,7 @@ function normalizeGeminiThoughtPart(
     type: 'reasoning',
     ...(envelope?.id ? { id: envelope.id } : {}),
     source_format: sourceFormat,
+    ...(envelope?.origin ? { source_origin: envelope.origin } : {}),
     reasoning_details: [
       ...(text
         ? [

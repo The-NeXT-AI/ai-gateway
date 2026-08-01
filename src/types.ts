@@ -859,6 +859,12 @@ export interface StandardResponseMessage {
   content: StandardResponseMessageContent[];
 }
 
+export interface ReasoningStateOrigin {
+  provider: string;
+  endpoint: string;
+  model?: string;
+}
+
 export interface StandardResponseFunctionCall {
   id: string;
   type: 'function_call';
@@ -868,6 +874,7 @@ export interface StandardResponseFunctionCall {
   arguments: string;
   thought_signature?: string;
   thought_signature_format?: string;
+  thought_signature_origin?: ReasoningStateOrigin;
   status: 'completed';
 }
 
@@ -890,6 +897,7 @@ export interface StandardResponseReasoning {
   encrypted_content?: string;
   reasoning_details?: unknown[];
   source_format?: string;
+  source_origin?: ReasoningStateOrigin;
 }
 
 export type StandardResponseOutputItem =
@@ -937,6 +945,7 @@ export type StandardRequestInputContent =
       input: unknown;
       thought_signature?: string;
       thought_signature_format?: string;
+      thought_signature_origin?: ReasoningStateOrigin;
     }
   | {
       type: 'tool_result';
@@ -969,6 +978,7 @@ export type StandardRequestInputContent =
       encrypted_content?: string;
       reasoning_details?: unknown[];
       source_format?: string;
+      source_origin?: ReasoningStateOrigin;
     };
 
 export interface StandardRequestInputMessage {

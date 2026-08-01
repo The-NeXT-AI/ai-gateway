@@ -45,7 +45,7 @@ export const openAIResponsesSourceAdapter: SourceAdapter = {
   }
 };
 
-function prepareOpenAIResponsesClientResponse(response: StandardResponse): StandardResponse {
+export function prepareOpenAIResponsesClientResponse(response: StandardResponse): StandardResponse {
   const output: StandardResponseOutputItem[] = [];
 
   for (const item of response.output) {
@@ -66,7 +66,8 @@ function prepareOpenAIResponsesClientResponse(response: StandardResponse): Stand
             item.thought_signature_format,
             item.thought_signature,
             carrierId,
-            'signature'
+            'signature',
+            item.thought_signature_origin
           )
         });
       }
@@ -74,6 +75,7 @@ function prepareOpenAIResponsesClientResponse(response: StandardResponse): Stand
       const {
         thought_signature: _thoughtSignature,
         thought_signature_format: _thoughtSignatureFormat,
+        thought_signature_origin: _thoughtSignatureOrigin,
         ...functionCall
       } = item;
       output.push(functionCall);
@@ -96,6 +98,7 @@ function prepareReasoningItemForOpenAIResponsesClient(
   const {
     reasoning_details: _reasoningDetails,
     source_format: _sourceFormat,
+    source_origin: _sourceOrigin,
     ...reasoning
   } = item;
 
@@ -107,13 +110,14 @@ function prepareReasoningItemForOpenAIResponsesClient(
   return {
     ...reasoning,
     encrypted_content:
-      opaqueState.format === OPENAI_RESPONSES_REASONING_FORMAT
+      opaqueState.format === OPENAI_RESPONSES_REASONING_FORMAT && !opaqueState.origin
         ? opaqueState.data
         : encodeReasoningTransportEnvelope(
             opaqueState.format,
             opaqueState.data,
             opaqueState.id || item.id,
-            opaqueState.kind
+            opaqueState.kind,
+            opaqueState.origin
           )
   };
 }
@@ -123,6 +127,7 @@ function readReasoningOpaqueState(item: StandardResponseReasoning): {
   data: string;
   id?: string;
   kind: 'signature' | 'encrypted';
+  origin?: StandardResponseReasoning['source_origin'];
 } | undefined {
   for (const detail of item.reasoning_details || []) {
     if (!isObject(detail)) {
@@ -149,7 +154,8 @@ function readReasoningOpaqueState(item: StandardResponseReasoning): {
         format,
         data,
         id: typeof detail.id === 'string' ? detail.id : item.id,
-        kind: signature ? 'signature' : 'encrypted'
+        kind: signature ? 'signature' : 'encrypted',
+        ...(item.source_origin ? { origin: item.source_origin } : {})
       };
     }
   }
@@ -159,7 +165,8 @@ function readReasoningOpaqueState(item: StandardResponseReasoning): {
       format: item.source_format,
       data: item.encrypted_content,
       id: item.id,
-      kind: 'encrypted'
+      kind: 'encrypted',
+      ...(item.source_origin ? { origin: item.source_origin } : {})
     };
   }
 

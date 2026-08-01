@@ -16,6 +16,7 @@ import {
   decodeReasoningTransportEnvelope,
   encodeReasoningTransportEnvelope,
   GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
   OPENAI_RESPONSES_REASONING_FORMAT
 } from '../adapters/builtins/reasoning-envelope';
 import { formatOpenAIChatCompletionsResponse } from '../adapters/builtins/source/formatters';
@@ -79,7 +80,7 @@ describe('reasoning state origin', () => {
     expect(first.model).toBe('gpt-5.6-sol');
   });
 
-  it('allows OpenAI/Gemini model switches at one endpoint but requires the same Claude model', () => {
+  it('requires the exact same model for every opaque reasoning format', () => {
     const endpoint = 'endpoint-fingerprint';
     const openAISol: ReasoningStateOrigin = { provider: 'openai', endpoint, model: 'gpt-5.6-sol' };
     const openAILuna: ReasoningStateOrigin = { provider: 'openai', endpoint, model: 'gpt-5.6-luna' };
@@ -89,6 +90,14 @@ describe('reasoning state origin', () => {
         openAISol,
         OPENAI_RESPONSES_REASONING_FORMAT,
         openAILuna
+      )
+    ).toBe(false);
+    expect(
+      canReplayReasoningState(
+        OPENAI_RESPONSES_REASONING_FORMAT,
+        openAISol,
+        OPENAI_RESPONSES_REASONING_FORMAT,
+        openAISol
       )
     ).toBe(true);
 
@@ -110,6 +119,16 @@ describe('reasoning state origin', () => {
         claudeA
       )
     ).toBe(true);
+
+    const geminiA: ReasoningStateOrigin = { provider: 'gemini', endpoint, model: 'gemini-a' };
+    const geminiB: ReasoningStateOrigin = { provider: 'gemini', endpoint, model: 'gemini-b' };
+    for (const format of [
+      GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+      GEMINI_INTERACTIONS_REASONING_FORMAT
+    ]) {
+      expect(canReplayReasoningState(format, geminiA, format, geminiB)).toBe(false);
+      expect(canReplayReasoningState(format, geminiA, format, geminiA)).toBe(true);
+    }
   });
 
   it('rejects old origin-less state and state from another endpoint', () => {
@@ -224,22 +243,32 @@ describe('target reasoning-state filtering', () => {
     ]
   };
 
-  it('keeps same-endpoint OpenAI state across model switches', () => {
+  it('drops same-endpoint OpenAI state after a model switch', () => {
     const prepared = prepareReasoningStateForTarget(
       request,
       OPENAI_RESPONSES_REASONING_FORMAT,
       { ...sourceOrigin, model: 'gpt-b' }
     );
     const content = typeof prepared.input === 'string' ? [] : prepared.input[0]?.content || [];
-    expect(content.find((item) => item.type === 'reasoning')).toEqual(
-      typeof request.input === 'string' ? undefined : request.input[0]?.content[0]
-    );
+    expect(content.some((item) => item.type === 'reasoning')).toBe(false);
     expect(content.find((item) => item.type === 'tool_use')).toEqual({
       type: 'tool_use',
       id: 'call_1',
       name: 'lookup',
       input: {}
     });
+  });
+
+  it('keeps OpenAI state only when the endpoint and model both match', () => {
+    const prepared = prepareReasoningStateForTarget(
+      request,
+      OPENAI_RESPONSES_REASONING_FORMAT,
+      sourceOrigin
+    );
+    const content = typeof prepared.input === 'string' ? [] : prepared.input[0]?.content || [];
+    expect(content.find((item) => item.type === 'reasoning')).toEqual(
+      typeof request.input === 'string' ? undefined : request.input[0]?.content[0]
+    );
   });
 
   it('drops foreign encrypted state before a strict target while preserving the tool call', () => {

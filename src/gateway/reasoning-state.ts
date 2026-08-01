@@ -214,10 +214,6 @@ export function canReplayReasoningState(
     return false;
   }
 
-  if (targetFormat !== ANTHROPIC_CLAUDE_REASONING_FORMAT) {
-    return true;
-  }
-
   return Boolean(
     sourceOrigin.model &&
     targetOrigin.model &&

@@ -779,6 +779,7 @@ interface ProviderPluginJsonConfig {
   enabled?: unknown;
   provider?: unknown;
   providerName?: unknown;
+  credentialScope?: unknown;
   codexOauth?: unknown;
   deepseekThinking?: unknown;
   deepSeekThinking?: unknown;
@@ -3848,11 +3849,13 @@ function parseProviderPluginEntry(
   const auth = parseProviderPluginMutation(item.auth);
   const request = parseProviderPluginMutation(item.request);
   const response = parseProviderPluginResponseMutation(item.response);
+  const hasCredentialScope = Object.prototype.hasOwnProperty.call(item, 'credentialScope');
+  const credentialScope = hasCredentialScope ? cloneUnknown(item.credentialScope) : undefined;
   const codexOauth = parseProviderPluginCodexOauth(item.codexOauth);
   const deepseekThinking = parseProviderPluginDeepSeekThinking(
     item.deepseekThinking ?? item.deepSeekThinking
   );
-  if (!auth && !request && !response && !codexOauth && !deepseekThinking) {
+  if (!auth && !request && !response && !codexOauth && !deepseekThinking && !hasCredentialScope) {
     return undefined;
   }
 
@@ -3865,6 +3868,7 @@ function parseProviderPluginEntry(
     enabled: true,
     provider,
     providerName,
+    credentialScope,
     codexOauth,
     deepseekThinking,
     auth,

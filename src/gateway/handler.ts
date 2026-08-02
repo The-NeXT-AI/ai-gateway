@@ -438,7 +438,20 @@ export async function handleGatewayRequest(
         targetProvider,
         targetProviderConfig,
         config,
-        passthroughModel
+        passthroughModel,
+        {
+          request,
+          config,
+          source,
+          sourceProvider: sourceAdapter.provider,
+          sourceAdapterKey: source.adapterKey,
+          targetProvider,
+          targetProviderConfig,
+          model: passthroughModel,
+          passthrough: true,
+          streaming: isStreaming,
+          plugins: providerPlugins
+        }
       );
       const apiKeyModelRestriction = evaluateApiKeyModelRestriction(request, passthroughModel, {
         provider: targetProvider,
@@ -838,7 +851,21 @@ export async function handleGatewayRequest(
         targetProvider,
         targetProviderConfig,
         config,
-        model
+        model,
+        {
+          request,
+          config,
+          source,
+          sourceProvider: sourceAdapter.provider,
+          sourceAdapterKey: source.adapterKey,
+          targetProvider,
+          targetProviderConfig,
+          model,
+          passthrough: false,
+          streaming: true,
+          plugins: providerPlugins,
+          standardRequest: unfilteredStandardRequest
+        }
       );
       const standardRequest = prepareReasoningStateForTarget(
         unfilteredStandardRequest,
@@ -1248,7 +1275,21 @@ export async function handleGatewayRequest(
       targetProvider,
       targetProviderConfig,
       config,
-      model
+      model,
+      {
+        request,
+        config,
+        source,
+        sourceProvider: sourceAdapter.provider,
+        sourceAdapterKey: source.adapterKey,
+        targetProvider,
+        targetProviderConfig,
+        model,
+        passthrough: false,
+        streaming: false,
+        plugins: providerPlugins,
+        standardRequest: unfilteredStandardRequest
+      }
     );
     const standardRequest = prepareReasoningStateForTarget(
       unfilteredStandardRequest,
@@ -1675,7 +1716,11 @@ async function runTransparentToolExecutionLoop(input: {
     input.targetProvider,
     input.targetProviderConfig,
     input.config,
-    input.model
+    input.model,
+    {
+      ...input.providerPluginContext,
+      standardRequest: workingRequest
+    }
   );
   const reasoningTargetFormat = resolveReasoningTargetFormat(
     input.targetProvider,
@@ -2244,7 +2289,24 @@ async function handleVirtualModelRequest(
       targetProvider,
       targetProviderConfig,
       config,
-      model
+      model,
+      {
+        request,
+        config,
+        source,
+        sourceProvider: sourceAdapter.provider,
+        sourceAdapterKey: source.adapterKey,
+        targetProvider,
+        targetProviderConfig,
+        model,
+        passthrough: false,
+        streaming: false,
+        plugins: providerPlugins,
+        standardRequest: {
+          ...rewrittenBaseRequest,
+          model
+        }
+      }
     );
     const reasoningTargetFormat = resolveReasoningTargetFormat(
       targetProvider,
@@ -3835,7 +3897,11 @@ async function* runOptimisticVirtualModelStream(input: {
     input.targetProvider,
     input.targetProviderConfig,
     input.config,
-    input.model
+    input.model,
+    {
+      ...input.providerPluginContext,
+      standardRequest: workingRequest
+    }
   );
   const reasoningTargetFormat = resolveReasoningTargetFormat(
     input.targetProvider,

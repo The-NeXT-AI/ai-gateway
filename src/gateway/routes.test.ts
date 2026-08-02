@@ -650,7 +650,11 @@ describe('gateway routes protocol conversion', () => {
         format: 'openai-responses-v1',
         data: 'encrypted-stream-reasoning',
         id: 'rs_stream_reasoning_1',
-        origin: { provider: 'openai', model: 'gpt-5.6-sol' }
+        origin: {
+          provider: 'openai',
+          model: 'gpt-5.6-sol',
+          credentialScope: expect.any(String)
+        }
       });
 
       const secondResponse = await app.inject({
@@ -851,7 +855,11 @@ describe('gateway routes protocol conversion', () => {
         format: 'openai-responses-v1',
         data: 'encrypted-chat-reasoning',
         id: 'rs_chat_reasoning_1',
-        origin: { provider: 'openai', model: 'gpt-5.6-sol' }
+        origin: {
+          provider: 'openai',
+          model: 'gpt-5.6-sol',
+          credentialScope: expect.any(String)
+        }
       });
 
       const secondResponse = await app.inject({
@@ -1055,7 +1063,11 @@ describe('gateway routes protocol conversion', () => {
         format: 'openai-responses-v1',
         data: 'encrypted-gemini-reasoning',
         id: 'rs_gemini_reasoning_1',
-        origin: { provider: 'openai', model: 'gpt-5.6-sol' }
+        origin: {
+          provider: 'openai',
+          model: 'gpt-5.6-sol',
+          credentialScope: expect.any(String)
+        }
       });
       expect(thoughtPart.thoughtSignature).not.toBe('encrypted-gemini-reasoning');
       const firstText = firstParts
@@ -4713,7 +4725,11 @@ describe('gateway routes protocol conversion', () => {
       expect(carrier).toMatch(/^ccr-reasoning-transport-v2:/);
       expect(decodeReasoningTransportEnvelope(carrier)).toMatchObject({
         data: 'encrypted-state-from-a',
-        origin: { provider: 'openai', model: 'gpt-origin-a' }
+        origin: {
+          provider: 'openai',
+          model: 'gpt-origin-a',
+          credentialScope: expect.any(String)
+        }
       });
       expect(carrier).not.toContain('service-a.example');
 

@@ -9,6 +9,7 @@ import type {
   ProviderPlugin,
   ProviderPluginConfig,
   ProviderPluginCodexOAuthConfig,
+  ProviderPluginCredentialScopeInput,
   ProviderPluginMutationConfig,
   ProviderPluginResponseMutationConfig,
   Result,
@@ -192,6 +193,10 @@ function buildConfiguredProviderPlugin(config: ProviderPluginConfig): ProviderPl
     key,
     provider: config.provider,
     providerName: config.providerName,
+    resolveCredentialScope:
+      config.credentialScope !== undefined || codexOauthConfig || config.auth
+        ? (input) => resolveConfiguredProviderCredentialScope(config, input)
+        : undefined,
     authenticate:
       codexOauthConfig || config.auth
         ? async (input) => {
@@ -299,6 +304,148 @@ function buildConfiguredProviderPlugin(config: ProviderPluginConfig): ProviderPl
           )
       : undefined
   };
+}
+
+function resolveConfiguredProviderCredentialScope(
+  config: ProviderPluginConfig,
+  input: ProviderPluginCredentialScopeInput
+): string | undefined {
+  const context: PluginValueResolveContext = {
+    config: input.config,
+    request: input.request,
+    sourceProvider: input.sourceProvider,
+    sourceAdapterKey: input.sourceAdapterKey,
+    targetProvider: input.targetProvider,
+    targetProviderName: input.targetProviderConfig?.name,
+    model: input.model,
+    forceCodexOauthRefreshOnce: input.forceCodexOauthRefreshOnce,
+    standardRequest: input.standardRequest,
+    upstreamRequest: {
+      url: '',
+      headers: {},
+      body: undefined
+    }
+  };
+
+  if (config.credentialScope !== undefined) {
+    const resolution = resolvePluginValue(config.credentialScope, context);
+    const explicitScope = resolution.found
+      ? normalizeNonEmptyString(resolution.value)
+      : undefined;
+    return explicitScope
+      ? hashCredentialScopeMaterial(`explicit\0${explicitScope}`)
+      : undefined;
+  }
+
+  const components: string[] = [];
+  if (config.codexOauth?.enabled) {
+    const oauthScope = resolveCodexOauthCredentialScope(config, context);
+    if (!oauthScope) {
+      return undefined;
+    }
+    components.push(oauthScope);
+  }
+
+  if (config.auth) {
+    const authResolution = resolvePluginValue(
+      {
+        headers: config.auth.headers,
+        query: config.auth.query,
+        bodySet: config.auth.bodySet,
+        bodyMerge: config.auth.bodyMerge
+      },
+      context
+    );
+    if (!authResolution.found) {
+      return undefined;
+    }
+    components.push(`auth\0${stableCredentialScopeValue(authResolution.value)}`);
+  }
+
+  return components.length > 0
+    ? hashCredentialScopeMaterial(components.join('\0'))
+    : undefined;
+}
+
+function resolveCodexOauthCredentialScope(
+  config: ProviderPluginConfig,
+  context: PluginValueResolveContext
+): string | undefined {
+  const codexOauth = config.codexOauth;
+  if (!codexOauth?.enabled) {
+    return undefined;
+  }
+
+  const section = `providerPlugins[${config.key}].codexOauth`;
+  const accountResolution =
+    codexOauth.accountId === undefined
+      ? undefined
+      : resolvePluginValue(codexOauth.accountId, context);
+  if (accountResolution && !accountResolution.found) {
+    return undefined;
+  }
+  const configuredAccountId = accountResolution?.found
+    ? normalizeNonEmptyString(accountResolution.value)
+    : undefined;
+  if (accountResolution?.found && !configuredAccountId) {
+    return undefined;
+  }
+
+  const accessResolution =
+    codexOauth.accessToken === undefined
+      ? undefined
+      : resolvePluginValue(codexOauth.accessToken, context);
+  const accessTokenResult = resolveCodexOauthTokenValue(
+    section,
+    'accessToken',
+    accessResolution,
+    context
+  );
+  if (!accessTokenResult.ok) {
+    return undefined;
+  }
+
+  const accountId =
+    configuredAccountId ||
+    (accessTokenResult.value
+      ? extractCodexAccountIdFromToken(accessTokenResult.value)
+      : undefined);
+  if (accountId) {
+    return `codex-account\0${accountId}`;
+  }
+
+  const refreshResolution =
+    codexOauth.refreshToken === undefined
+      ? undefined
+      : resolvePluginValue(codexOauth.refreshToken, context);
+  const refreshTokenResult = resolveCodexOauthTokenValue(
+    section,
+    'refreshToken',
+    refreshResolution,
+    context
+  );
+  if (!refreshTokenResult.ok || !refreshTokenResult.value) {
+    return undefined;
+  }
+
+  return `codex-refresh\0${refreshTokenResult.value}`;
+}
+
+function hashCredentialScopeMaterial(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('base64url');
+}
+
+function stableCredentialScopeValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableCredentialScopeValue(item)).join(',')}]`;
+  }
+  if (isPlainObject(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableCredentialScopeValue(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'undefined';
 }
 
 async function applyCodexOauthAuthentication(

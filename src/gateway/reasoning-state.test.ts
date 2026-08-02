@@ -1,13 +1,17 @@
 import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
-import type { FastifyReply } from 'fastify';
+import type { FastifyReply, FastifyRequest } from 'fastify';
 import type {
   GatewayConfig,
   ProviderConfig,
+  ProviderPlugin,
   ReasoningStateOrigin,
   StandardRequest,
   StandardResponse
 } from '../types';
+import { ProviderPluginRegistry } from '../adapters/registry';
+import { parseProviderPluginsFromRaw } from '../config';
+import { syncProviderPluginsFromConfig } from '../provider/plugins';
 import {
   ANTHROPIC_CLAUDE_REASONING_FORMAT,
   appendGeminiThoughtSignatureToToolCallId,
@@ -28,8 +32,11 @@ import {
   createReasoningAwarePassthroughSseStream,
   normalizeReasoningEndpoint,
   prepareReasoningStateForTarget,
+  type ReasoningStateCredentialContext,
   wrapPassthroughReasoningPayload
 } from './reasoning-state';
+
+const testCredentialScope = 'test-credential-scope';
 
 const gatewayConfig = {
   openaiBaseUrl: 'https://api.openai.com/v1',
@@ -46,6 +53,37 @@ const openAIProvider = (baseurl: string): ProviderConfig => ({
   extraBody: { default: {}, byModel: {} },
   billing: { byModel: {} }
 });
+
+function credentialContext(
+  config: GatewayConfig,
+  providerConfig: ProviderConfig,
+  plugins: ProviderPlugin[] = [],
+  request: Partial<FastifyRequest> = {}
+): ReasoningStateCredentialContext {
+  return {
+    request: {
+      headers: {},
+      query: {},
+      ...request
+    } as FastifyRequest,
+    config,
+    source: { adapterKey: 'anthropic_messages' },
+    sourceProvider: 'anthropic',
+    sourceAdapterKey: 'anthropic_messages',
+    targetProvider: 'openai',
+    targetProviderConfig: providerConfig,
+    model: 'gpt-5.6-sol',
+    passthrough: false,
+    streaming: false,
+    plugins
+  };
+}
+
+function configuredPlugins(config: GatewayConfig, providerName: string): ProviderPlugin[] {
+  const registry = new ProviderPluginRegistry();
+  syncProviderPluginsFromConfig(registry, config);
+  return registry.resolve('openai', providerName);
+}
 
 describe('reasoning state origin', () => {
   it('normalizes endpoints without credentials, query, fragments, default ports, or trailing slashes', () => {
@@ -82,8 +120,18 @@ describe('reasoning state origin', () => {
 
   it('requires the exact same model for every opaque reasoning format', () => {
     const endpoint = 'endpoint-fingerprint';
-    const openAISol: ReasoningStateOrigin = { provider: 'openai', endpoint, model: 'gpt-5.6-sol' };
-    const openAILuna: ReasoningStateOrigin = { provider: 'openai', endpoint, model: 'gpt-5.6-luna' };
+    const openAISol: ReasoningStateOrigin = {
+      provider: 'openai',
+      endpoint,
+      model: 'gpt-5.6-sol',
+      credentialScope: testCredentialScope
+    };
+    const openAILuna: ReasoningStateOrigin = {
+      provider: 'openai',
+      endpoint,
+      model: 'gpt-5.6-luna',
+      credentialScope: testCredentialScope
+    };
     expect(
       canReplayReasoningState(
         OPENAI_RESPONSES_REASONING_FORMAT,
@@ -101,8 +149,18 @@ describe('reasoning state origin', () => {
       )
     ).toBe(true);
 
-    const claudeA: ReasoningStateOrigin = { provider: 'anthropic', endpoint, model: 'claude-a' };
-    const claudeB: ReasoningStateOrigin = { provider: 'anthropic', endpoint, model: 'claude-b' };
+    const claudeA: ReasoningStateOrigin = {
+      provider: 'anthropic',
+      endpoint,
+      model: 'claude-a',
+      credentialScope: testCredentialScope
+    };
+    const claudeB: ReasoningStateOrigin = {
+      provider: 'anthropic',
+      endpoint,
+      model: 'claude-b',
+      credentialScope: testCredentialScope
+    };
     expect(
       canReplayReasoningState(
         ANTHROPIC_CLAUDE_REASONING_FORMAT,
@@ -120,8 +178,18 @@ describe('reasoning state origin', () => {
       )
     ).toBe(true);
 
-    const geminiA: ReasoningStateOrigin = { provider: 'gemini', endpoint, model: 'gemini-a' };
-    const geminiB: ReasoningStateOrigin = { provider: 'gemini', endpoint, model: 'gemini-b' };
+    const geminiA: ReasoningStateOrigin = {
+      provider: 'gemini',
+      endpoint,
+      model: 'gemini-a',
+      credentialScope: testCredentialScope
+    };
+    const geminiB: ReasoningStateOrigin = {
+      provider: 'gemini',
+      endpoint,
+      model: 'gemini-b',
+      credentialScope: testCredentialScope
+    };
     for (const format of [
       GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
       GEMINI_INTERACTIONS_REASONING_FORMAT
@@ -131,8 +199,35 @@ describe('reasoning state origin', () => {
     }
   });
 
+  it('requires the exact same credential scope for every opaque reasoning format', () => {
+    const first: ReasoningStateOrigin = {
+      provider: 'openai',
+      endpoint: 'endpoint-fingerprint',
+      model: 'model-a',
+      credentialScope: 'credential-a'
+    };
+    const second: ReasoningStateOrigin = {
+      ...first,
+      credentialScope: 'credential-b'
+    };
+    for (const format of [
+      OPENAI_RESPONSES_REASONING_FORMAT,
+      ANTHROPIC_CLAUDE_REASONING_FORMAT,
+      GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+      GEMINI_INTERACTIONS_REASONING_FORMAT
+    ]) {
+      expect(canReplayReasoningState(format, first, format, second)).toBe(false);
+      expect(canReplayReasoningState(format, first, format, first)).toBe(true);
+    }
+  });
+
   it('rejects old origin-less state and state from another endpoint', () => {
-    const target: ReasoningStateOrigin = { provider: 'gemini', endpoint: 'endpoint-a' };
+    const target: ReasoningStateOrigin = {
+      provider: 'gemini',
+      endpoint: 'endpoint-a',
+      model: 'gemini-a',
+      credentialScope: testCredentialScope
+    };
     expect(
       canReplayReasoningState(
         GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
@@ -144,11 +239,303 @@ describe('reasoning state origin', () => {
     expect(
       canReplayReasoningState(
         GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
-        { provider: 'gemini', endpoint: 'endpoint-b' },
+        {
+          provider: 'gemini',
+          endpoint: 'endpoint-b',
+          model: 'gemini-a',
+          credentialScope: testCredentialScope
+        },
         GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
         target
       )
     ).toBe(false);
+  });
+
+  it('separates static API keys and credential-pool entries without exposing their values', () => {
+    const provider = openAIProvider('https://api.example.com/v1');
+    const first = buildReasoningStateOrigin(
+      'openai',
+      { ...provider, apikey: 'test-key-alpha', credentialId: 'account-a' },
+      gatewayConfig,
+      'gpt-5.6-sol'
+    );
+    const same = buildReasoningStateOrigin(
+      'openai',
+      { ...provider, apikey: 'test-key-alpha', credentialId: 'account-a' },
+      gatewayConfig,
+      'gpt-5.6-sol'
+    );
+    const changedKey = buildReasoningStateOrigin(
+      'openai',
+      { ...provider, apikey: 'test-key-beta', credentialId: 'account-a' },
+      gatewayConfig,
+      'gpt-5.6-sol'
+    );
+    const changedCredential = buildReasoningStateOrigin(
+      'openai',
+      { ...provider, apikey: 'test-key-alpha', credentialId: 'account-b' },
+      gatewayConfig,
+      'gpt-5.6-sol'
+    );
+
+    expect(first.credentialScope).toBe(same.credentialScope);
+    expect(first.credentialScope).not.toBe(changedKey.credentialScope);
+    expect(first.credentialScope).not.toBe(changedCredential.credentialScope);
+    expect(JSON.stringify(first)).not.toContain('test-key-alpha');
+    expect(JSON.stringify(first)).not.toContain('account-a');
+  });
+
+  it('uses the actual request-side credential when unmanaged OpenAI auth is forwarded', () => {
+    const provider = openAIProvider('https://api.example.com/v1');
+    const first = buildReasoningStateOrigin(
+      'openai',
+      provider,
+      gatewayConfig,
+      'gpt-5.6-sol',
+      credentialContext(gatewayConfig, provider, [], {
+        headers: { authorization: 'Bearer request-key-a' }
+      })
+    );
+    const second = buildReasoningStateOrigin(
+      'openai',
+      provider,
+      gatewayConfig,
+      'gpt-5.6-sol',
+      credentialContext(gatewayConfig, provider, [], {
+        headers: { authorization: 'Bearer request-key-b' }
+      })
+    );
+
+    expect(first.credentialScope).toBeTruthy();
+    expect(first.credentialScope).not.toBe(second.credentialScope);
+    expect(JSON.stringify(first)).not.toContain('request-key-a');
+  });
+
+  it('separates Anthropic and Gemini credentials with their protocol-specific inputs', () => {
+    const anthropicProvider: ProviderConfig = {
+      ...openAIProvider('https://api.anthropic.com'),
+      name: 'test-anthropic',
+      type: 'anthropic_messages'
+    };
+    const anthropicA = buildReasoningStateOrigin(
+      'anthropic',
+      anthropicProvider,
+      gatewayConfig,
+      'claude-test',
+      {
+        ...credentialContext(gatewayConfig, anthropicProvider, [], {
+          headers: { 'x-api-key': 'anthropic-key-a' }
+        }),
+        targetProvider: 'anthropic',
+        model: 'claude-test'
+      }
+    );
+    const anthropicB = buildReasoningStateOrigin(
+      'anthropic',
+      anthropicProvider,
+      gatewayConfig,
+      'claude-test',
+      {
+        ...credentialContext(gatewayConfig, anthropicProvider, [], {
+          headers: { 'x-api-key': 'anthropic-key-b' }
+        }),
+        targetProvider: 'anthropic',
+        model: 'claude-test'
+      }
+    );
+
+    const geminiProvider: ProviderConfig = {
+      ...openAIProvider('https://generativelanguage.googleapis.com'),
+      name: 'test-gemini',
+      type: 'gemini_generate_content'
+    };
+    const geminiA = buildReasoningStateOrigin(
+      'gemini',
+      geminiProvider,
+      gatewayConfig,
+      'gemini-test',
+      {
+        ...credentialContext(gatewayConfig, geminiProvider, [], { query: { key: 'gemini-key-a' } }),
+        targetProvider: 'gemini',
+        model: 'gemini-test'
+      }
+    );
+    const geminiB = buildReasoningStateOrigin(
+      'gemini',
+      geminiProvider,
+      gatewayConfig,
+      'gemini-test',
+      {
+        ...credentialContext(gatewayConfig, geminiProvider, [], { query: { key: 'gemini-key-b' } }),
+        targetProvider: 'gemini',
+        model: 'gemini-test'
+      }
+    );
+
+    expect(anthropicA.credentialScope).not.toBe(anthropicB.credentialScope);
+    expect(geminiA.credentialScope).not.toBe(geminiB.credentialScope);
+    expect(JSON.stringify({ anthropicA, geminiA })).not.toContain('key-a');
+  });
+
+  it('keeps Codex OAuth scope stable across access-token refreshes and separates accounts', () => {
+    const provider = {
+      ...openAIProvider('https://chatgpt.com/backend-api/codex'),
+      apikey: 'local-agent-placeholder'
+    };
+    const originFor = (accountId: string, accessToken: string) => {
+      const config = {
+        ...gatewayConfig,
+        providerPlugins: parseProviderPluginsFromRaw([
+          {
+            key: 'codex-oauth',
+            provider: 'openai',
+            providerName: provider.name,
+            codexOauth: {
+              accessToken,
+              refreshToken: `refresh-${accountId}`,
+              accountId
+            }
+          }
+        ])
+      } as GatewayConfig;
+      return buildReasoningStateOrigin(
+        'openai',
+        provider,
+        config,
+        'gpt-5.6-sol',
+        credentialContext(config, provider, configuredPlugins(config, provider.name))
+      );
+    };
+
+    const first = originFor('test-account-a', 'access-token-old');
+    const refreshed = originFor('test-account-a', 'access-token-new');
+    const otherAccount = originFor('test-account-b', 'access-token-other');
+    expect(first.credentialScope).toBe(refreshed.credentialScope);
+    expect(first.credentialScope).not.toBe(otherAccount.credentialScope);
+    expect(JSON.stringify(first)).not.toContain('test-account-a');
+    expect(JSON.stringify(first)).not.toContain('access-token-old');
+  });
+
+  it('extracts a stable Codex account from rotating JWT access tokens', () => {
+    const provider = {
+      ...openAIProvider('https://chatgpt.com/backend-api/codex'),
+      apikey: 'local-agent-placeholder'
+    };
+    const tokenFor = (marker: string) =>
+      `header.${Buffer.from(JSON.stringify({ account_id: 'jwt-account', marker }), 'utf8').toString('base64url')}.signature`;
+    const originFor = (accessToken: string) => {
+      const config = {
+        ...gatewayConfig,
+        providerPlugins: parseProviderPluginsFromRaw([
+          {
+            key: 'codex-oauth',
+            provider: 'openai',
+            providerName: provider.name,
+            codexOauth: { accessToken }
+          }
+        ])
+      } as GatewayConfig;
+      return buildReasoningStateOrigin(
+        'openai',
+        provider,
+        config,
+        'gpt-5.6-sol',
+        credentialContext(config, provider, configuredPlugins(config, provider.name))
+      );
+    };
+
+    expect(originFor(tokenFor('old')).credentialScope).toBe(
+      originFor(tokenFor('new')).credentialScope
+    );
+  });
+
+  it('uses the Codex refresh token only when no stable account ID is available', () => {
+    const provider = {
+      ...openAIProvider('https://chatgpt.com/backend-api/codex'),
+      apikey: 'local-agent-placeholder'
+    };
+    const originFor = (refreshToken: string) => {
+      const config = {
+        ...gatewayConfig,
+        providerPlugins: parseProviderPluginsFromRaw([
+          {
+            key: 'codex-oauth',
+            provider: 'openai',
+            providerName: provider.name,
+            codexOauth: { refreshToken }
+          }
+        ])
+      } as GatewayConfig;
+      return buildReasoningStateOrigin(
+        'openai',
+        provider,
+        config,
+        'gpt-5.6-sol',
+        credentialContext(config, provider, configuredPlugins(config, provider.name))
+      );
+    };
+
+    expect(originFor('refresh-token-a').credentialScope).toBe(
+      originFor('refresh-token-a').credentialScope
+    );
+    expect(originFor('refresh-token-a').credentialScope).not.toBe(
+      originFor('refresh-token-b').credentialScope
+    );
+    expect(JSON.stringify(originFor('refresh-token-a'))).not.toContain('refresh-token-a');
+  });
+
+  it('fails closed when an authenticating plugin cannot provide a stable scope', () => {
+    const provider = {
+      ...openAIProvider('https://api.example.com/v1'),
+      apikey: 'placeholder-key'
+    };
+    const plugin: ProviderPlugin = {
+      key: 'custom-auth',
+      authenticate: ({ upstreamRequest }) => ({ ok: true, value: upstreamRequest })
+    };
+    const origin = buildReasoningStateOrigin(
+      'openai',
+      provider,
+      gatewayConfig,
+      'gpt-5.6-sol',
+      credentialContext(gatewayConfig, provider, [plugin])
+    );
+
+    expect(origin.credentialScope).toBeUndefined();
+  });
+
+  it('supports an explicit stable scope for custom authentication plugins', () => {
+    const provider = {
+      ...openAIProvider('https://custom.example/v1'),
+      apikey: 'placeholder-key'
+    };
+    const config = {
+      ...gatewayConfig,
+      providerPlugins: parseProviderPluginsFromRaw([
+        {
+          key: 'custom-scope',
+          provider: 'openai',
+          providerName: provider.name,
+          credentialScope: '{{ request.headers.x-upstream-account }}'
+        }
+      ])
+    } as GatewayConfig;
+    const plugins = configuredPlugins(config, provider.name);
+    const originFor = (account: string) =>
+      buildReasoningStateOrigin(
+        'openai',
+        provider,
+        config,
+        'gpt-5.6-sol',
+        credentialContext(config, provider, plugins, {
+          headers: { 'x-upstream-account': account }
+        })
+      );
+
+    expect(originFor('custom-account-a').credentialScope).not.toBe(
+      originFor('custom-account-b').credentialScope
+    );
+    expect(JSON.stringify(originFor('custom-account-a'))).not.toContain('custom-account-a');
   });
 });
 
@@ -156,7 +543,8 @@ describe('reasoning transport envelope v2', () => {
   const origin: ReasoningStateOrigin = {
     provider: 'gemini',
     endpoint: 'endpoint-fingerprint',
-    model: 'gemini-3-pro'
+    model: 'gemini-3-pro',
+    credentialScope: testCredentialScope
   };
 
   it('round-trips format, opaque state, id, kind, and origin while retaining v1 compatibility', () => {
@@ -185,6 +573,31 @@ describe('reasoning transport envelope v2', () => {
     expect(decodeReasoningTransportEnvelope(legacy)?.origin).toBeUndefined();
   });
 
+  it('decodes an older v2 origin but does not treat its missing credential scope as replayable', () => {
+    const oldOrigin: ReasoningStateOrigin = {
+      provider: 'gemini',
+      endpoint: 'endpoint-fingerprint',
+      model: 'gemini-3-pro'
+    };
+    const encoded = encodeReasoningTransportEnvelope(
+      GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+      'old-v2-signature',
+      undefined,
+      'signature',
+      oldOrigin
+    );
+    const decoded = decodeReasoningTransportEnvelope(encoded);
+    expect(decoded?.origin).toEqual(oldOrigin);
+    expect(
+      canReplayReasoningState(
+        decoded?.format,
+        decoded?.origin,
+        GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+        origin
+      )
+    ).toBe(false);
+  });
+
   it('adds and removes a Gemini tool-call ID carrier only for a valid v2 Gemini signature', () => {
     const encoded = encodeReasoningTransportEnvelope(
       GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
@@ -208,7 +621,8 @@ describe('target reasoning-state filtering', () => {
   const sourceOrigin: ReasoningStateOrigin = {
     provider: 'openai',
     endpoint: 'endpoint-a',
-    model: 'gpt-a'
+    model: 'gpt-a',
+    credentialScope: testCredentialScope
   };
   const request: StandardRequest = {
     model: 'gpt-b',
@@ -271,6 +685,61 @@ describe('target reasoning-state filtering', () => {
     );
   });
 
+  it('drops OpenAI state when only the credential scope changes', () => {
+    const prepared = prepareReasoningStateForTarget(
+      request,
+      OPENAI_RESPONSES_REASONING_FORMAT,
+      { ...sourceOrigin, credentialScope: 'other-credential-scope' }
+    );
+    const content = typeof prepared.input === 'string' ? [] : prepared.input[0]?.content || [];
+    expect(content.some((item) => item.type === 'reasoning')).toBe(false);
+    expect(content).toContainEqual({ type: 'tool_use', id: 'call_1', name: 'lookup', input: {} });
+  });
+
+  it('applies the same credential check to a Gemini tool-call signature carrier', () => {
+    const geminiOrigin: ReasoningStateOrigin = {
+      provider: 'gemini',
+      endpoint: 'gemini-endpoint',
+      model: 'gemini-3-pro',
+      credentialScope: 'gemini-account-a'
+    };
+    const geminiRequest: StandardRequest = {
+      model: 'gemini-3-pro',
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'call_gemini',
+              name: 'lookup',
+              input: {},
+              thought_signature: 'gemini-signature',
+              thought_signature_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+              thought_signature_origin: geminiOrigin
+            }
+          ]
+        }
+      ]
+    };
+
+    const retained = prepareReasoningStateForTarget(
+      geminiRequest,
+      GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+      geminiOrigin
+    );
+    const stripped = prepareReasoningStateForTarget(
+      geminiRequest,
+      GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+      { ...geminiOrigin, credentialScope: 'gemini-account-b' }
+    );
+    const retainedContent = typeof retained.input === 'string' ? [] : retained.input[0]?.content || [];
+    const strippedContent = typeof stripped.input === 'string' ? [] : stripped.input[0]?.content || [];
+    expect(retainedContent[0]).toHaveProperty('thought_signature', 'gemini-signature');
+    expect(strippedContent[0]).not.toHaveProperty('thought_signature');
+  });
+
   it('drops foreign encrypted state before a strict target while preserving the tool call', () => {
     const prepared = prepareReasoningStateForTarget(
       request,
@@ -300,7 +769,8 @@ describe('OpenAI Chat Gemini signature field-preservation fallback', () => {
   const origin: ReasoningStateOrigin = {
     provider: 'gemini',
     endpoint: 'gemini-endpoint',
-    model: 'gemini-3-pro'
+    model: 'gemini-3-pro',
+    credentialScope: testCredentialScope
   };
 
   const response: StandardResponse = {
@@ -410,7 +880,8 @@ describe('same-protocol passthrough wrapping', () => {
   const origin: ReasoningStateOrigin = {
     provider: 'anthropic',
     endpoint: 'anthropic-endpoint',
-    model: 'claude-test'
+    model: 'claude-test',
+    credentialScope: testCredentialScope
   };
 
   it('wraps native non-stream opaque fields without changing readable content', () => {

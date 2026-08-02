@@ -4,6 +4,8 @@ import type {
   GatewayConfig,
   Provider,
   ProviderConfig,
+  ProviderPlugin,
+  ProviderPluginCredentialScopeInput,
   ReasoningStateOrigin,
   StandardRequest,
   StandardRequestInputContent,
@@ -18,12 +20,18 @@ import {
   OPENAI_RESPONSES_REASONING_FORMAT
 } from '../adapters/builtins/reasoning-envelope';
 import { parseSseChunks } from '../sse';
+import { readBearerToken, readHeader } from '../utils';
+
+export interface ReasoningStateCredentialContext extends ProviderPluginCredentialScopeInput {
+  plugins: ProviderPlugin[];
+}
 
 export function buildReasoningStateOrigin(
   provider: Provider,
   providerConfig: ProviderConfig | undefined,
   config: GatewayConfig,
-  model: string | undefined
+  model: string | undefined,
+  credentialContext?: ReasoningStateCredentialContext
 ): ReasoningStateOrigin {
   const providerFamily = resolveProviderFamily(provider, providerConfig);
   const baseUrl = resolveProviderBaseUrl(providerFamily, providerConfig, config);
@@ -31,11 +39,18 @@ export function buildReasoningStateOrigin(
   const endpoint = createHash('sha256')
     .update(`${providerFamily}\0${normalizedEndpoint}`, 'utf8')
     .digest('base64url');
+  const credentialScope = resolveReasoningCredentialScope(
+    providerFamily,
+    providerConfig,
+    config,
+    credentialContext
+  );
 
   return {
     provider: providerFamily,
     endpoint,
-    ...(model?.trim() ? { model: model.trim() } : {})
+    ...(model?.trim() ? { model: model.trim() } : {}),
+    ...(credentialScope ? { credentialScope } : {})
   };
 }
 
@@ -209,7 +224,10 @@ export function canReplayReasoningState(
     sourceFormat !== targetFormat ||
     !sourceOrigin ||
     sourceOrigin.provider !== targetOrigin.provider ||
-    sourceOrigin.endpoint !== targetOrigin.endpoint
+    sourceOrigin.endpoint !== targetOrigin.endpoint ||
+    !sourceOrigin.credentialScope ||
+    !targetOrigin.credentialScope ||
+    sourceOrigin.credentialScope !== targetOrigin.credentialScope
   ) {
     return false;
   }
@@ -219,6 +237,137 @@ export function canReplayReasoningState(
     targetOrigin.model &&
     sourceOrigin.model === targetOrigin.model
   );
+}
+
+function resolveReasoningCredentialScope(
+  providerFamily: string,
+  providerConfig: ProviderConfig | undefined,
+  config: GatewayConfig,
+  credentialContext: ReasoningStateCredentialContext | undefined
+): string | undefined {
+  const providerIdentity = (
+    providerConfig?.credentialSourceProviderName ||
+    providerConfig?.name ||
+    providerFamily
+  ).trim().toLowerCase();
+  const credentialId = providerConfig?.credentialId?.trim() || 'default';
+  const pluginResolution = resolveProviderPluginCredentialScope(credentialContext);
+  if (pluginResolution.present && !pluginResolution.scope) {
+    return undefined;
+  }
+  const credentialMaterial = pluginResolution.scope
+    ? `plugins\0${pluginResolution.scope}`
+    : resolveBuiltInCredential(
+        providerFamily,
+        providerConfig,
+        config,
+        credentialContext?.request
+      );
+  if (!credentialMaterial) {
+    return undefined;
+  }
+
+  return createHash('sha256')
+    .update(
+      `${providerFamily}\0${providerIdentity}\0${credentialId}\0${credentialMaterial}`,
+      'utf8'
+    )
+    .digest('base64url');
+}
+
+function resolveProviderPluginCredentialScope(
+  credentialContext: ReasoningStateCredentialContext | undefined
+): { present: boolean; scope?: string } {
+  if (!credentialContext) {
+    return { present: false };
+  }
+
+  // Provider plugins execute in registration order, so keep that order in the
+  // fingerprint as well. Reordering two auth plugins can change the final credential.
+  const credentialPlugins = credentialContext.plugins.filter(
+    (plugin) => plugin.authenticate || plugin.resolveCredentialScope
+  );
+  if (credentialPlugins.length === 0) {
+    return { present: false };
+  }
+
+  const scopes: string[] = [];
+  for (const plugin of credentialPlugins) {
+    if (!plugin.resolveCredentialScope) {
+      return { present: true };
+    }
+    try {
+      const scope = plugin.resolveCredentialScope(credentialContext)?.trim();
+      if (!scope) {
+        return { present: true };
+      }
+      scopes.push(`${plugin.key}\0${scope}`);
+    } catch {
+      return { present: true };
+    }
+  }
+
+  return { present: true, scope: scopes.join('\0') };
+}
+
+function resolveBuiltInCredential(
+  providerFamily: string,
+  providerConfig: ProviderConfig | undefined,
+  config: GatewayConfig,
+  request: ProviderPluginCredentialScopeInput['request'] | undefined
+): string | undefined {
+  const configuredProviderKey =
+    providerConfig?.apikey?.trim() ||
+    (providerConfig?.apiKeyEnv ? process.env[providerConfig.apiKeyEnv]?.trim() : undefined);
+  const preferManaged = Boolean(
+    config.auth?.enabled &&
+      (config.auth.mode === 'http_introspection' || config.auth.mode === 'static_api_key')
+  );
+
+  if (providerFamily === 'openai') {
+    const managed = configuredProviderKey || config.openaiApiKey?.trim() || process.env.OPENAI_API_KEY?.trim();
+    const bearer = readBearerToken(readHeader(request?.headers.authorization));
+    const apiKeyHeader =
+      readHeader(request?.headers['x-api-key']) || readHeader(request?.headers['api-key']);
+    return preferManaged
+      ? managed || bearer || apiKeyHeader
+      : bearer || apiKeyHeader || managed;
+  }
+
+  if (providerFamily === 'anthropic') {
+    const managed = configuredProviderKey || config.anthropicApiKey?.trim() || process.env.ANTHROPIC_API_KEY?.trim();
+    const apiKeyHeader = readHeader(request?.headers['x-api-key']);
+    const bearer = readBearerToken(readHeader(request?.headers.authorization));
+    return preferManaged
+      ? managed || apiKeyHeader || bearer
+      : apiKeyHeader || bearer || managed;
+  }
+
+  if (providerFamily === 'gemini') {
+    return (
+      readRequestQueryValue(request?.query, 'key') ||
+      configuredProviderKey ||
+      config.geminiApiKey?.trim() ||
+      process.env.GEMINI_API_KEY?.trim()
+    );
+  }
+
+  return configuredProviderKey;
+}
+
+function readRequestQueryValue(value: unknown, key: string): string | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const raw = (value as Record<string, unknown>)[key];
+  if (typeof raw === 'string') {
+    return raw.trim() || undefined;
+  }
+  if (Array.isArray(raw)) {
+    const first = raw.find((item): item is string => typeof item === 'string' && Boolean(item.trim()));
+    return first?.trim();
+  }
+  return undefined;
 }
 
 export function wrapPassthroughReasoningPayload(

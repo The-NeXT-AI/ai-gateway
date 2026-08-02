@@ -256,6 +256,8 @@ function normalizeReasoningStateOrigin(value: unknown): ReasoningStateOrigin | u
   const provider = typeof record.provider === 'string' ? record.provider.trim() : '';
   const endpoint = typeof record.endpoint === 'string' ? record.endpoint.trim() : '';
   const model = typeof record.model === 'string' ? record.model.trim() : '';
+  const credentialScope =
+    typeof record.credentialScope === 'string' ? record.credentialScope.trim() : '';
   if (!provider || !endpoint) {
     return undefined;
   }
@@ -263,6 +265,7 @@ function normalizeReasoningStateOrigin(value: unknown): ReasoningStateOrigin | u
   return {
     provider,
     endpoint,
-    ...(model ? { model } : {})
+    ...(model ? { model } : {}),
+    ...(credentialScope ? { credentialScope } : {})
   };
 }

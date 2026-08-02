@@ -863,6 +863,7 @@ export interface ReasoningStateOrigin {
   provider: string;
   endpoint: string;
   model?: string;
+  credentialScope?: string;
 }
 
 export interface StandardResponseFunctionCall {
@@ -1165,6 +1166,7 @@ export interface ProviderPluginConfig {
   enabled: boolean;
   provider?: Provider;
   providerName?: string;
+  credentialScope?: ProviderPluginValue;
   codexOauth?: ProviderPluginCodexOAuthConfig;
   deepseekThinking?: ProviderPluginDeepSeekThinkingConfig;
   auth?: ProviderPluginMutationConfig;
@@ -1182,6 +1184,7 @@ export interface GatewayPluginProviderHookConfig {
   enabled: boolean;
   provider?: Provider;
   providerName?: string;
+  credentialScope?: ProviderPluginValue;
   codexOauth?: ProviderPluginCodexOAuthConfig;
   deepseekThinking?: ProviderPluginDeepSeekThinkingConfig;
   auth?: ProviderPluginMutationConfig;
@@ -1209,10 +1212,16 @@ export interface ProviderPluginResponseInput extends ProviderPluginContext {
   standardRequest?: StandardRequest;
 }
 
+export interface ProviderPluginCredentialScopeInput extends ProviderPluginContext {
+  standardRequest?: StandardRequest;
+}
+
 export interface ProviderPlugin {
   key: string;
   provider?: Provider;
   providerName?: string;
+  /** Returns a stable, non-sensitive identifier for the effective upstream credential. */
+  resolveCredentialScope?(input: ProviderPluginCredentialScopeInput): string | undefined;
   authenticate?(input: ProviderPluginRequestInput): Result<UpstreamRequest> | Promise<Result<UpstreamRequest>>;
   transformRequest?(input: ProviderPluginRequestInput): Result<UpstreamRequest> | Promise<Result<UpstreamRequest>>;
   transformResponse?(input: ProviderPluginResponseInput): Result<unknown> | Promise<Result<unknown>>;

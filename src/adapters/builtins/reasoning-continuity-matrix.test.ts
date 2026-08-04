@@ -214,7 +214,8 @@ const targetScenarios: TargetScenario[] = [
     targetProviderConfig: {
       name: 'responses-target',
       type: 'openai_responses',
-      models: ['gpt-5.6-sol']
+      models: ['gpt-5.6-sol'],
+      openaiResponsesReasoningHistoryPolicy: 'encrypted'
     },
     rawResponse: {
       id: 'resp_openai_responses_reasoning',

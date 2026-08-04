@@ -638,6 +638,50 @@ describe('Gateway config providerPlugins', () => {
     expect(config.providers[2]?.openaiChatThinkingOptions).toBe('disabled');
   });
 
+  it('parses provider and model OpenAI Responses reasoning history policies', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'responses-main',
+          type: 'openai_responses',
+          models: ['gpt-main', 'deepseek-reasoner'],
+          openaiResponsesReasoningHistoryPolicy: 'encrypted',
+          openaiResponsesReasoningSummaryPolicy: 'drop',
+          modelMetadata: {
+            'deepseek-reasoner': {
+              openaiResponsesReasoningHistoryPolicy: 'plaintext',
+              openaiResponsesReasoningSummaryPolicy: 'as_content'
+            },
+            ignored: {
+              openaiResponsesReasoningHistoryPolicy: 'strip'
+            }
+          }
+        },
+        {
+          name: 'invalid-responses-policy',
+          type: 'openai_responses',
+          models: ['other'],
+          openaiResponsesReasoningHistoryPolicy: 'unsafe',
+          openaiResponsesReasoningSummaryPolicy: 'keep'
+        }
+      ]
+    });
+
+    expect(config.providers[0]).toMatchObject({
+      openaiResponsesReasoningHistoryPolicy: 'encrypted',
+      openaiResponsesReasoningSummaryPolicy: 'drop',
+      modelMetadata: {
+        'deepseek-reasoner': {
+          openaiResponsesReasoningHistoryPolicy: 'plaintext',
+          openaiResponsesReasoningSummaryPolicy: 'as_content'
+        }
+      }
+    });
+    expect(config.providers[0]?.modelMetadata).not.toHaveProperty('ignored');
+    expect(config.providers[1]?.openaiResponsesReasoningHistoryPolicy).toBeUndefined();
+    expect(config.providers[1]?.openaiResponsesReasoningSummaryPolicy).toBeUndefined();
+  });
+
   it('parses per-model reasoning metadata for provider effort translation', () => {
     const config = parseGatewayConfigFromRaw({
       providers: [

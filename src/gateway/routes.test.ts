@@ -405,6 +405,104 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it.each([
+    {
+      name: 'known plaintext-compatible endpoint',
+      baseurl: 'https://api.deepseek.com/v1',
+      expectedReasoning: true
+    },
+    {
+      name: 'unknown endpoint',
+      baseurl: 'https://responses.example.test/v1',
+      expectedReasoning: false
+    }
+  ])('applies the auto Responses history policy for a $name', async ({ baseurl, expectedReasoning }) => {
+    let upstreamBody: Record<string, unknown> = {};
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      upstreamBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          id: 'resp_policy_result',
+          object: 'response',
+          status: 'completed',
+          model: 'reasoning-model',
+          output_text: 'done',
+          output: [
+            {
+              id: 'msg_policy_result',
+              type: 'message',
+              role: 'assistant',
+              status: 'completed',
+              content: [{ type: 'output_text', text: 'done', annotations: [] }]
+            }
+          ],
+          usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 }
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('responses-policy', 'openai_responses', [
+      'reasoning-model'
+    ]);
+    provider.baseurl = baseurl;
+    provider.openaiResponsesReasoningHistoryPolicy = 'auto';
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, createConfig([provider]), createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'x-target-provider': 'responses-policy'
+        },
+        payload: {
+          model: 'reasoning-model',
+          max_tokens: 128,
+          messages: [
+            { role: 'user', content: 'First turn' },
+            {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'thinking',
+                  thinking: 'Readable prior reasoning.',
+                  signature: 'foreign-anthropic-signature'
+                },
+                { type: 'text', text: 'First answer.' }
+              ]
+            },
+            { role: 'user', content: 'Second turn' }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const input = upstreamBody.input as Array<Record<string, unknown>>;
+      const reasoning = input.find((item) => item.type === 'reasoning');
+      if (expectedReasoning) {
+        expect(reasoning).toMatchObject({
+          type: 'reasoning',
+          content: [{ type: 'reasoning_text', text: 'Readable prior reasoning.' }]
+        });
+        expect(reasoning).not.toHaveProperty('encrypted_content');
+        expect(reasoning).not.toHaveProperty('summary');
+      } else {
+        expect(reasoning).toBeUndefined();
+      }
+      expect(JSON.stringify(upstreamBody)).not.toContain('foreign-anthropic-signature');
+      expect(JSON.stringify(upstreamBody)).toContain('First answer.');
+      expect(JSON.stringify(upstreamBody)).toContain('Second turn');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('preserves encrypted reasoning IDs in Anthropic history on the second OpenAI Responses turn', async () => {
     const upstreamBodies: Array<Record<string, unknown>> = [];
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {

@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type {
+  OpenAIResponsesReasoningHistoryPolicy,
+  OpenAIResponsesReasoningSummaryPolicy,
   ProviderConfig,
   StandardRequest,
   StandardRequestInputContent,
@@ -186,7 +188,8 @@ export const openAIResponsesTargetAdapter: TargetAdapter = {
 
     const body = buildOpenAIResponsesBodyFromStandardRequest(
       input.standardRequest,
-      input.targetProviderConfig
+      input.targetProviderConfig,
+      input.targetProviderConfig?.baseurl || input.config.openaiBaseUrl
     );
 
     return ok({
@@ -202,7 +205,8 @@ export const openAIResponsesTargetAdapter: TargetAdapter = {
 
 export function buildOpenAIResponsesBodyFromStandardRequest(
   standardRequest: StandardRequest,
-  targetProviderConfig?: ProviderConfig
+  targetProviderConfig?: ProviderConfig,
+  targetBaseUrl?: string
 ): Record<string, unknown> {
   // The Responses API does not accept `stop`; Chat Completions handles it above.
   const deferredToolSearch = buildDeferredToolSearchPlan(
@@ -216,7 +220,18 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
     input: standardInputToOpenAIResponsesInput(
       standardRequest.input,
       standardRequest.tools,
-      deferredToolSearch
+      deferredToolSearch,
+      {
+        historyPolicy: resolveOpenAIResponsesReasoningHistoryPolicy(
+          targetProviderConfig,
+          standardRequest.model,
+          targetBaseUrl || targetProviderConfig?.baseurl
+        ),
+        summaryPolicy: resolveOpenAIResponsesReasoningSummaryPolicy(
+          targetProviderConfig,
+          standardRequest.model
+        )
+      }
     ),
     temperature: standardRequest.temperature,
     top_p: standardRequest.top_p,
@@ -343,9 +358,7 @@ function providerModelReasoningEfforts(
   }
 
   if (targetProviderConfig?.modelMetadata) {
-    const matchingMetadata = Object.entries(targetProviderConfig.modelMetadata).find(
-      ([configuredModel]) => configuredModel.trim().toLowerCase() === normalizedModel
-    )?.[1];
+    const matchingMetadata = providerModelMetadata(targetProviderConfig, normalizedModel);
     if (matchingMetadata?.supportedReasoningLevels !== undefined) {
       const supportedEfforts = new Set<OpenAIResponsesReasoningEffort>();
       for (const level of matchingMetadata.supportedReasoningLevels) {
@@ -362,6 +375,74 @@ function providerModelReasoningEfforts(
     pattern.test(normalizedModel)
   );
   return knownCapability ? new Set(knownCapability.supportedEfforts) : undefined;
+}
+
+export function resolveOpenAIResponsesReasoningHistoryPolicy(
+  targetProviderConfig: ProviderConfig | undefined,
+  model: string | undefined,
+  targetBaseUrl: string | undefined
+): Exclude<OpenAIResponsesReasoningHistoryPolicy, 'auto'> {
+  const configured =
+    providerModelMetadata(targetProviderConfig, model)?.openaiResponsesReasoningHistoryPolicy ??
+    targetProviderConfig?.openaiResponsesReasoningHistoryPolicy ??
+    'auto';
+  if (configured !== 'auto') {
+    return configured;
+  }
+
+  return inferOpenAIResponsesReasoningHistoryPolicy(targetBaseUrl);
+}
+
+function resolveOpenAIResponsesReasoningSummaryPolicy(
+  targetProviderConfig: ProviderConfig | undefined,
+  model: string | undefined
+): OpenAIResponsesReasoningSummaryPolicy {
+  return (
+    providerModelMetadata(targetProviderConfig, model)?.openaiResponsesReasoningSummaryPolicy ??
+    targetProviderConfig?.openaiResponsesReasoningSummaryPolicy ??
+    'drop'
+  );
+}
+
+function inferOpenAIResponsesReasoningHistoryPolicy(
+  targetBaseUrl: string | undefined
+): Exclude<OpenAIResponsesReasoningHistoryPolicy, 'auto'> {
+  const value = targetBaseUrl?.trim();
+  if (!value) {
+    return 'strip';
+  }
+
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    const pathname = url.pathname.replace(/\/+$/, '').toLowerCase();
+    if (hostname === 'api.openai.com') {
+      return 'encrypted';
+    }
+    if (hostname === 'chatgpt.com' && pathname.startsWith('/backend-api/codex')) {
+      return 'encrypted';
+    }
+    if (hostname === 'api.deepseek.com') {
+      return 'plaintext';
+    }
+  } catch {
+    // Unknown or non-URL endpoints use the safe default below.
+  }
+
+  return 'strip';
+}
+
+function providerModelMetadata(
+  targetProviderConfig: ProviderConfig | undefined,
+  model: string | undefined
+) {
+  const normalizedModel = model?.trim().toLowerCase();
+  if (!normalizedModel || !targetProviderConfig?.modelMetadata) {
+    return undefined;
+  }
+  return Object.entries(targetProviderConfig.modelMetadata).find(
+    ([configuredModel]) => configuredModel.trim().toLowerCase() === normalizedModel
+  )?.[1];
 }
 
 function readOpenAIResponsesReasoningEffort(
@@ -474,10 +555,63 @@ function standardInputToOpenAIChatMessages(
   return messages;
 }
 
+function mapReasoningItemToOpenAIResponses(
+  reasoning: StandardRequestReasoningContent,
+  policy: {
+    historyPolicy: Exclude<OpenAIResponsesReasoningHistoryPolicy, 'auto'>;
+    summaryPolicy: OpenAIResponsesReasoningSummaryPolicy;
+  }
+): Record<string, unknown> | undefined {
+  if (policy.historyPolicy === 'strip') {
+    return undefined;
+  }
+
+  if (policy.historyPolicy === 'encrypted') {
+    const id = reasoning.id;
+    const encryptedContent = reasoning.encrypted_content;
+    if (
+      reasoning.source_format !== OPENAI_RESPONSES_REASONING_FORMAT ||
+      !id?.trim() ||
+      !encryptedContent?.trim()
+    ) {
+      return undefined;
+    }
+    const summary = reasoning.summary;
+    return {
+      type: 'reasoning',
+      id,
+      summary: summary?.trim() ? [{ type: 'summary_text', text: summary }] : [],
+      encrypted_content: encryptedContent
+    };
+  }
+
+  const text = reasoning.text;
+  const summary = reasoning.summary;
+  const readableReasoning =
+    text?.trim()
+      ? text
+      : policy.summaryPolicy === 'as_content' && summary?.trim()
+        ? summary
+        : undefined;
+  if (!readableReasoning) {
+    return undefined;
+  }
+
+  return {
+    type: 'reasoning',
+    id: reasoning.id?.trim() ? reasoning.id : `rs_${randomUUID().replace(/-/g, '')}`,
+    content: [{ type: 'reasoning_text', text: readableReasoning }]
+  };
+}
+
 function standardInputToOpenAIResponsesInput(
   input: string | StandardRequestInputMessage[],
   tools?: unknown[],
-  deferredToolSearch?: DeferredToolSearchPlan
+  deferredToolSearch?: DeferredToolSearchPlan,
+  reasoningPolicy: {
+    historyPolicy: Exclude<OpenAIResponsesReasoningHistoryPolicy, 'auto'>;
+    summaryPolicy: OpenAIResponsesReasoningSummaryPolicy;
+  } = { historyPolicy: 'strip', summaryPolicy: 'drop' }
 ): string | Array<Record<string, unknown>> {
   if (typeof input === 'string') {
     return input;
@@ -489,48 +623,14 @@ function standardInputToOpenAIResponsesInput(
     const text = extractStandardInputTextContent(message.content);
 
     if (message.role === 'assistant') {
-      const replayableReasoningItems = message.content.filter(
-        (item): item is StandardRequestReasoningContent =>
-          item.type === 'reasoning' &&
-          item.source_format === OPENAI_RESPONSES_REASONING_FORMAT
+      const reasoningItems = message.content.filter(
+        (item): item is StandardRequestReasoningContent => item.type === 'reasoning'
       );
-      for (const replayableReasoning of replayableReasoningItems) {
-        const replayableEncryptedContent =
-          replayableReasoning.encrypted_content &&
-          replayableReasoning.id
-            ? replayableReasoning.encrypted_content
-            : undefined;
-        if (
-          !replayableReasoning.text &&
-          !replayableReasoning.summary &&
-          !replayableEncryptedContent
-        ) {
-          continue;
+      for (const reasoning of reasoningItems) {
+        const mapped = mapReasoningItemToOpenAIResponses(reasoning, reasoningPolicy);
+        if (mapped) {
+          items.push(mapped);
         }
-
-        items.push({
-          type: 'reasoning',
-          id: replayableReasoning.id || `rs_${randomUUID().replace(/-/g, '')}`,
-          summary: replayableReasoning.summary
-            ? [
-                {
-                  type: 'summary_text',
-                  text: replayableReasoning.summary
-                }
-              ]
-            : [],
-          ...(replayableReasoning.text
-            ? {
-                content: [
-                  {
-                    type: 'reasoning_text',
-                    text: replayableReasoning.text
-                  }
-                ]
-              }
-            : {}),
-          ...(replayableEncryptedContent ? { encrypted_content: replayableEncryptedContent } : {})
-        });
       }
 
       if (text) {

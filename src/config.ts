@@ -157,6 +157,12 @@ interface ProviderJsonConfig {
   openaiChatReasoningOptions?: unknown;
   chatThinkingOptions?: unknown;
   thinkingOptions?: unknown;
+  openaiResponsesReasoningHistoryPolicy?: unknown;
+  responsesReasoningHistoryPolicy?: unknown;
+  openai_responses_reasoning_history_policy?: unknown;
+  openaiResponsesReasoningSummaryPolicy?: unknown;
+  responsesReasoningSummaryPolicy?: unknown;
+  openai_responses_reasoning_summary_policy?: unknown;
   modelMetadata?: unknown;
   extraHeaders?: unknown;
   extraBody?: unknown;
@@ -3648,6 +3654,16 @@ function parseProvidersConfig(value: unknown): ProviderConfig[] {
           item.chatThinkingOptions ??
           item.thinkingOptions
       ),
+      openaiResponsesReasoningHistoryPolicy: parseOpenAIResponsesReasoningHistoryPolicyToken(
+        item.openaiResponsesReasoningHistoryPolicy ??
+          item.responsesReasoningHistoryPolicy ??
+          item.openai_responses_reasoning_history_policy
+      ),
+      openaiResponsesReasoningSummaryPolicy: parseOpenAIResponsesReasoningSummaryPolicyToken(
+        item.openaiResponsesReasoningSummaryPolicy ??
+          item.responsesReasoningSummaryPolicy ??
+          item.openai_responses_reasoning_summary_policy
+      ),
       modelMetadata: parseProviderModelMetadata(item.modelMetadata, models),
       extraHeaders: parseModelScopedHeaders(item.extraHeaders, models),
       extraBody: parseModelScopedBody(item.extraBody, models),
@@ -4469,6 +4485,31 @@ function parseOpenAIChatThinkingOptionsToken(value: unknown): ProviderConfig['op
   return parseOpenAIChatCompatibilityModeToken(value);
 }
 
+function parseOpenAIResponsesReasoningHistoryPolicyToken(
+  value: unknown
+): ProviderConfig['openaiResponsesReasoningHistoryPolicy'] {
+  const normalized = readString(value)?.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  if (
+    normalized === 'auto' ||
+    normalized === 'encrypted' ||
+    normalized === 'plaintext' ||
+    normalized === 'strip'
+  ) {
+    return normalized;
+  }
+  return undefined;
+}
+
+function parseOpenAIResponsesReasoningSummaryPolicyToken(
+  value: unknown
+): ProviderConfig['openaiResponsesReasoningSummaryPolicy'] {
+  const normalized = readString(value)?.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  if (normalized === 'drop' || normalized === 'as_content') {
+    return normalized;
+  }
+  return undefined;
+}
+
 function parseOpenAIChatCompatibilityModeToken(value: unknown): 'auto' | 'enabled' | 'disabled' | undefined {
   if (typeof value === 'boolean') {
     return value ? 'enabled' : 'disabled';
@@ -4581,9 +4622,31 @@ function parseProviderModelMetadata(
     const supportedReasoningLevels = parseProviderReasoningLevels(
       rawMetadata.supportedReasoningLevels
     );
-    if (supportedReasoningLevels !== undefined) {
+    const openaiResponsesReasoningHistoryPolicy =
+      parseOpenAIResponsesReasoningHistoryPolicyToken(
+        rawMetadata.openaiResponsesReasoningHistoryPolicy ??
+          rawMetadata.responsesReasoningHistoryPolicy ??
+          rawMetadata.openai_responses_reasoning_history_policy
+      );
+    const openaiResponsesReasoningSummaryPolicy =
+      parseOpenAIResponsesReasoningSummaryPolicyToken(
+        rawMetadata.openaiResponsesReasoningSummaryPolicy ??
+          rawMetadata.responsesReasoningSummaryPolicy ??
+          rawMetadata.openai_responses_reasoning_summary_policy
+      );
+    if (
+      supportedReasoningLevels !== undefined ||
+      openaiResponsesReasoningHistoryPolicy !== undefined ||
+      openaiResponsesReasoningSummaryPolicy !== undefined
+    ) {
       metadata[model] = {
-        supportedReasoningLevels
+        ...(supportedReasoningLevels !== undefined ? { supportedReasoningLevels } : {}),
+        ...(openaiResponsesReasoningHistoryPolicy !== undefined
+          ? { openaiResponsesReasoningHistoryPolicy }
+          : {}),
+        ...(openaiResponsesReasoningSummaryPolicy !== undefined
+          ? { openaiResponsesReasoningSummaryPolicy }
+          : {})
       };
     }
   }

@@ -55,8 +55,18 @@ export interface ProviderModelReasoningLevel {
   description?: string;
 }
 
+export type OpenAIResponsesReasoningHistoryPolicy =
+  | 'auto'
+  | 'encrypted'
+  | 'plaintext'
+  | 'strip';
+
+export type OpenAIResponsesReasoningSummaryPolicy = 'drop' | 'as_content';
+
 export interface ProviderModelMetadata {
   supportedReasoningLevels?: ProviderModelReasoningLevel[];
+  openaiResponsesReasoningHistoryPolicy?: OpenAIResponsesReasoningHistoryPolicy;
+  openaiResponsesReasoningSummaryPolicy?: OpenAIResponsesReasoningSummaryPolicy;
 }
 
 export type ProviderHealthStatus = 'healthy' | 'degraded' | 'unknown' | 'down';
@@ -109,6 +119,8 @@ export interface ProviderConfig {
   openaiChatStreamUsage?: 'include_usage' | 'disabled';
   openaiChatReasoningSplit?: 'auto' | 'enabled' | 'disabled';
   openaiChatThinkingOptions?: 'auto' | 'enabled' | 'disabled';
+  openaiResponsesReasoningHistoryPolicy?: OpenAIResponsesReasoningHistoryPolicy;
+  openaiResponsesReasoningSummaryPolicy?: OpenAIResponsesReasoningSummaryPolicy;
   modelMetadata?: Record<string, ProviderModelMetadata>;
   extraHeaders: ModelScopedHeadersConfig;
   extraBody: ModelScopedBodyConfig;

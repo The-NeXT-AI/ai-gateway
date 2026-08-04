@@ -238,7 +238,8 @@ describe('openAIResponsesTargetAdapter', () => {
       {
         name: 'codex-api',
         type: 'openai_responses',
-        models: ['gpt-5.6-sol']
+        models: ['gpt-5.6-sol'],
+        openaiResponsesReasoningHistoryPolicy: 'encrypted'
       }
     );
 
@@ -316,7 +317,8 @@ describe('openAIResponsesTargetAdapter', () => {
       {
         name: 'codex-api',
         type: 'openai_responses',
-        models: ['gpt-5.6-sol']
+        models: ['gpt-5.6-sol'],
+        openaiResponsesReasoningHistoryPolicy: 'encrypted'
       }
     );
 
@@ -367,6 +369,12 @@ describe('openAIResponsesTargetAdapter', () => {
       config: {
         openaiApiKey: 'test',
         openaiBaseUrl: 'https://example.test/v1'
+      } as never,
+      targetProviderConfig: {
+        name: 'test-responses',
+        type: 'openai_responses',
+        models: ['gpt-5.6-sol'],
+        openaiResponsesReasoningHistoryPolicy: 'encrypted'
       } as never
     });
 
@@ -390,6 +398,238 @@ describe('openAIResponsesTargetAdapter', () => {
         encrypted_content: 'enc_two'
       }
     ]);
+  });
+
+  it('replays only complete encrypted state and never sends readable content to encrypted targets', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest(
+      {
+        model: 'gpt-5.6-sol',
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'reasoning',
+                id: 'rs_valid',
+                text: 'must not be sent',
+                summary: 'safe attached summary',
+                source_format: 'openai-responses-v1',
+                encrypted_content: 'enc_valid'
+              },
+              {
+                type: 'reasoning',
+                text: 'missing id',
+                source_format: 'openai-responses-v1',
+                encrypted_content: 'enc_missing_id'
+              },
+              {
+                type: 'reasoning',
+                id: 'rs_foreign',
+                text: 'foreign text',
+                source_format: 'anthropic-claude-v1',
+                encrypted_content: 'foreign_ciphertext'
+              }
+            ]
+          }
+        ]
+      },
+      {
+        name: 'official-openai',
+        type: 'openai_responses',
+        models: ['gpt-5.6-sol'],
+        openaiResponsesReasoningHistoryPolicy: 'encrypted'
+      } as never
+    );
+
+    expect(body.input).toEqual([
+      {
+        type: 'reasoning',
+        id: 'rs_valid',
+        summary: [{ type: 'summary_text', text: 'safe attached summary' }],
+        encrypted_content: 'enc_valid'
+      }
+    ]);
+    expect(JSON.stringify(body.input)).not.toContain('must not be sent');
+    expect(JSON.stringify(body.input)).not.toContain('enc_missing_id');
+    expect(JSON.stringify(body.input)).not.toContain('foreign_ciphertext');
+  });
+
+  it('infers encrypted, plaintext, and strip policies from known Responses endpoints', () => {
+    const input = [
+      {
+        type: 'message' as const,
+        role: 'assistant' as const,
+        content: [
+          {
+            type: 'reasoning' as const,
+            id: 'rs_previous',
+            text: 'readable reasoning',
+            source_format: 'openai-responses-v1',
+            encrypted_content: 'encrypted reasoning'
+          },
+          { type: 'input_text' as const, text: 'answer' }
+        ]
+      }
+    ];
+    const provider = {
+      name: 'responses-auto',
+      type: 'openai_responses',
+      models: ['reasoning-model'],
+      openaiResponsesReasoningHistoryPolicy: 'auto'
+    } as never;
+
+    const official = buildOpenAIResponsesBodyFromStandardRequest(
+      { model: 'reasoning-model', input },
+      provider,
+      'https://api.openai.com/v1'
+    );
+    const codex = buildOpenAIResponsesBodyFromStandardRequest(
+      { model: 'reasoning-model', input },
+      provider,
+      'https://chatgpt.com/backend-api/codex'
+    );
+    const deepSeek = buildOpenAIResponsesBodyFromStandardRequest(
+      { model: 'reasoning-model', input },
+      provider,
+      'https://api.deepseek.com/v1'
+    );
+    const unknown = buildOpenAIResponsesBodyFromStandardRequest(
+      { model: 'reasoning-model', input },
+      provider,
+      'https://responses.example.test/v1'
+    );
+
+    for (const body of [official, codex]) {
+      expect((body.input as Array<Record<string, unknown>>)[0]).toEqual({
+        type: 'reasoning',
+        id: 'rs_previous',
+        summary: [],
+        encrypted_content: 'encrypted reasoning'
+      });
+    }
+    expect((deepSeek.input as Array<Record<string, unknown>>)[0]).toEqual({
+      type: 'reasoning',
+      id: 'rs_previous',
+      content: [{ type: 'reasoning_text', text: 'readable reasoning' }]
+    });
+    expect(unknown.input).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'answer' }]
+      }
+    ]);
+  });
+
+  it('lets a model override the provider policy and optionally converts summaries to plaintext content', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest(
+      {
+        model: 'deepseek-reasoner',
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'reasoning',
+                summary: 'reasoning summary',
+                source_format: 'gemini-generate-content-v1',
+                encrypted_content: 'foreign opaque state'
+              }
+            ]
+          }
+        ]
+      },
+      {
+        name: 'mixed-responses',
+        type: 'openai_responses',
+        models: ['deepseek-reasoner'],
+        openaiResponsesReasoningHistoryPolicy: 'encrypted',
+        openaiResponsesReasoningSummaryPolicy: 'drop',
+        modelMetadata: {
+          'DEEPSEEK-REASONER': {
+            openaiResponsesReasoningHistoryPolicy: 'plaintext',
+            openaiResponsesReasoningSummaryPolicy: 'as_content'
+          }
+        }
+      } as never
+    );
+
+    const reasoning = (body.input as Array<Record<string, unknown>>)[0];
+    expect(reasoning).toMatchObject({
+      type: 'reasoning',
+      content: [{ type: 'reasoning_text', text: 'reasoning summary' }]
+    });
+    expect(reasoning).toHaveProperty('id');
+    expect(reasoning).not.toHaveProperty('summary');
+    expect(reasoning).not.toHaveProperty('encrypted_content');
+    expect(JSON.stringify(reasoning)).not.toContain('foreign opaque state');
+  });
+
+  it('drops summary-only plaintext history unless summary conversion is enabled', () => {
+    const body = buildOpenAIResponsesBodyFromStandardRequest(
+      {
+        model: 'compatible-model',
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'reasoning', summary: 'summary only' }]
+          }
+        ]
+      },
+      {
+        name: 'compatible-responses',
+        type: 'openai_responses',
+        models: ['compatible-model'],
+        openaiResponsesReasoningHistoryPolicy: 'plaintext',
+        openaiResponsesReasoningSummaryPolicy: 'drop'
+      } as never
+    );
+
+    expect(body.input).toEqual([]);
+  });
+
+  it('builds identical second-turn reasoning history for streaming and non-streaming requests', () => {
+    const request = {
+      model: 'gpt-5.6-sol',
+      input: [
+        {
+          type: 'message' as const,
+          role: 'assistant' as const,
+          content: [
+            {
+              type: 'reasoning' as const,
+              id: 'rs_stream_parity',
+              source_format: 'openai-responses-v1',
+              encrypted_content: 'enc_stream_parity'
+            },
+            { type: 'tool_use' as const, id: 'call_1', name: 'lookup', input: {} }
+          ]
+        },
+        {
+          type: 'message' as const,
+          role: 'user' as const,
+          content: [{ type: 'tool_result' as const, tool_use_id: 'call_1', content: 'ok' }]
+        }
+      ]
+    };
+    const provider = {
+      name: 'official-openai',
+      type: 'openai_responses',
+      models: ['gpt-5.6-sol'],
+      openaiResponsesReasoningHistoryPolicy: 'encrypted'
+    } as never;
+    const nonStreaming = buildOpenAIResponsesBodyFromStandardRequest(request, provider);
+    const streaming = buildOpenAIResponsesBodyFromStandardRequest(
+      { ...request, stream: true },
+      provider
+    );
+
+    expect(streaming.input).toEqual(nonStreaming.input);
+    expect(streaming.stream).toBe(true);
+    expect(nonStreaming.stream).toBeUndefined();
   });
 
   it('keeps supported reasoning efforts and selects the closest supported fallback', () => {

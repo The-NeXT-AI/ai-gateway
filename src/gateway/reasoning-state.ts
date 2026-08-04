@@ -189,26 +189,19 @@ export function prepareReasoningStateForTarget(
           return [item];
         }
 
+        if (targetFormat === OPENAI_RESPONSES_REASONING_FORMAT) {
+          const readableReasoning = stripOpaqueReasoningState(item);
+          return readableReasoning ? [readableReasoning] : [];
+        }
+
         if (targetFormat) {
           // Strict protocols bind their native reasoning blocks to provider state.
           // Keep normal assistant text/tool calls, but do not synthesize an unsigned block.
           return [];
         }
 
-        const readableDetails = sanitizeReadableReasoningDetails(item.reasoning_details);
-        const {
-          encrypted_content: _encryptedContent,
-          source_origin: _sourceOrigin,
-          ...readableReasoning
-        } = item;
-        return [
-          {
-            ...readableReasoning,
-            ...(readableDetails.length > 0
-              ? { reasoning_details: readableDetails }
-              : { reasoning_details: undefined })
-          }
-        ];
+        const readableReasoning = stripOpaqueReasoningState(item);
+        return readableReasoning ? [readableReasoning] : [];
       })
     }))
   };
@@ -583,6 +576,30 @@ function hasOpaqueReasoningState(
       record.thought_signature
     );
   });
+}
+
+function stripOpaqueReasoningState(
+  item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
+): Extract<StandardRequestInputContent, { type: 'reasoning' }> | undefined {
+  const readableDetails = sanitizeReadableReasoningDetails(item.reasoning_details);
+  const {
+    encrypted_content: _encryptedContent,
+    source_origin: _sourceOrigin,
+    ...readableReasoning
+  } = item;
+  if (
+    !readableReasoning.text?.trim() &&
+    !readableReasoning.summary?.trim() &&
+    readableDetails.length === 0
+  ) {
+    return undefined;
+  }
+  return {
+    ...readableReasoning,
+    ...(readableDetails.length > 0
+      ? { reasoning_details: readableDetails }
+      : { reasoning_details: undefined })
+  };
 }
 
 function sanitizeReadableReasoningDetails(value: unknown[] | undefined): unknown[] {

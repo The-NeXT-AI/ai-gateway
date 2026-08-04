@@ -657,14 +657,18 @@ describe('target reasoning-state filtering', () => {
     ]
   };
 
-  it('drops same-endpoint OpenAI state after a model switch', () => {
+  it('strips opaque OpenAI state after a model switch but keeps readable reasoning for policy evaluation', () => {
     const prepared = prepareReasoningStateForTarget(
       request,
       OPENAI_RESPONSES_REASONING_FORMAT,
       { ...sourceOrigin, model: 'gpt-b' }
     );
     const content = typeof prepared.input === 'string' ? [] : prepared.input[0]?.content || [];
-    expect(content.some((item) => item.type === 'reasoning')).toBe(false);
+    const reasoning = content.find((item) => item.type === 'reasoning');
+    expect(reasoning).toMatchObject({ type: 'reasoning', text: 'readable summary' });
+    expect(reasoning).not.toHaveProperty('encrypted_content');
+    expect(reasoning).not.toHaveProperty('source_origin');
+    expect(JSON.stringify(reasoning)).not.toContain('encrypted-openai-state');
     expect(content.find((item) => item.type === 'tool_use')).toEqual({
       type: 'tool_use',
       id: 'call_1',
@@ -685,15 +689,46 @@ describe('target reasoning-state filtering', () => {
     );
   });
 
-  it('drops OpenAI state when only the credential scope changes', () => {
+  it('strips opaque OpenAI state when only the credential scope changes', () => {
     const prepared = prepareReasoningStateForTarget(
       request,
       OPENAI_RESPONSES_REASONING_FORMAT,
       { ...sourceOrigin, credentialScope: 'other-credential-scope' }
     );
     const content = typeof prepared.input === 'string' ? [] : prepared.input[0]?.content || [];
-    expect(content.some((item) => item.type === 'reasoning')).toBe(false);
+    const reasoning = content.find((item) => item.type === 'reasoning');
+    expect(reasoning).toMatchObject({ type: 'reasoning', text: 'readable summary' });
+    expect(reasoning).not.toHaveProperty('encrypted_content');
+    expect(reasoning).not.toHaveProperty('source_origin');
     expect(content).toContainEqual({ type: 'tool_use', id: 'call_1', name: 'lookup', input: {} });
+  });
+
+  it('drops an origin-mismatched Responses item when it has no readable reasoning', () => {
+    const encryptedOnly: StandardRequest = {
+      model: 'gpt-b',
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'reasoning',
+              id: 'rs_encrypted_only',
+              source_format: OPENAI_RESPONSES_REASONING_FORMAT,
+              source_origin: sourceOrigin,
+              encrypted_content: 'encrypted-only-state'
+            }
+          ]
+        }
+      ]
+    };
+    const prepared = prepareReasoningStateForTarget(
+      encryptedOnly,
+      OPENAI_RESPONSES_REASONING_FORMAT,
+      { ...sourceOrigin, model: 'gpt-b' }
+    );
+    const content = typeof prepared.input === 'string' ? [] : prepared.input[0]?.content || [];
+    expect(content).toEqual([]);
   });
 
   it('applies the same credential check to a Gemini tool-call signature carrier', () => {
@@ -745,6 +780,17 @@ describe('target reasoning-state filtering', () => {
       request,
       GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
       { provider: 'gemini', endpoint: 'other-gemini' }
+    );
+    const content = typeof prepared.input === 'string' ? [] : prepared.input[0]?.content || [];
+    expect(content.some((item) => item.type === 'reasoning')).toBe(false);
+    expect(content).toContainEqual({ type: 'tool_use', id: 'call_1', name: 'lookup', input: {} });
+  });
+
+  it('does not preserve foreign readable reasoning for an Anthropic strict target', () => {
+    const prepared = prepareReasoningStateForTarget(
+      request,
+      ANTHROPIC_CLAUDE_REASONING_FORMAT,
+      { provider: 'anthropic', endpoint: 'anthropic-endpoint' }
     );
     const content = typeof prepared.input === 'string' ? [] : prepared.input[0]?.content || [];
     expect(content.some((item) => item.type === 'reasoning')).toBe(false);

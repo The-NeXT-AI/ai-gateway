@@ -1,5 +1,6 @@
 import { Readable } from 'node:stream';
 import type { FastifyReply } from 'fastify';
+import { Dispatcher, getGlobalDispatcher } from 'undici';
 
 export interface UpstreamCallLogContext {
   logger?: {
@@ -37,6 +38,9 @@ interface NormalizedUpstreamRetryOptions {
   jitterMs: number;
   retryStatusCodes: Set<number>;
 }
+
+type FetchDispatcher = NonNullable<RequestInit['dispatcher']>;
+type FetchInitWithDispatcher = RequestInit & { dispatcher?: FetchDispatcher };
 
 const hopByHopHeaders = new Set([
   'connection',
@@ -134,6 +138,7 @@ export async function callUpstream(
       'Upstream request dispatched.'
     );
   }
+  const dispatcher = upstreamFetchDispatcherForTimeout(timeoutMs);
 
   let lastError: unknown;
   let timedOut = false;
@@ -168,12 +173,14 @@ export async function callUpstream(
 
       try {
         const method = normalizeUpstreamMethod(requestOptions?.method);
-        const response = await fetch(url, {
+        const fetchInit: FetchInitWithDispatcher = {
           method,
           headers,
           body: serializeUpstreamRequestBody(body, requestOptions?.bodyEncoding, method),
-          signal: controller.signal
-        });
+          signal: controller.signal,
+          ...(dispatcher ? { dispatcher: dispatcher as unknown as FetchDispatcher } : {})
+        };
+        const response = await fetch(url, fetchInit);
 
         if (shouldLog && requestLogPayload) {
           const responseBody =
@@ -284,6 +291,72 @@ export async function callUpstream(
   }
 
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function upstreamFetchDispatcherForTimeout(timeoutMs: number): FetchDispatcher | undefined {
+  const normalizedTimeoutMs = normalizeDispatcherTimeoutMs(timeoutMs);
+  if (normalizedTimeoutMs === undefined) {
+    return undefined;
+  }
+
+  return new UpstreamTimeoutDispatcher(normalizedTimeoutMs) as unknown as FetchDispatcher;
+}
+
+function normalizeDispatcherTimeoutMs(timeoutMs: number): number | undefined {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return undefined;
+  }
+
+  return Math.max(1, Math.trunc(timeoutMs));
+}
+
+class UpstreamTimeoutDispatcher extends Dispatcher {
+  constructor(private readonly timeoutMs: number) {
+    super();
+  }
+
+  get isMockActive(): unknown {
+    return (getGlobalDispatcher() as { isMockActive?: unknown }).isMockActive;
+  }
+
+  dispatch(
+    options: Parameters<Dispatcher['dispatch']>[0],
+    handler: Parameters<Dispatcher['dispatch']>[1]
+  ): boolean {
+    return getGlobalDispatcher().dispatch(
+      {
+        ...options,
+        bodyTimeout: this.timeoutMs,
+        headersTimeout: this.timeoutMs
+      },
+      handler
+    );
+  }
+
+  close(): Promise<void>;
+  close(callback: () => void): void;
+  close(callback?: () => void): Promise<void> | void {
+    if (callback) {
+      queueMicrotask(callback);
+      return;
+    }
+
+    return Promise.resolve();
+  }
+
+  destroy(): Promise<void>;
+  destroy(error: Error | null): Promise<void>;
+  destroy(callback: () => void): void;
+  destroy(error: Error | null, callback: () => void): void;
+  destroy(errorOrCallback?: Error | null | (() => void), callback?: () => void): Promise<void> | void {
+    const done = typeof errorOrCallback === 'function' ? errorOrCallback : callback;
+    if (done) {
+      queueMicrotask(done);
+      return;
+    }
+
+    return Promise.resolve();
+  }
 }
 
 function isEventStreamResponse(response: Response): boolean {

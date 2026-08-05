@@ -47,6 +47,7 @@
     "fastify": "^5.8.2",
     "glob": "^13.0.6",
     "openai": "^6.27.0",
+    "undici": "^6.28.0",
     "ws": "^8.19.0"
   },
   "devDependencies": {

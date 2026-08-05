@@ -10,7 +10,7 @@ async function build() {
     outfile: 'dist/index.js',
     minify: !watchMode,
     sourcemap: true,
-    external: ['fastify', 'ws'],
+    external: ['fastify', 'undici', 'ws'],
   };
 
   try {

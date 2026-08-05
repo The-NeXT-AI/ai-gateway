@@ -1,4 +1,37 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+const undiciMock = vi.hoisted(() => ({
+  dispatch: vi.fn(() => true),
+  getGlobalDispatcher: vi.fn()
+}));
+
+vi.mock('undici', () => ({
+  Dispatcher: class MockDispatcher {
+    dispatch(): boolean {
+      throw new Error('dispatch not implemented');
+    }
+
+    close(callback?: () => void): Promise<void> | void {
+      if (callback) {
+        callback();
+        return;
+      }
+
+      return Promise.resolve();
+    }
+
+    destroy(errorOrCallback?: Error | null | (() => void), callback?: () => void): Promise<void> | void {
+      const done = typeof errorOrCallback === 'function' ? errorOrCallback : callback;
+      if (done) {
+        done();
+        return;
+      }
+
+      return Promise.resolve();
+    }
+  },
+  getGlobalDispatcher: undiciMock.getGlobalDispatcher
+}));
 
 import {
   callUpstream,
@@ -7,7 +40,18 @@ import {
   sanitizePayloadForLog
 } from './client';
 
+type FetchInitWithDispatcherForTest = RequestInit & { dispatcher?: unknown };
+type TestDispatcher = {
+  isMockActive?: unknown;
+  dispatch(options: Record<string, unknown>, handler: unknown): boolean;
+};
+
 describe('callUpstream', () => {
+  afterEach(() => {
+    undiciMock.dispatch.mockClear();
+    undiciMock.getGlobalDispatcher.mockReset();
+  });
+
   it('aborts model upstream requests based on timeoutMs', async () => {
     vi.useFakeTimers();
     const originalFetch = global.fetch;
@@ -73,6 +117,131 @@ describe('callUpstream', () => {
     } finally {
       global.fetch = originalFetch;
       vi.useRealTimers();
+    }
+  });
+
+  it('passes timeout-aware dispatchers to upstream fetch', async () => {
+    const originalFetch = global.fetch;
+
+    try {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response('{}', { status: 200 })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      const response = await callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        600000
+      );
+
+      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+
+      expect(response.status).toBe(200);
+      expect(fetchInit?.dispatcher).toBeTruthy();
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('applies upstream timeouts through the current global dispatcher', async () => {
+    const originalFetch = global.fetch;
+    const globalDispatcher = { dispatch: undiciMock.dispatch };
+    undiciMock.getGlobalDispatcher.mockReturnValue(globalDispatcher);
+
+    try {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response('{}', { status: 200 })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      const response = await callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        600000
+      );
+
+      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+      const handler = {};
+      const dispatchResult = (fetchInit?.dispatcher as TestDispatcher | undefined)?.dispatch(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST'
+        },
+        handler
+      );
+
+      expect(response.status).toBe(200);
+      expect(dispatchResult).toBe(true);
+      expect(undiciMock.getGlobalDispatcher).toHaveBeenCalledTimes(1);
+      expect(undiciMock.dispatch).toHaveBeenCalledWith(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST',
+          bodyTimeout: 600000,
+          headersTimeout: 600000
+        },
+        handler
+      );
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('reflects MockAgent state from the current global dispatcher', async () => {
+    const originalFetch = global.fetch;
+    const globalDispatcher = { dispatch: undiciMock.dispatch, isMockActive: true };
+    undiciMock.getGlobalDispatcher.mockReturnValue(globalDispatcher);
+
+    try {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response('{}', { status: 200 })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      const response = await callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        600000
+      );
+
+      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+
+      expect(response.status).toBe(200);
+      expect((fetchInit?.dispatcher as TestDispatcher | undefined)?.isMockActive).toBe(true);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('does not pass a dispatcher when timeoutMs disables the application timer', async () => {
+    const originalFetch = global.fetch;
+
+    try {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response('{}', { status: 200 })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      const response = await callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        0
+      );
+
+      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+
+      expect(response.status).toBe(200);
+      expect(fetchInit?.dispatcher).toBeUndefined();
+      expect(undiciMock.getGlobalDispatcher).not.toHaveBeenCalled();
+    } finally {
+      global.fetch = originalFetch;
     }
   });
 

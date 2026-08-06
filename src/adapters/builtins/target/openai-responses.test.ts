@@ -3373,7 +3373,7 @@ describe('openAIResponsesTargetAdapter', () => {
       return;
     }
 
-    expect(parsed.value.output).toEqual([
+    expect(parsed.value.output).toMatchObject([
       {
         type: 'function_call',
         id: 'toolu_search',
@@ -3413,7 +3413,14 @@ describe('openAIResponsesTargetAdapter', () => {
     }
     expect(parsed.value.status).toBe('incomplete');
     expect(parsed.value.finish_reason).toBe('max_output_tokens');
-    expect(parsed.value.output).toEqual([]);
+    expect(parsed.value.output).toMatchObject([
+      {
+        type: 'provider_native_item',
+        item_type: 'tool_search_call',
+        provider_status: 'incomplete',
+        capture_state: 'complete'
+      }
+    ]);
   });
 
   it('passes explicit OpenAI Responses web_search tools through as hosted tools', () => {
@@ -3614,6 +3621,203 @@ describe('openAIResponsesTargetAdapter', () => {
           required: ['prompt']
         },
         description: 'Search the web.'
+      }
+    ]);
+  });
+
+  it('captures the complete ordered Responses output including phase, PTC, and compaction state', () => {
+    const rawOutput = [
+      {
+        type: 'reasoning',
+        id: 'rs_ordered',
+        status: 'completed',
+        summary: [{ type: 'summary_text', text: 'Plan the lookup.' }],
+        content: [{ type: 'reasoning_text', text: 'Use the program first.' }],
+        encrypted_content: 'encrypted-reasoning'
+      },
+      {
+        type: 'message',
+        id: 'msg_ordered',
+        role: 'assistant',
+        phase: 'commentary',
+        status: 'completed',
+        content: [{ type: 'output_text', text: 'Running the program.', annotations: [] }]
+      },
+      {
+        type: 'program',
+        id: 'prog_ordered',
+        status: 'completed',
+        code: 'const result = await lookup({ city: "Wuhu" });',
+        caller: { type: 'code_interpreter', id: 'caller_ordered' },
+        fingerprint: 'program-fingerprint'
+      },
+      {
+        type: 'program_output',
+        id: 'prog_output_ordered',
+        program_id: 'prog_ordered',
+        status: 'completed',
+        output: '22 C'
+      },
+      {
+        type: 'function_call',
+        id: 'fc_ordered',
+        call_id: 'call_ordered',
+        name: 'lookup',
+        arguments: '{"city":"Wuhu"}',
+        caller: { type: 'program', id: 'prog_ordered' },
+        status: 'completed'
+      },
+      {
+        type: 'function_call_output',
+        id: 'fco_ordered',
+        call_id: 'call_ordered',
+        output: '22 C',
+        status: 'completed'
+      },
+      {
+        type: 'compaction',
+        id: 'cmp_ordered',
+        encrypted_content: 'opaque-compacted-window',
+        status: 'completed'
+      }
+    ];
+    const parsed = openAIResponsesTargetAdapter.toStandardResponse({
+      id: 'resp_ordered_native_state',
+      model: 'gpt-5.6-sol',
+      status: 'completed',
+      output: rawOutput,
+      usage: { input_tokens: 12, output_tokens: 8, total_tokens: 20 }
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    expect(parsed.value.output.map((item) => item.type)).toEqual([
+      'reasoning',
+      'message',
+      'provider_native_item',
+      'provider_native_item',
+      'function_call',
+      'provider_native_item',
+      'provider_native_item'
+    ]);
+    expect(parsed.value.output[1]).toMatchObject({
+      type: 'message',
+      phase: 'commentary'
+    });
+    const nativeItems = parsed.value.output.map((item) =>
+      item.type === 'provider_native_item'
+        ? item
+        : 'native_item' in item
+          ? item.native_item
+          : undefined
+    );
+    expect(nativeItems.map((item) => item?.raw_payload)).toEqual(rawOutput);
+    expect(nativeItems.map((item) => item?.position.item)).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    expect(nativeItems.every((item) => item?.capture_state === 'complete')).toBe(true);
+    expect(nativeItems[6]).toMatchObject({
+      item_type: 'compaction',
+      compaction_mode: 'server_side'
+    });
+
+    const compactParsed = openAIResponsesTargetAdapter.toStandardResponse(
+      {
+        id: 'resp_standalone_compaction',
+        model: 'gpt-5.6-sol',
+        status: 'completed',
+        output: [rawOutput[6]]
+      },
+      {
+        standardRequest: {
+          model: 'gpt-5.6-sol',
+          input: 'compact this window',
+          openai_responses: { operation: 'compact' }
+        }
+      } as never
+    );
+    expect(compactParsed.ok).toBe(true);
+    if (compactParsed.ok) {
+      expect(compactParsed.value.output[0]).toMatchObject({
+        type: 'provider_native_item',
+        item_type: 'compaction',
+        compaction_mode: 'standalone',
+        capture_state: 'complete'
+      });
+    }
+  });
+
+  it('prunes only stateless server-side history before the latest compaction', () => {
+    const compaction = {
+      type: 'provider_native_item',
+      item_type: 'compaction',
+      native_id: 'cmp_latest',
+      raw_payload: {
+        type: 'compaction',
+        id: 'cmp_latest',
+        encrypted_content: 'opaque-window'
+      },
+      provider_schema_version: 'openai-responses-v1',
+      source_format: 'openai-responses-v1',
+      source_origin: {
+        provider: 'openai',
+        endpoint: 'openai-endpoint',
+        model: 'gpt-5.6-sol',
+        credentialScope: 'account-scope'
+      },
+      position: { turn: 1, step: 0, item: 0 },
+      capture_state: 'complete',
+      compaction_mode: 'server_side'
+    };
+    const request = {
+      model: 'gpt-5.6-sol',
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'history before compaction' }]
+        },
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [compaction],
+          native_items: [compaction]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'new delta' }]
+        }
+      ],
+      openai_responses: { operation: 'create' }
+    };
+
+    const serverSide = buildOpenAIResponsesBodyFromStandardRequest(request as never);
+    expect(serverSide.input).toEqual([
+      compaction.raw_payload,
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'new delta' }]
+      }
+    ]);
+
+    const standalone = buildOpenAIResponsesBodyFromStandardRequest({
+      ...request,
+      openai_responses: { operation: 'compact' }
+    } as never);
+    expect(standalone.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'history before compaction' }]
+      },
+      compaction.raw_payload,
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'new delta' }]
       }
     ]);
   });

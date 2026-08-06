@@ -1,14 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import type {
-  OpenAIResponsesReasoningHistoryPolicy,
+  NativeHistoryPolicy,
   OpenAIResponsesReasoningSummaryPolicy,
+  ProviderNativeItem,
   ProviderConfig,
   StandardRequest,
   StandardRequestInputContent,
   StandardRequestInputMessage,
   TargetAdapter
 } from '../../../types';
-import { ok } from '../../../types';
+import { err, ok } from '../../../types';
 import { asString, collectStandardInputMessages, isObject } from '../../../utils';
 import { buildOpenAIHeaders } from '../common';
 import { OPENAI_RESPONSES_REASONING_FORMAT } from '../reasoning-envelope';
@@ -126,6 +127,9 @@ export const openAIResponsesTargetAdapter: TargetAdapter = {
   providerTypes: ['openai_responses', 'openai_chat_completions'],
   providerFallback: true,
   buildRequestFromStandard(input) {
+    if (input.standardRequest.native_state_error) {
+      return err(input.standardRequest.native_state_error);
+    }
     const headersResult = buildOpenAIHeaders(input.request.headers, {
       ...input.config,
       openaiApiKey: input.targetProviderConfig?.apikey || input.config.openaiApiKey
@@ -192,14 +196,21 @@ export const openAIResponsesTargetAdapter: TargetAdapter = {
       input.targetProviderConfig?.baseurl || input.config.openaiBaseUrl
     );
 
+    const targetBaseUrl = input.targetProviderConfig?.baseurl || input.config.openaiBaseUrl;
+    const operation = input.standardRequest.openai_responses?.operation;
     return ok({
-      url: `${input.config.openaiBaseUrl}/responses`,
+      url: `${targetBaseUrl}/responses${operation === 'compact' ? '/compact' : ''}`,
       headers: headersResult.value,
       body
     });
   },
-  toStandardResponse(payload) {
-    return parseOpenAIToStandardResponse(payload);
+  toStandardResponse(payload, input) {
+    return parseOpenAIToStandardResponse(payload, {
+      compactionMode:
+        input?.standardRequest.openai_responses?.operation === 'compact'
+          ? 'standalone'
+          : 'server_side'
+    });
   }
 };
 
@@ -214,24 +225,28 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
     standardRequest.tools,
     standardRequest.tool_choice
   );
+  const projectedInput = standardInputToOpenAIResponsesInput(
+    standardRequest.input,
+    standardRequest.tools,
+    deferredToolSearch,
+    {
+      historyPolicy: resolveOpenAIResponsesReasoningHistoryPolicy(
+        targetProviderConfig,
+        standardRequest.model,
+        targetBaseUrl || targetProviderConfig?.baseurl
+      ),
+      summaryPolicy: resolveOpenAIResponsesReasoningSummaryPolicy(
+        targetProviderConfig,
+        standardRequest.model
+      )
+    }
+  );
   const body: Record<string, unknown> = {
     model: standardRequest.model,
     instructions: standardRequest.instructions,
-    input: standardInputToOpenAIResponsesInput(
-      standardRequest.input,
-      standardRequest.tools,
-      deferredToolSearch,
-      {
-        historyPolicy: resolveOpenAIResponsesReasoningHistoryPolicy(
-          targetProviderConfig,
-          standardRequest.model,
-          targetBaseUrl || targetProviderConfig?.baseurl
-        ),
-        summaryPolicy: resolveOpenAIResponsesReasoningSummaryPolicy(
-          targetProviderConfig,
-          standardRequest.model
-        )
-      }
+    input: pruneOpenAIResponsesInputBeforeLatestCompaction(
+      projectedInput,
+      standardRequest.openai_responses
     ),
     temperature: standardRequest.temperature,
     top_p: standardRequest.top_p,
@@ -258,6 +273,23 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
 
   if (standardRequest.stream === true) {
     body.stream = true;
+  }
+
+  const responsesOptions = standardRequest.openai_responses;
+  if (responsesOptions?.previous_response_id) {
+    body.previous_response_id = responsesOptions.previous_response_id;
+  }
+  if (responsesOptions?.store !== undefined) {
+    body.store = responsesOptions.store;
+  }
+  if (responsesOptions?.conversation !== undefined) {
+    body.conversation = responsesOptions.conversation;
+  }
+  if (responsesOptions?.context_management !== undefined) {
+    body.context_management = responsesOptions.context_management;
+  }
+  if (responsesOptions?.include !== undefined) {
+    body.include = responsesOptions.include;
   }
 
   applyOpenAIResponsesReasoningOptions(body, standardRequest, targetProviderConfig);
@@ -381,13 +413,13 @@ export function resolveOpenAIResponsesReasoningHistoryPolicy(
   targetProviderConfig: ProviderConfig | undefined,
   model: string | undefined,
   targetBaseUrl: string | undefined
-): Exclude<OpenAIResponsesReasoningHistoryPolicy, 'auto'> {
+): NativeHistoryPolicy {
   const configured =
     providerModelMetadata(targetProviderConfig, model)?.openaiResponsesReasoningHistoryPolicy ??
     targetProviderConfig?.openaiResponsesReasoningHistoryPolicy ??
     'auto';
   if (configured !== 'auto') {
-    return configured;
+    return configured === 'encrypted' ? 'native' : configured;
   }
 
   return inferOpenAIResponsesReasoningHistoryPolicy(targetBaseUrl);
@@ -406,7 +438,7 @@ function resolveOpenAIResponsesReasoningSummaryPolicy(
 
 function inferOpenAIResponsesReasoningHistoryPolicy(
   targetBaseUrl: string | undefined
-): Exclude<OpenAIResponsesReasoningHistoryPolicy, 'auto'> {
+): NativeHistoryPolicy {
   const value = targetBaseUrl?.trim();
   if (!value) {
     return 'strip';
@@ -417,10 +449,10 @@ function inferOpenAIResponsesReasoningHistoryPolicy(
     const hostname = url.hostname.toLowerCase();
     const pathname = url.pathname.replace(/\/+$/, '').toLowerCase();
     if (hostname === 'api.openai.com') {
-      return 'encrypted';
+      return 'native';
     }
     if (hostname === 'chatgpt.com' && pathname.startsWith('/backend-api/codex')) {
-      return 'encrypted';
+      return 'native';
     }
     if (hostname === 'api.deepseek.com') {
       return 'plaintext';
@@ -558,7 +590,7 @@ function standardInputToOpenAIChatMessages(
 function mapReasoningItemToOpenAIResponses(
   reasoning: StandardRequestReasoningContent,
   policy: {
-    historyPolicy: Exclude<OpenAIResponsesReasoningHistoryPolicy, 'auto'>;
+    historyPolicy: NativeHistoryPolicy;
     summaryPolicy: OpenAIResponsesReasoningSummaryPolicy;
   }
 ): Record<string, unknown> | undefined {
@@ -566,7 +598,7 @@ function mapReasoningItemToOpenAIResponses(
     return undefined;
   }
 
-  if (policy.historyPolicy === 'encrypted') {
+  if (policy.historyPolicy === 'native') {
     const id = reasoning.id;
     const encryptedContent = reasoning.encrypted_content;
     if (
@@ -581,7 +613,8 @@ function mapReasoningItemToOpenAIResponses(
       type: 'reasoning',
       id,
       summary: summary?.trim() ? [{ type: 'summary_text', text: summary }] : [],
-      encrypted_content: encryptedContent
+      encrypted_content: encryptedContent,
+      ...(reasoning.status ? { status: reasoning.status } : {})
     };
   }
 
@@ -600,8 +633,10 @@ function mapReasoningItemToOpenAIResponses(
   return {
     type: 'reasoning',
     id: reasoning.id?.trim() ? reasoning.id : `rs_${randomUUID().replace(/-/g, '')}`,
-    content: [{ type: 'reasoning_text', text: readableReasoning }]
+    content: [{ type: 'reasoning_text', text: readableReasoning }],
+    ...(reasoning.status ? { status: reasoning.status } : {})
   };
+
 }
 
 function standardInputToOpenAIResponsesInput(
@@ -609,7 +644,7 @@ function standardInputToOpenAIResponsesInput(
   tools?: unknown[],
   deferredToolSearch?: DeferredToolSearchPlan,
   reasoningPolicy: {
-    historyPolicy: Exclude<OpenAIResponsesReasoningHistoryPolicy, 'auto'>;
+    historyPolicy: NativeHistoryPolicy;
     summaryPolicy: OpenAIResponsesReasoningSummaryPolicy;
   } = { historyPolicy: 'strip', summaryPolicy: 'drop' }
 ): string | Array<Record<string, unknown>> {
@@ -620,10 +655,30 @@ function standardInputToOpenAIResponsesInput(
   const items: Array<Record<string, unknown>> = [];
   for (const message of collectStandardInputMessages(input)) {
     const role = message.role === 'assistant' ? 'assistant' : 'user';
-    const text = extractStandardInputTextContent(message.content);
+    const replayedNativeItems = [...(message.native_items || [])]
+      .sort(compareProviderNativeItemPosition);
+    for (const nativeItem of replayedNativeItems) {
+      items.push(projectProviderNativeItemToOpenAIResponses(nativeItem));
+    }
+    const replayedNativeSet = new Set(replayedNativeItems);
+    const replayedTypes = new Set(replayedNativeItems.map((item) => item.item_type));
+    const messageContent = message.content.filter((item) => {
+      if (item.type === 'provider_native_item') {
+        return !replayedNativeSet.has(item);
+      }
+      const nativeItem = 'native_item' in item ? item.native_item : undefined;
+      if (nativeItem && replayedNativeSet.has(nativeItem)) {
+        return false;
+      }
+      if (item.type === 'input_text' && replayedTypes.has('message')) {
+        return false;
+      }
+      return true;
+    });
+    const text = extractStandardInputTextContent(messageContent);
 
     if (message.role === 'assistant') {
-      const reasoningItems = message.content.filter(
+      const reasoningItems = messageContent.filter(
         (item): item is StandardRequestReasoningContent => item.type === 'reasoning'
       );
       for (const reasoning of reasoningItems) {
@@ -636,7 +691,10 @@ function standardInputToOpenAIResponsesInput(
       if (text) {
         items.push({
           type: 'message',
+          ...(message.id ? { id: message.id } : {}),
           role,
+          ...(message.status ? { status: message.status } : {}),
+          ...(message.phase ? { phase: message.phase } : {}),
           content: [
             {
               type: 'output_text',
@@ -646,7 +704,7 @@ function standardInputToOpenAIResponsesInput(
         });
       }
 
-      for (const item of message.content) {
+      for (const item of messageContent) {
         if (item.type === 'tool_search_call') {
           items.push({
             type: 'tool_search_call',
@@ -679,10 +737,13 @@ function standardInputToOpenAIResponsesInput(
         const splitName = splitNamespacedToolCallName(item.name, tools);
         items.push({
           type: 'function_call',
+          ...(item.native_id ? { id: item.native_id } : {}),
           call_id: item.id,
           name: splitName.name,
           ...(splitName.namespace ? { namespace: splitName.namespace } : {}),
-          arguments: normalizeFunctionArguments(item.input)
+          arguments: normalizeFunctionArguments(item.input),
+          ...(item.status ? { status: item.status } : {}),
+          ...(item.caller ? { caller: item.caller } : {})
         });
       }
       continue;
@@ -691,7 +752,10 @@ function standardInputToOpenAIResponsesInput(
     if (text) {
       items.push({
         type: 'message',
+        ...(message.id ? { id: message.id } : {}),
         role,
+        ...(message.status ? { status: message.status } : {}),
+        ...(message.phase ? { phase: message.phase } : {}),
         content: [
           {
             type: 'input_text',
@@ -701,7 +765,7 @@ function standardInputToOpenAIResponsesInput(
       });
     }
 
-    for (const item of message.content) {
+    for (const item of messageContent) {
       if (item.type !== 'tool_search_output') {
         continue;
       }
@@ -714,7 +778,7 @@ function standardInputToOpenAIResponsesInput(
       });
     }
 
-    const toolResults = collectUserToolResults(message.content);
+    const toolResults = collectUserToolResults(messageContent);
     for (const toolResult of toolResults) {
       const discovery = deferredToolSearch?.discoveries.get(toolResult.tool_call_id);
       if (discovery && deferredToolSearch) {
@@ -760,17 +824,55 @@ function standardInputToOpenAIResponsesInput(
 
       items.push({
         type: 'function_call_output',
+        ...(toolResult.native_id ? { id: toolResult.native_id } : {}),
         call_id: toolResult.tool_call_id,
         output: appendToolReferencesToResultContent(
           toolResult.content,
           toolResult.tool_references,
           tools
-        )
+        ),
+        ...(toolResult.status ? { status: toolResult.status } : {}),
+        ...(toolResult.caller ? { caller: toolResult.caller } : {})
       });
     }
   }
 
   return items;
+}
+
+function compareProviderNativeItemPosition(
+  left: ProviderNativeItem,
+  right: ProviderNativeItem
+): number {
+  return left.position.turn - right.position.turn ||
+    left.position.step - right.position.step ||
+    left.position.item - right.position.item;
+}
+
+function projectProviderNativeItemToOpenAIResponses(
+  item: ProviderNativeItem
+): Record<string, unknown> {
+  return { ...item.raw_payload };
+}
+
+function pruneOpenAIResponsesInputBeforeLatestCompaction(
+  input: string | Array<Record<string, unknown>>,
+  options: StandardRequest['openai_responses']
+): string | Array<Record<string, unknown>> {
+  if (
+    typeof input === 'string' ||
+    options?.operation === 'compact' ||
+    options?.previous_response_id
+  ) {
+    return input;
+  }
+  let latestCompactionIndex = -1;
+  for (let index = 0; index < input.length; index += 1) {
+    if (asString(input[index]?.type) === 'compaction') {
+      latestCompactionIndex = index;
+    }
+  }
+  return latestCompactionIndex > 0 ? input.slice(latestCompactionIndex) : input;
 }
 
 function extractStandardInputTextContent(content: StandardRequestInputContent[]): string {
@@ -905,17 +1007,23 @@ function collectUserToolResults(
   includeToolSearchOutputs = false
 ): Array<{
   tool_call_id: string;
+  native_id?: string;
   content: string;
+  status?: string;
   is_error?: boolean;
   result_format?: 'function' | 'web_search';
   tool_references?: string[];
+  caller?: Record<string, unknown>;
 }> {
   const toolResults: Array<{
     tool_call_id: string;
+    native_id?: string;
     content: string;
+    status?: string;
     is_error?: boolean;
     result_format?: 'function' | 'web_search';
     tool_references?: string[];
+    caller?: Record<string, unknown>;
   }> = [];
   for (const item of content) {
     if (item.type === 'tool_search_output') {
@@ -934,10 +1042,13 @@ function collectUserToolResults(
 
     toolResults.push({
       tool_call_id: item.tool_use_id,
+      native_id: item.native_id,
       content: item.content,
+      status: item.status,
       is_error: item.is_error,
       result_format: item.result_format,
-      tool_references: item.tool_references
+      tool_references: item.tool_references,
+      caller: item.caller
     });
   }
 

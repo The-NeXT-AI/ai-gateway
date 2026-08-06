@@ -5,6 +5,14 @@ import {
   parseOpenAIChatCompletionsRequest,
   parseOpenAIResponsesRequest
 } from './parsers';
+import {
+  encodeReasoningTransportEnvelope,
+  OPENAI_RESPONSES_REASONING_FORMAT
+} from '../reasoning-envelope';
+import {
+  deriveProviderNativeGroups,
+  prepareReasoningStateForTargetResult
+} from '../../../gateway/reasoning-state';
 
 describe('parseOpenAIResponsesRequest', () => {
   it('parses function_call_output as tool_result content', () => {
@@ -24,7 +32,7 @@ describe('parseOpenAIResponsesRequest', () => {
       return;
     }
 
-    expect(result.value.input).toEqual([
+    expect(result.value.input).toMatchObject([
       {
         type: 'message',
         role: 'user',
@@ -54,7 +62,7 @@ describe('parseOpenAIResponsesRequest', () => {
       return;
     }
 
-    expect(result.value.input).toEqual([
+    expect(result.value.input).toMatchObject([
       {
         type: 'message',
         role: 'assistant',
@@ -70,6 +78,7 @@ describe('parseOpenAIResponsesRequest', () => {
         ]
       }
     ]);
+    expect((result.value.input as any[])[0].content[0].native_item).toBeUndefined();
   });
 
   it('coalesces reasoning output items with following function calls', () => {
@@ -105,7 +114,7 @@ describe('parseOpenAIResponsesRequest', () => {
       return;
     }
 
-    expect(result.value.input).toEqual([
+    expect(result.value.input).toMatchObject([
       {
         type: 'message',
         role: 'assistant',
@@ -146,6 +155,186 @@ describe('parseOpenAIResponsesRequest', () => {
         ]
       }
     ]);
+    const messages = result.value.input as any[];
+    expect(messages[0].content[0].native_item).toBeUndefined();
+    expect(messages[0].content[1].native_item).toBeUndefined();
+    expect(messages[1].content[0].native_item).toBeUndefined();
+  });
+
+  it('reconstructs one complete native dependency group from a v3 reasoning carrier and exact tool items', () => {
+    const origin = {
+      provider: 'openai',
+      endpoint: 'responses-endpoint',
+      model: 'gpt-5.6-sol',
+      credentialScope: 'responses-account'
+    };
+    const encryptedContent = encodeReasoningTransportEnvelope(
+      OPENAI_RESPONSES_REASONING_FORMAT,
+      'opaque-reasoning',
+      'rs_native',
+      'encrypted',
+      origin,
+      {
+        nativeItem: {
+          item_type: 'reasoning',
+          native_id: 'rs_native',
+          raw_payload: {
+            type: 'reasoning',
+            id: 'rs_native',
+            status: 'completed',
+            summary: [],
+            encrypted_content: 'opaque-reasoning'
+          },
+          provider_schema_version: 'openai-responses-v1',
+          item_origin: 'native',
+          position: { turn: 0, step: 0, item: 0 },
+          capture_state: 'complete'
+        }
+      }
+    );
+    const result = parseOpenAIResponsesRequest({
+      input: [
+        {
+          type: 'reasoning',
+          id: 'rs_native',
+          status: 'completed',
+          summary: [],
+          encrypted_content: encryptedContent
+        },
+        {
+          type: 'function_call',
+          id: 'fc_weather',
+          call_id: 'call_weather',
+          name: 'get_weather',
+          arguments: '{ "city": "Shanghai" }',
+          status: 'completed'
+        },
+        {
+          type: 'function_call_output',
+          id: 'fco_weather',
+          call_id: 'call_weather',
+          output: '{"temperature":22}',
+          status: 'completed'
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    const messages = result.value.input as any[];
+    const reasoning = messages[0].content[0].native_item;
+    const call = messages[0].content[1].native_item;
+    const output = messages[1].content[0].native_item;
+    expect(reasoning).toMatchObject({
+      item_type: 'reasoning',
+      native_id: 'rs_native',
+      capture_state: 'complete'
+    });
+    expect(call).toMatchObject({
+      item_type: 'function_call',
+      native_id: 'fc_weather',
+      call_id: 'call_weather',
+      pair_id: 'call_weather',
+      depends_on: ['rs_native'],
+      capture_state: 'complete',
+      raw_payload: {
+        type: 'function_call',
+        id: 'fc_weather',
+        call_id: 'call_weather',
+        arguments: '{ "city": "Shanghai" }'
+      }
+    });
+    expect(output).toMatchObject({
+      item_type: 'function_call_output',
+      native_id: 'fco_weather',
+      call_id: 'call_weather',
+      pair_id: 'call_weather',
+      depends_on: ['fc_weather'],
+      capture_state: 'complete'
+    });
+    expect(call.group_id).toBe(reasoning.group_id);
+    expect(output.group_id).toBe(reasoning.group_id);
+    expect(deriveProviderNativeGroups(result.value)).toMatchObject([
+      {
+        state: 'active_waiting_model',
+        active: true,
+        items: expect.arrayContaining([reasoning, call, output])
+      }
+    ]);
+  });
+
+  it('rejects an active reconstructed Responses tool group when its native route changes', () => {
+    const origin = {
+      provider: 'openai',
+      endpoint: 'responses-endpoint',
+      model: 'gpt-5.6-sol',
+      credentialScope: 'responses-account'
+    };
+    const encryptedContent = encodeReasoningTransportEnvelope(
+      OPENAI_RESPONSES_REASONING_FORMAT,
+      'opaque-reasoning',
+      'rs_active',
+      'encrypted',
+      origin,
+      {
+        nativeItem: {
+          item_type: 'reasoning',
+          native_id: 'rs_active',
+          raw_payload: {
+            type: 'reasoning',
+            id: 'rs_active',
+            status: 'completed',
+            summary: [],
+            encrypted_content: 'opaque-reasoning'
+          },
+          provider_schema_version: 'openai-responses-v1',
+          item_origin: 'native',
+          position: { turn: 0, step: 0, item: 0 },
+          capture_state: 'complete'
+        }
+      }
+    );
+    const parsed = parseOpenAIResponsesRequest({
+      input: [
+        {
+          type: 'reasoning',
+          id: 'rs_active',
+          encrypted_content: encryptedContent
+        },
+        {
+          type: 'function_call',
+          id: 'fc_active',
+          call_id: 'call_active',
+          name: 'lookup',
+          arguments: '{}'
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect(deriveProviderNativeGroups(parsed.value)).toMatchObject([
+      { state: 'active_waiting_tool', active: true }
+    ]);
+    expect(
+      prepareReasoningStateForTargetResult(
+        parsed.value,
+        OPENAI_RESPONSES_REASONING_FORMAT,
+        {
+          ...origin,
+          model: 'gpt-5.6-terra'
+        },
+        { historyPolicy: 'native' }
+      )
+    ).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('incompatible_active_native_group')
+    });
   });
 
   it('parses reasoning output items without serializing them as user text', () => {
@@ -174,7 +363,7 @@ describe('parseOpenAIResponsesRequest', () => {
       return;
     }
 
-    expect(result.value.input).toEqual([
+    expect(result.value.input).toMatchObject([
       {
         type: 'message',
         role: 'assistant',
@@ -220,7 +409,7 @@ describe('parseOpenAIResponsesRequest', () => {
       return;
     }
 
-    expect(result.value.input).toEqual([
+    expect(result.value.input).toMatchObject([
       {
         type: 'message',
         role: 'user',
@@ -362,7 +551,7 @@ describe('parseAnthropicMessagesRequest', () => {
       return;
     }
 
-    expect(result.value.input).toEqual([
+    expect(result.value.input).toMatchObject([
       {
         type: 'message',
         role: 'assistant',
@@ -404,6 +593,87 @@ describe('parseAnthropicMessagesRequest', () => {
         ]
       }
     ]);
+    const messages = result.value.input as any[];
+    expect(messages[0].content[0].native_item).toMatchObject({
+      item_type: 'thinking',
+      capture_state: 'partial',
+      provider_mode: 'default',
+      raw_payload: {
+        type: 'thinking',
+        thinking: 'anthropic thinking',
+        signature: 'sig_123'
+      }
+    });
+    expect(messages[0].content[1].native_item).toMatchObject({
+      item_type: 'tool_use',
+      group_id: 'toolu_weather',
+      provider_mode: 'default',
+      capture_state: 'partial'
+    });
+    expect(messages[1].content[0].native_item).toMatchObject({
+      item_type: 'tool_result',
+      group_id: 'toolu_weather',
+      provider_mode: 'default',
+      capture_state: 'partial'
+    });
+  });
+
+  it('reanalyzes an origin-bearing v2 thinking carrier into a complete native tool group', () => {
+    const origin = {
+      provider: 'anthropic',
+      endpoint: 'anthropic-endpoint',
+      model: 'claude-sonnet-4-5',
+      credentialScope: 'anthropic-account'
+    };
+    const signature = `ccr-reasoning-transport-v2:${Buffer.from(JSON.stringify({
+      format: 'anthropic-claude-v1',
+      data: 'v2-signature',
+      kind: 'signature',
+      origin
+    }), 'utf8').toString('base64url')}`;
+    const result = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 128,
+      thinking: { type: 'adaptive' },
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: '', signature },
+            {
+              type: 'tool_use',
+              id: 'toolu_v2',
+              name: 'lookup',
+              input: { key: 'value' }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+    const [reasoning, toolUse] = result.value.input[0]!.content as any[];
+    expect(reasoning.native_item).toMatchObject({
+      item_type: 'thinking',
+      raw_payload: {
+        type: 'thinking',
+        thinking: '',
+        signature: 'v2-signature'
+      },
+      source_origin: origin,
+      group_id: 'toolu_v2',
+      capture_state: 'complete',
+      provider_mode: 'adaptive'
+    });
+    expect(toolUse.native_item).toMatchObject({
+      item_type: 'tool_use',
+      group_id: 'toolu_v2',
+      capture_state: 'complete',
+      provider_mode: 'adaptive'
+    });
   });
 
   it('keeps top-level thinking controls for protocol conversion', () => {
@@ -587,7 +857,7 @@ describe('parseOpenAIChatCompletionsRequest', () => {
       return;
     }
 
-    expect(result.value.input[0]?.content).toContainEqual({
+    expect(result.value.input[0]?.content).toContainEqual(expect.objectContaining({
       type: 'reasoning',
       id: 'rs_chat_reasoning_1',
       source_format: 'openai-responses-v1',
@@ -601,7 +871,7 @@ describe('parseOpenAIChatCompletionsRequest', () => {
           index: 0
         }
       ]
-    });
+    }));
   });
 
   it('keeps OpenAI-compatible reasoning_effort as standard reasoning effort', () => {
@@ -793,7 +1063,7 @@ describe('parseGeminiGenerateContentRequest', () => {
     expect(result.value.thinking).toEqual({
       type: 'enabled'
     });
-    expect(result.value.input).toEqual([
+    expect(result.value.input).toMatchObject([
       {
         type: 'message',
         role: 'assistant',
@@ -885,7 +1155,7 @@ describe('parseGeminiGenerateContentRequest', () => {
       return;
     }
 
-    expect(result.value.input[0]?.content).toContainEqual({
+    expect(result.value.input[0]?.content).toContainEqual(expect.objectContaining({
       type: 'reasoning',
       id: 'rs_gemini_reasoning_1',
       source_format: 'openai-responses-v1',
@@ -899,6 +1169,6 @@ describe('parseGeminiGenerateContentRequest', () => {
           index: 0
         }
       ]
-    });
+    }));
   });
 });

@@ -649,7 +649,7 @@ describe('gateway routes protocol conversion', () => {
         ]
       });
       const secondInput = upstreamBodies[1]?.input as Array<Record<string, unknown>>;
-      expect(secondInput[1]).not.toHaveProperty('status');
+      expect(secondInput[1]).toHaveProperty('status', 'completed');
     } finally {
       await app.close();
     }
@@ -729,7 +729,7 @@ describe('gateway routes protocol conversion', () => {
       expect(firstResponse.statusCode).toBe(200);
       expect(firstResponse.headers['content-type']).toContain('text/event-stream');
       expect(firstResponse.body).toContain('"type":"redacted_thinking"');
-      expect(firstResponse.body).toContain('ccr-reasoning-transport-v2:');
+      expect(firstResponse.body).toContain('ccr-reasoning-transport-v3:');
       expect(firstResponse.body).not.toContain('encrypted-stream-reasoning');
 
       const eventPayloads = firstResponse.body
@@ -805,7 +805,7 @@ describe('gateway routes protocol conversion', () => {
         ]
       });
       const secondInput = upstreamBodies[1]?.input as Array<Record<string, unknown>>;
-      expect(secondInput[1]).not.toHaveProperty('status');
+      expect(secondInput[1]).toHaveProperty('status', 'completed');
     } finally {
       await app.close();
     }
@@ -1155,7 +1155,7 @@ describe('gateway routes protocol conversion', () => {
         throw new Error('Expected a Gemini thought part with a reasoning signature.');
       }
       expect(thoughtPart.thoughtSignature).toEqual(
-        expect.stringMatching(/^ccr-reasoning-transport-v2:/)
+        expect.stringMatching(/^ccr-reasoning-transport-v3:/)
       );
       expect(decodeReasoningTransportEnvelope(String(thoughtPart.thoughtSignature))).toMatchObject({
         format: 'openai-responses-v1',
@@ -1225,7 +1225,7 @@ describe('gateway routes protocol conversion', () => {
         ]
       });
       const secondInput = upstreamBodies[1]?.input as Array<Record<string, unknown>>;
-      expect(secondInput[1]).not.toHaveProperty('status');
+      expect(secondInput[1]).toHaveProperty('status', 'completed');
     } finally {
       await app.close();
     }
@@ -4820,7 +4820,7 @@ describe('gateway routes protocol conversion', () => {
       expect(first.statusCode).toBe(200);
       const firstPayload = JSON.parse(first.body) as Record<string, any>;
       const carrier = firstPayload.output[0].encrypted_content as string;
-      expect(carrier).toMatch(/^ccr-reasoning-transport-v2:/);
+      expect(carrier).toMatch(/^ccr-reasoning-transport-v3:/);
       expect(decodeReasoningTransportEnvelope(carrier)).toMatchObject({
         data: 'encrypted-state-from-a',
         origin: {

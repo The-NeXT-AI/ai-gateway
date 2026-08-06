@@ -119,6 +119,19 @@ export function registerGatewayRoutes(
     );
   });
 
+  fastify.post('/v1/responses/compact', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+    return handleGatewayRequest(
+      request,
+      reply,
+      {
+        adapterKey: 'openai_responses',
+        metadata: { operation: 'compact' }
+      },
+      config,
+      runtime
+    );
+  });
+
   fastify.post('/v1/embeddings', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
     return handleOpenAIEmbeddingsRequest(request, reply, config, runtime);
   });

@@ -700,6 +700,49 @@ describe('buildGatewayBillingTraceSnapshot', () => {
 
     expect(trace?.response?.statusCode).toBe(200);
   });
+
+  it('redacts provider-native state from request and response trace bodies', () => {
+    const trace = buildGatewayBillingTraceSnapshot(
+      {
+        headers: {},
+        body: {
+          model: 'gpt-5.6-sol',
+          encrypted_content: 'request-ciphertext',
+          signature: 'request-signature',
+          raw_payload: { hidden: 'request-native-payload' },
+          carrier: 'ccr-reasoning-transport-v3:request-carrier',
+          visible: 'keep this'
+        }
+      } as any,
+      {
+        statusCode: 200,
+        getHeaders: () => ({})
+      } as any,
+      {
+        responseBody: {
+          thoughtSignature: 'response-signature',
+          fingerprint: 'response-fingerprint',
+          visible: 'keep response'
+        }
+      }
+    );
+
+    expect(trace?.request?.body).toMatchObject({
+      model: 'gpt-5.6-sol',
+      encrypted_content: '***',
+      signature: '***',
+      raw_payload: '***',
+      carrier: '***',
+      visible: 'keep this'
+    });
+    expect(trace?.response?.body).toMatchObject({
+      thoughtSignature: '***',
+      fingerprint: '***',
+      visible: 'keep response'
+    });
+    expect(JSON.stringify(trace)).not.toContain('request-ciphertext');
+    expect(JSON.stringify(trace)).not.toContain('response-fingerprint');
+  });
 });
 
 describe('extractGatewayRequestClientContext', () => {

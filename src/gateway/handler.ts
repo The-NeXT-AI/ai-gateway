@@ -70,6 +70,7 @@ import {
   applyOpenAIChatStreamUsageOption,
   rewriteOpenAIChatCompatibleRequest
 } from '../adapters/builtins/target/shared';
+import { resolveOpenAIResponsesReasoningHistoryPolicy } from '../adapters/builtins/target/openai-responses';
 import type { GatewayRuntime } from './runtime';
 import { applyHealthAwareRouting } from './health-routing';
 import { evaluateGatewayPolicy, type GatewayPolicyResult } from './policy';
@@ -100,7 +101,10 @@ import {
 } from '../raw-trace';
 import { matchesAnyPattern } from '../shared/pattern';
 import { evaluateApiKeyModelRestriction } from './auth';
-import { containsReasoningTransportCarrier } from '../adapters/builtins/reasoning-envelope';
+import {
+  containsReasoningTransportCarrier,
+  validateReasoningTransportCarriers
+} from '../adapters/builtins/reasoning-envelope';
 import {
   attachReasoningStateOrigin,
   buildReasoningStateOrigin,
@@ -297,6 +301,17 @@ export async function handleGatewayRequest(
     return sendBadRequest(reply, 'Request body must be a JSON object.');
   }
 
+  const carrierValidation = validateReasoningTransportCarriers(body, config.bodyLimitBytes);
+  if (!carrierValidation.ok) {
+    return reply.code(carrierValidation.status).send({
+      error: {
+        message: carrierValidation.message,
+        type: 'invalid_request_error',
+        code: carrierValidation.code
+      }
+    });
+  }
+
   const adapterInput = {
     request,
     body,
@@ -394,7 +409,22 @@ export async function handleGatewayRequest(
       continue;
     }
 
+    const carrierFreeSourceModel = resolvePassthroughModel(body, source);
+    const carrierFreeTargetModel = resolveTargetModel(
+      request,
+      target,
+      carrierFreeSourceModel,
+      config
+    );
+    const carrierFreeRouteUnchanged =
+      targetIndex === 0 &&
+      targetProviders.length === 1 &&
+      !readHeader(request.headers['x-target-model']) &&
+      carrierFreeTargetModel.ok &&
+      carrierFreeTargetModel.value === carrierFreeSourceModel;
+
     if (
+      carrierFreeRouteUnchanged &&
       canPassthroughWithoutProtocolConversion(
         source.adapterKey,
         sourceAdapter.provider,
@@ -708,8 +738,24 @@ export async function handleGatewayRequest(
           const wrapped = wrapPassthroughReasoningPayload(
             transformedPayload,
             source.adapterKey,
-            passthroughReasoningOrigin
+            passthroughReasoningOrigin,
+            source.metadata?.operation === 'compact'
+              ? { compactionMode: 'standalone' }
+              : undefined
           );
+          const carrierOutputValidation = validateReasoningTransportCarriers(
+            wrapped.payload,
+            config.bodyLimitBytes
+          );
+          if (!carrierOutputValidation.ok) {
+            return reply.code(carrierOutputValidation.status).send({
+              error: {
+                type: carrierOutputValidation.status === 413 ? 'request_too_large' : 'invalid_request_error',
+                code: carrierOutputValidation.code,
+                message: carrierOutputValidation.message
+              }
+            });
+          }
           return relayUpstreamResponseWithPayload(reply, upstreamResponse, wrapped.payload);
         }
         if (isJsonContentType(upstreamResponse.headers.get('content-type'))) {
@@ -722,9 +768,25 @@ export async function handleGatewayRequest(
           const wrapped = wrapPassthroughReasoningPayload(
             passthroughPayload,
             source.adapterKey,
-            passthroughReasoningOrigin
+            passthroughReasoningOrigin,
+            source.metadata?.operation === 'compact'
+              ? { compactionMode: 'standalone' }
+              : undefined
           );
           if (wrapped.changed) {
+            const carrierOutputValidation = validateReasoningTransportCarriers(
+              wrapped.payload,
+              config.bodyLimitBytes
+            );
+            if (!carrierOutputValidation.ok) {
+              return reply.code(carrierOutputValidation.status).send({
+                error: {
+                  type: carrierOutputValidation.status === 413 ? 'request_too_large' : 'invalid_request_error',
+                  code: carrierOutputValidation.code,
+                  message: carrierOutputValidation.message
+                }
+              });
+            }
             return relayUpstreamResponseWithPayload(reply, upstreamResponse, wrapped.payload);
           }
         }
@@ -776,7 +838,8 @@ export async function handleGatewayRequest(
             upstreamResponse,
             source.adapterKey,
             passthroughReasoningOrigin,
-            clientAbortSignal
+            clientAbortSignal,
+            config.bodyLimitBytes
           ),
           clientAbortSignal
         );
@@ -870,7 +933,14 @@ export async function handleGatewayRequest(
       const standardRequest = prepareReasoningStateForTarget(
         unfilteredStandardRequest,
         resolveReasoningTargetFormat(targetProvider, targetProviderConfig),
-        reasoningOrigin
+        reasoningOrigin,
+        buildNativeStatePreparationOptions(
+          config,
+          targetProviderConfig,
+          model,
+          resolveReasoningTargetFormat(targetProvider, targetProviderConfig),
+          targetIndex > 0
+        )
       );
 
       const targetRequestResult = targetAdapter.buildRequestFromStandard({
@@ -1047,7 +1117,8 @@ export async function handleGatewayRequest(
           upstreamResponse,
           standardRequest,
           clientAbortSignal,
-          reasoningOrigin
+          reasoningOrigin,
+          config.bodyLimitBytes
         );
       }
 
@@ -1178,7 +1249,11 @@ export async function handleGatewayRequest(
 
       standardResponseResult = {
         ok: true,
-        value: attachReasoningStateOrigin(standardResponseResult.value, reasoningOrigin)
+        value: attachReasoningStateOrigin(
+          standardResponseResult.value,
+          reasoningOrigin,
+          resolveReasoningTargetFormat(targetProvider, targetProviderConfig)
+        )
       };
 
       const sourceStandardResponse = prepareStandardResponseForSource(
@@ -1208,7 +1283,12 @@ export async function handleGatewayRequest(
         }
       );
       attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
-      return relayConvertedStreamFromStandardResponse(reply, source, sourceStandardResponse);
+      return relayConvertedStreamFromStandardResponse(
+        reply,
+        source,
+        sourceStandardResponse,
+        config.bodyLimitBytes
+      );
     }
 
     if (!baseStandardRequest) {
@@ -1294,7 +1374,14 @@ export async function handleGatewayRequest(
     const standardRequest = prepareReasoningStateForTarget(
       unfilteredStandardRequest,
       resolveReasoningTargetFormat(targetProvider, targetProviderConfig),
-      reasoningOrigin
+      reasoningOrigin,
+      buildNativeStatePreparationOptions(
+        config,
+        targetProviderConfig,
+        model,
+        resolveReasoningTargetFormat(targetProvider, targetProviderConfig),
+        targetIndex > 0
+      )
     );
 
     const targetRequestResult = targetAdapter.buildRequestFromStandard({
@@ -1555,7 +1642,11 @@ export async function handleGatewayRequest(
 
     standardResponseResult = {
       ok: true,
-      value: attachReasoningStateOrigin(standardResponseResult.value, reasoningOrigin)
+      value: attachReasoningStateOrigin(
+        standardResponseResult.value,
+        reasoningOrigin,
+        resolveReasoningTargetFormat(targetProvider, targetProviderConfig)
+      )
     };
 
     const transparentToolExecutionResult = await runTransparentToolExecutionLoop({
@@ -1600,6 +1691,19 @@ export async function handleGatewayRequest(
       source,
       config
     });
+    const carrierOutputValidation = validateReasoningTransportCarriers(
+      sourcePayload,
+      config.bodyLimitBytes
+    );
+    if (!carrierOutputValidation.ok) {
+      return reply.code(carrierOutputValidation.status).send({
+        error: {
+          type: carrierOutputValidation.status === 413 ? 'request_too_large' : 'invalid_request_error',
+          code: carrierOutputValidation.code,
+          message: carrierOutputValidation.message
+        }
+      });
+    }
 
     attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
     attachBillingHeaders(
@@ -1838,7 +1942,14 @@ async function runTransparentToolExecutionLoop(input: {
     const targetWorkingRequest = prepareReasoningStateForTarget(
       workingRequest,
       reasoningTargetFormat,
-      reasoningOrigin
+      reasoningOrigin,
+      buildNativeStatePreparationOptions(
+        input.config,
+        input.targetProviderConfig,
+        input.model,
+        reasoningTargetFormat,
+        input.state.attempts.length > 0
+      )
     );
 
     const targetRequestResult = input.targetAdapter.buildRequestFromStandard({
@@ -2047,7 +2158,8 @@ async function runTransparentToolExecutionLoop(input: {
           lastAttemptSequence = retryResult.attemptSequence;
           lastResponse = attachReasoningStateOrigin(
             retryResult.standardResponse,
-            reasoningOrigin
+            reasoningOrigin,
+            reasoningTargetFormat
           );
           aggregatedUsage = mergeStandardUsage(aggregatedUsage, lastResponse.usage);
           continue;
@@ -2056,7 +2168,11 @@ async function runTransparentToolExecutionLoop(input: {
       return { ok: false, upstreamAttemptSequence };
     }
 
-    lastResponse = attachReasoningStateOrigin(standardResponseResult.value, reasoningOrigin);
+    lastResponse = attachReasoningStateOrigin(
+      standardResponseResult.value,
+      reasoningOrigin,
+      reasoningTargetFormat
+    );
     aggregatedUsage = mergeStandardUsage(aggregatedUsage, lastResponse.usage);
   }
 }
@@ -2352,7 +2468,14 @@ async function handleVirtualModelRequest(
       const targetWorkingRequest = prepareReasoningStateForTarget(
         workingRequest,
         reasoningTargetFormat,
-        reasoningOrigin
+        reasoningOrigin,
+        buildNativeStatePreparationOptions(
+          config,
+          targetProviderConfig,
+          model,
+          reasoningTargetFormat,
+          targetIndex > 0
+        )
       );
       const targetRequestResult = targetAdapter.buildRequestFromStandard({
         request,
@@ -2468,7 +2591,8 @@ async function handleVirtualModelRequest(
           upstreamResponse,
           targetWorkingRequest,
           clientAbortSignal,
-          reasoningOrigin
+          reasoningOrigin,
+          config.bodyLimitBytes
         );
       }
 
@@ -2664,7 +2788,11 @@ async function handleVirtualModelRequest(
       if (!parsedStandardResponse) {
         break;
       }
-      lastResponse = attachReasoningStateOrigin(parsedStandardResponse, reasoningOrigin);
+      lastResponse = attachReasoningStateOrigin(
+        parsedStandardResponse,
+        reasoningOrigin,
+        reasoningTargetFormat
+      );
       aggregatedUsage = mergeStandardUsage(aggregatedUsage, lastResponse.usage);
       const functionCalls = extractFunctionCallsFromStandardResponse(lastResponse);
       const callPartition = partitionVirtualFunctionCalls(
@@ -3959,7 +4087,8 @@ async function* runOptimisticVirtualModelStream(input: {
 
       const lastResponse = attachReasoningStateOrigin(
         standardResponseResult.value,
-        reasoningOrigin
+        reasoningOrigin,
+        reasoningTargetFormat
       );
       aggregatedUsage = mergeStandardUsage(aggregatedUsage, lastResponse.usage);
       const functionCalls = extractFunctionCallsFromStandardResponse(lastResponse);
@@ -4052,7 +4181,14 @@ async function* runOptimisticVirtualModelStream(input: {
       const targetWorkingRequest = prepareReasoningStateForTarget(
         workingRequest,
         reasoningTargetFormat,
-        reasoningOrigin
+        reasoningOrigin,
+        buildNativeStatePreparationOptions(
+          input.config,
+          input.targetProviderConfig,
+          input.model,
+          reasoningTargetFormat,
+          false
+        )
       );
 
       const targetRequestResult = input.targetAdapter.buildRequestFromStandard({
@@ -4238,6 +4374,19 @@ function sendVirtualModelResponse(
       source,
       config
     });
+    const carrierOutputValidation = validateReasoningTransportCarriers(
+      sourcePayload,
+      config.bodyLimitBytes
+    );
+    if (!carrierOutputValidation.ok) {
+      return reply.code(carrierOutputValidation.status).send({
+        error: {
+          type: carrierOutputValidation.status === 413 ? 'request_too_large' : 'invalid_request_error',
+          code: carrierOutputValidation.code,
+          message: carrierOutputValidation.message
+        }
+      });
+    }
     attachBillingHeaders(
       request,
       reply,
@@ -4283,7 +4432,12 @@ function sendVirtualModelResponse(
       upstreamResponseBody: sourceStandardResponse
     }
   );
-  return relayConvertedStreamFromStandardResponse(reply, source, sourceStandardResponse);
+  return relayConvertedStreamFromStandardResponse(
+    reply,
+    source,
+    sourceStandardResponse,
+    config.bodyLimitBytes
+  );
 }
 
 function prepareStandardResponseForSource(
@@ -5390,6 +5544,40 @@ function dedupeProviders(providers: Provider[]): Provider[] {
     }
   }
   return deduped;
+}
+
+function buildNativeStatePreparationOptions(
+  config: GatewayConfig,
+  targetProviderConfig: ProviderConfig | undefined,
+  model: string | undefined,
+  targetFormat: string | undefined,
+  failover: boolean
+) {
+  const normalizedModel = model?.trim().toLowerCase();
+  const modelPolicy = normalizedModel && targetProviderConfig?.modelMetadata
+    ? Object.entries(targetProviderConfig.modelMetadata).find(
+        ([configuredModel]) => configuredModel.trim().toLowerCase() === normalizedModel
+      )?.[1].openaiResponsesReasoningHistoryPolicy
+    : undefined;
+  const configuredPolicy = modelPolicy ?? targetProviderConfig?.openaiResponsesReasoningHistoryPolicy;
+  const explicitStrip = configuredPolicy === 'strip';
+  const historyPolicy = targetFormat === 'openai-responses-v1'
+    ? resolveOpenAIResponsesReasoningHistoryPolicy(
+        targetProviderConfig,
+        model,
+        targetProviderConfig?.baseurl || config.openaiBaseUrl
+      )
+    : explicitStrip
+      ? 'strip'
+      : 'native';
+  return {
+    historyPolicy,
+    explicitStrip,
+    plaintextReasoningSupported:
+      targetFormat === undefined ||
+      (targetFormat === 'openai-responses-v1' && historyPolicy === 'plaintext'),
+    failover
+  } as const;
 }
 
 function sendBadRequest(reply: FastifyReply, message: string) {
@@ -7508,7 +7696,9 @@ export function buildGatewayBillingTraceSnapshot(
   const responseHeaders = sanitizeHeadersForLog(
     normalizeHeaderBagForTrace(reply.getHeaders()),
   );
-  const requestBody = request.body;
+  const requestBody = request.body !== undefined
+    ? sanitizePayloadForLog(request.body)
+    : undefined;
   const responseBody =
     options.responseBody !== undefined
       ? sanitizePayloadForLog(options.responseBody)

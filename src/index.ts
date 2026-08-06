@@ -349,6 +349,12 @@ const start = async () => {
 
     await fastify.listen({ host: config.host, port: config.port });
     fastify.log.info(`Gateway running at http://${config.host}:${config.port}`);
+    if (!isLoopbackGatewayHost(config.host)) {
+      fastify.log.warn(
+        'Provider-native carrier replay is enabled on a non-loopback listener. ' +
+        'Carrier origin metadata is not a multi-tenant security credential; use only with trusted clients or a single-tenant boundary.'
+      );
+    }
   } catch (error) {
     fastify.log.error(error);
     process.exit(1);
@@ -356,6 +362,11 @@ const start = async () => {
 };
 
 start();
+
+function isLoopbackGatewayHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1';
+}
 
 async function reloadRuntimeFromConfig(nextConfig: GatewayConfig): Promise<void> {
   await applyStaticRuntimeConfig(nextConfig);

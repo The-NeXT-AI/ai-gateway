@@ -20,13 +20,15 @@ import {
   encodeReasoningTransportEnvelope,
   GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
   GEMINI_INTERACTIONS_REASONING_FORMAT,
-  OPENAI_RESPONSES_REASONING_FORMAT
+  OPENAI_RESPONSES_REASONING_FORMAT,
+  validateReasoningTransportCarriersInSseFrames
 } from '../adapters/builtins/reasoning-envelope';
 import { splitNamespacedToolCallName } from '../adapters/builtins/target/tools';
 import { parseSseChunks } from '../sse';
 import { bindAbortSignalToReadable } from '../upstream/client';
 import type {
   GatewaySourceContext,
+  ProviderNativeItem,
   ReasoningStateOrigin,
   StandardRequest,
   StandardResponse,
@@ -239,6 +241,8 @@ interface OpenAIReasoningAccumulator {
 interface OpenAIResponsesEncryptedReasoning {
   id: string;
   encryptedContent: string;
+  rawItem: Record<string, unknown>;
+  outputIndex: number;
 }
 
 interface OpenAINonStreamCollectionState {
@@ -311,9 +315,20 @@ type OptimisticOpenAIChatRelay =
 export function relayConvertedStreamFromStandardResponse(
   reply: FastifyReply,
   source: GatewaySourceContext,
-  standardResponse: StandardResponse
+  standardResponse: StandardResponse,
+  bodyLimitBytes = 32 * 1024 * 1024
 ) {
   const frames = buildConvertedStreamFrames(source, standardResponse);
+  const carrierValidation = validateReasoningTransportCarriersInSseFrames(frames, bodyLimitBytes);
+  if (!carrierValidation.ok) {
+    return reply.code(carrierValidation.status).send({
+      error: {
+        type: carrierValidation.status === 413 ? 'request_too_large' : 'invalid_request_error',
+        code: carrierValidation.code,
+        message: carrierValidation.message
+      }
+    });
+  }
 
   reply.code(200);
   reply.header('content-type', 'text/event-stream; charset=utf-8');
@@ -330,7 +345,8 @@ export function relayConvertedStreamFromUpstreamResponse(
   upstreamResponse: Response,
   standardRequest?: StandardRequest,
   abortSignal?: AbortSignal,
-  reasoningOrigin?: ReasoningStateOrigin
+  reasoningOrigin?: ReasoningStateOrigin,
+  bodyLimitBytes = 32 * 1024 * 1024
 ) {
   reply.code(200);
   reply.header('content-type', 'text/event-stream; charset=utf-8');
@@ -343,18 +359,23 @@ export function relayConvertedStreamFromUpstreamResponse(
   }
 
   let stream: Readable;
+  let convertedStream: Readable | undefined;
   if (source.adapterKey === 'anthropic_messages') {
-    stream = Readable.from(relayAnthropicMessagesFromOpenAIStream(upstreamResponse, reasoningOrigin));
+    convertedStream = Readable.from(relayAnthropicMessagesFromOpenAIStream(upstreamResponse, reasoningOrigin));
   } else if (source.adapterKey === 'openai_responses') {
-    stream = Readable.from(
+    convertedStream = Readable.from(
       relayOpenAIResponsesFromOpenAIStream(upstreamResponse, standardRequest?.tools, reasoningOrigin)
     );
   } else if (source.adapterKey === 'gemini_stream') {
-    stream = Readable.from(relayGeminiStreamFromOpenAIStream(upstreamResponse, reasoningOrigin));
+    convertedStream = Readable.from(relayGeminiStreamFromOpenAIStream(upstreamResponse, reasoningOrigin));
   } else if (source.adapterKey === 'gemini_interactions') {
-    stream = Readable.from(relayGeminiInteractionsFromUpstreamStream(upstreamResponse, reasoningOrigin));
+    convertedStream = Readable.from(relayGeminiInteractionsFromUpstreamStream(upstreamResponse, reasoningOrigin));
   } else if (source.adapterKey === 'openai_chat') {
-    stream = Readable.from(relayOpenAIChatFromUpstreamStream(upstreamResponse, reasoningOrigin));
+    convertedStream = Readable.from(relayOpenAIChatFromUpstreamStream(upstreamResponse, reasoningOrigin));
+  }
+
+  if (convertedStream) {
+    stream = Readable.from(bufferAndValidateReasoningCarrierStream(convertedStream, bodyLimitBytes));
   } else {
     stream = Readable.fromWeb(upstreamResponse.body as unknown as ReadableStream<Uint8Array>);
   }
@@ -363,6 +384,23 @@ export function relayConvertedStreamFromUpstreamResponse(
     upstreamResponse.body?.cancel(abortSignal?.reason).catch(() => undefined);
   });
   return reply.send(stream);
+}
+
+async function* bufferAndValidateReasoningCarrierStream(
+  stream: Readable,
+  bodyLimitBytes: number
+): AsyncGenerator<string> {
+  const frames: string[] = [];
+  for await (const chunk of stream) {
+    frames.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+  }
+  const validation = validateReasoningTransportCarriersInSseFrames(frames, bodyLimitBytes);
+  if (!validation.ok) {
+    throw new Error(`Reasoning stream rejected: ${validation.code}`);
+  }
+  for (const frame of frames) {
+    yield frame;
+  }
 }
 
 export function canRelayOptimisticOpenAIChatStream(source: GatewaySourceContext): boolean {
@@ -1788,6 +1826,10 @@ function buildOpenAIResponsesStreamFrames(standardResponse: StandardResponse): s
       continue;
     }
 
+    if (item.type === 'provider_native_item') {
+      continue;
+    }
+
     frames.push(...buildOpenAIResponsesFunctionCallStreamFrames(item, outputIndex));
   }
 
@@ -2287,6 +2329,10 @@ function buildGeminiInteractionsStreamFrames(standardResponse: StandardResponse)
           frames.push(...emitGeminiInteractionsTextDelta(state, content.text));
         }
       }
+      continue;
+    }
+
+    if (item.type === 'provider_native_item') {
       continue;
     }
 
@@ -3034,13 +3080,14 @@ function emitGeminiInteractionsFramesFromOpenAIResponsesEvent(
     const outputText = asString(response?.output_text) || extractOpenAIResponsesOutputText(response?.output);
     const frames: string[] = [];
     const reasoningSignatures = collectOpenAIResponsesEncryptedReasoning(response).map(
-      ({ id: reasoningId, encryptedContent }) =>
+      ({ id: reasoningId, encryptedContent, rawItem, outputIndex }) =>
         encodeReasoningTransportEnvelope(
           OPENAI_RESPONSES_REASONING_FORMAT,
           encryptedContent,
           reasoningId,
           'encrypted',
-          state.reasoningOrigin
+          state.reasoningOrigin,
+          buildOpenAIResponsesStreamingNativeOptions(rawItem, outputIndex)
         )
     );
     frames.push(...emitGeminiInteractionsStandaloneThoughtSignatures(state, reasoningSignatures));
@@ -3643,7 +3690,7 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
     if (reasoningItems.length > 0) {
       frames.push(
         buildOpenAIChatRelayDeltaFrame(state, {
-          reasoning_details: reasoningItems.map(({ id, encryptedContent }, index) => ({
+          reasoning_details: reasoningItems.map(({ id, encryptedContent, rawItem, outputIndex }, index) => ({
             type: 'reasoning.encrypted',
             data: state.reasoningOrigin
               ? encodeReasoningTransportEnvelope(
@@ -3651,7 +3698,8 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
                   encryptedContent,
                   id,
                   'encrypted',
-                  state.reasoningOrigin
+                  state.reasoningOrigin,
+                  buildOpenAIResponsesStreamingNativeOptions(rawItem, outputIndex)
                 )
               : encryptedContent,
             id,
@@ -4017,7 +4065,12 @@ function emitGeminiResponsesReasoningFrames(
   state: GeminiRelayState,
   response: Record<string, unknown> | undefined
 ): string[] {
-  return collectOpenAIResponsesEncryptedReasoning(response).map(({ id, encryptedContent }) => {
+  return collectOpenAIResponsesEncryptedReasoning(response).map(({
+    id,
+    encryptedContent,
+    rawItem,
+    outputIndex
+  }) => {
     state.emittedAnyDelta = true;
     return encodeSseData({
       candidates: [
@@ -4033,7 +4086,8 @@ function emitGeminiResponsesReasoningFrames(
                   encryptedContent,
                   id,
                   'encrypted',
-                  state.reasoningOrigin
+                  state.reasoningOrigin,
+                  buildOpenAIResponsesStreamingNativeOptions(rawItem, outputIndex)
                 )
               }
             ]
@@ -5389,7 +5443,7 @@ function emitAnthropicResponsesReasoningBlocks(
 
   const frames = ensureAnthropicRelayStarted(state);
   frames.push(...closeActiveAnthropicTextBlock(state));
-  for (const { id, encryptedContent } of reasoningItems) {
+  for (const { id, encryptedContent, rawItem, outputIndex } of reasoningItems) {
     const blockIndex = state.nextBlockIndex;
     state.nextBlockIndex += 1;
     frames.push(
@@ -5400,7 +5454,8 @@ function emitAnthropicResponsesReasoningBlocks(
           encryptedContent,
           id,
           'encrypted',
-          state.reasoningOrigin
+          state.reasoningOrigin,
+          buildOpenAIResponsesStreamingNativeOptions(rawItem, outputIndex)
         )
       })
     );
@@ -5416,7 +5471,8 @@ function collectOpenAIResponsesEncryptedReasoning(
   }
 
   const reasoningItems: OpenAIResponsesEncryptedReasoning[] = [];
-  for (const outputItem of response.output) {
+  for (let outputIndex = 0; outputIndex < response.output.length; outputIndex += 1) {
+    const outputItem = response.output[outputIndex];
     if (!isObject(outputItem) || asString(outputItem.type) !== 'reasoning') {
       continue;
     }
@@ -5424,10 +5480,28 @@ function collectOpenAIResponsesEncryptedReasoning(
     const id = asString(outputItem.id);
     const encryptedContent = asString(outputItem.encrypted_content);
     if (id && encryptedContent) {
-      reasoningItems.push({ id, encryptedContent });
+      reasoningItems.push({ id, encryptedContent, rawItem: outputItem, outputIndex });
     }
   }
   return reasoningItems;
+}
+
+function buildOpenAIResponsesStreamingNativeOptions(
+  rawItem: Record<string, unknown>,
+  outputIndex: number
+): { nativeItem: Partial<ProviderNativeItem> } {
+  return {
+    nativeItem: {
+      item_type: 'reasoning',
+      native_id: asString(rawItem.id),
+      raw_payload: rawItem,
+      provider_schema_version: OPENAI_RESPONSES_REASONING_FORMAT,
+      item_origin: 'native',
+      position: { turn: 0, step: 0, item: outputIndex },
+      capture_state: 'complete',
+      ...(asString(rawItem.status) ? { provider_status: asString(rawItem.status) } : {})
+    }
+  };
 }
 
 function updateAnthropicRelayIdentity(state: AnthropicRelayState, response: Record<string, unknown> | undefined) {

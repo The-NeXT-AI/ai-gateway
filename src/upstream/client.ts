@@ -743,6 +743,9 @@ function redactSensitiveValues(value: unknown, depth: number): unknown {
 
   if (!value || typeof value !== 'object') {
     if (typeof value === 'string') {
+      if (value.includes('ccr-reasoning-transport-') || value.includes('ccr-openai-responses-reasoning-')) {
+        return '***';
+      }
       return truncateStringForLog(value);
     }
     return value;
@@ -788,6 +791,12 @@ function isSensitiveKey(key: string): boolean {
   const normalized = key.trim().toLowerCase();
   return (
     sensitiveHeaderNames.has(normalized) ||
+    normalized === 'raw_payload' ||
+    normalized === 'encrypted_content' ||
+    normalized === 'signature' ||
+    normalized === 'thoughtsignature' ||
+    normalized === 'thought_signature' ||
+    normalized === 'fingerprint' ||
     normalized.includes('token') ||
     normalized.includes('secret') ||
     normalized.includes('password')

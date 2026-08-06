@@ -153,7 +153,7 @@ describe('geminiInteractionsSourceAdapter', () => {
       return;
     }
 
-    expect(parsed.value.input).toEqual([
+    expect(parsed.value.input).toMatchObject([
       {
         type: 'message',
         role: 'user',

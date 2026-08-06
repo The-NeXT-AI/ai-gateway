@@ -7,10 +7,17 @@ import type {
   TargetAdapter
 } from '../../types';
 import {
+  ANTHROPIC_CLAUDE_REASONING_FORMAT,
   decodeReasoningTransportEnvelope,
   decodeOpenAIResponsesReasoningEnvelope,
+  GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
   OPENAI_RESPONSES_REASONING_FORMAT
 } from './reasoning-envelope';
+import {
+  attachReasoningStateOrigin,
+  prepareReasoningStateForTarget
+} from '../../gateway/reasoning-state';
 import { anthropicMessagesSourceAdapter } from './source/anthropic-messages';
 import { geminiGenerateContentSourceAdapter } from './source/gemini-generate-content';
 import { geminiInteractionsSourceAdapter } from './source/gemini-interactions';
@@ -542,6 +549,13 @@ describe('reasoning continuity conversion matrix', () => {
       target,
       createSecondTurnStandardRequest(upstreamParsed.value)
     );
+    const mustRejectActiveNativeToolGroup =
+      origin.protocol === 'gemini_generate_content' &&
+      target.protocol !== origin.protocol;
+    if (mustRejectActiveNativeToolGroup) {
+      expect(built.ok).toBe(false);
+      return;
+    }
     expect(built.ok).toBe(true);
     if (!built.ok) {
       return;
@@ -614,7 +628,7 @@ describe('reasoning continuity conversion matrix', () => {
 });
 
 function parseTargetResponse(target: TargetScenario) {
-  return target.adapter.toStandardResponse(target.rawResponse, {
+  const parsed = target.adapter.toStandardResponse(target.rawResponse, {
     request: {
       headers: {}
     } as never,
@@ -625,14 +639,33 @@ function parseTargetResponse(target: TargetScenario) {
     config: gatewayConfig,
     targetProviderConfig: target.targetProviderConfig
   } as never);
+  return parsed.ok
+    ? {
+        ok: true as const,
+        value: attachReasoningStateOrigin(
+          parsed.value,
+          reasoningOriginFor(target),
+          reasoningFormatFor(target)
+        )
+      }
+    : parsed;
 }
 
 function buildTargetRequest(target: TargetScenario, standardRequest: StandardRequest) {
+  const prepared = prepareReasoningStateForTarget(
+    standardRequest,
+    reasoningFormatFor(target),
+    reasoningOriginFor(target),
+    {
+      historyPolicy: target.protocol === 'openai_chat_completions' ? 'plaintext' : 'native',
+      plaintextReasoningSupported: target.protocol === 'openai_chat_completions'
+    }
+  );
   return target.adapter.buildRequestFromStandard({
     request: {
       headers: {}
     } as never,
-    standardRequest,
+    standardRequest: prepared,
     config: gatewayConfig,
     targetProviderConfig: target.targetProviderConfig
   } as never);
@@ -674,7 +707,8 @@ function createSecondTurnStandardRequest(response: StandardResponse): StandardRe
         ...(reasoningText ? { text: reasoningText } : {}),
         ...(item.summary.length
           ? { summary: item.summary.map((entry) => entry.text).join('\n') }
-          : {})
+          : {}),
+        ...(item.native_item ? { native_item: item.native_item } : {})
       });
       continue;
     }
@@ -682,9 +716,10 @@ function createSecondTurnStandardRequest(response: StandardResponse): StandardRe
     if (item.type === 'message') {
       for (const content of item.content) {
         if (content.type === 'output_text') {
-          assistantContent.push({
-            type: 'input_text',
-            text: content.text
+        assistantContent.push({
+          type: 'input_text',
+          text: content.text,
+          ...(item.native_item ? { native_item: item.native_item } : {})
           });
         }
       }
@@ -707,7 +742,8 @@ function createSecondTurnStandardRequest(response: StandardResponse): StandardRe
                   }
                 : {})
             }
-          : {})
+          : {}),
+        ...(item.native_item ? { native_item: item.native_item } : {})
       });
     }
   }
@@ -829,4 +865,33 @@ function targetCanAcceptOrigin(target: TargetScenario, origin: TargetScenario): 
     target.protocol !== 'openai_chat_completions' &&
     target.protocol === origin.protocol
   );
+}
+
+function reasoningFormatFor(target: TargetScenario): string | undefined {
+  switch (target.protocol) {
+    case 'openai_responses':
+      return OPENAI_RESPONSES_REASONING_FORMAT;
+    case 'anthropic_messages':
+      return ANTHROPIC_CLAUDE_REASONING_FORMAT;
+    case 'gemini_generate_content':
+      return GEMINI_GENERATE_CONTENT_REASONING_FORMAT;
+    case 'gemini_interactions':
+      return GEMINI_INTERACTIONS_REASONING_FORMAT;
+    default:
+      return undefined;
+  }
+}
+
+function reasoningOriginFor(target: TargetScenario) {
+  const provider = target.protocol.startsWith('gemini')
+    ? 'gemini'
+    : target.protocol === 'anthropic_messages'
+      ? 'anthropic'
+      : 'openai';
+  return {
+    provider,
+    endpoint: `${provider}-endpoint`,
+    model: 'gpt-5.6-sol',
+    credentialScope: `${provider}-account`
+  };
 }

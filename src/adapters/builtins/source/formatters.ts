@@ -1,4 +1,9 @@
-import type { ReasoningStateOrigin, StandardResponse, StandardResponseReasoning } from '../../../types';
+import type {
+  ProviderNativeItem,
+  ReasoningStateOrigin,
+  StandardResponse,
+  StandardResponseReasoning
+} from '../../../types';
 import {
   mapFinishReasonToAnthropic,
   mapFinishReasonToGemini,
@@ -7,9 +12,11 @@ import {
 import {
   ANTHROPIC_CLAUDE_REASONING_FORMAT,
   appendGeminiThoughtSignatureToToolCallId,
+  decodeReasoningTransportEnvelope,
   encodeReasoningTransportEnvelope,
   GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
   GEMINI_INTERACTIONS_REASONING_FORMAT,
+  isProviderNativePayloadStructurallyValid,
   OPENAI_RESPONSES_REASONING_FORMAT
 } from '../reasoning-envelope';
 
@@ -176,12 +183,22 @@ function collectOpenAIChatToolCalls(response: StandardResponse): Array<Record<st
               item.thought_signature,
               undefined,
               'signature',
-              item.thought_signature_origin
+              item.thought_signature_origin,
+              item.native_item ? { nativeItem: item.native_item } : undefined
             );
       if (item.thought_signature_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT) {
+        const idSignature = item.native_item
+          ? encodeReasoningTransportEnvelope(
+              item.thought_signature_format,
+              item.thought_signature,
+              undefined,
+              'signature',
+              item.thought_signature_origin
+            )
+          : thoughtSignature;
         toolCall.id = appendGeminiThoughtSignatureToToolCallId(
           toolCall.id as string,
-          thoughtSignature
+          idSignature
         );
       }
       toolCall.extra_content = {
@@ -199,6 +216,25 @@ function collectOpenAIChatToolCalls(response: StandardResponse): Array<Record<st
 function collectAnthropicContentBlocks(response: StandardResponse): Array<Record<string, unknown>> {
   const blocks: Array<Record<string, unknown>> = [];
   for (const item of response.output) {
+    if (item.type === 'provider_native_item') {
+      if (
+        item.source_format === ANTHROPIC_CLAUDE_REASONING_FORMAT &&
+        isProviderNativePayloadStructurallyValid(item, ANTHROPIC_CLAUDE_REASONING_FORMAT)
+      ) {
+        blocks.push(encodeNativePayloadForClient(item, ANTHROPIC_CLAUDE_REASONING_FORMAT));
+      }
+      continue;
+    }
+    if (
+      item.native_item?.source_format === ANTHROPIC_CLAUDE_REASONING_FORMAT &&
+      isProviderNativePayloadStructurallyValid(item.native_item, ANTHROPIC_CLAUDE_REASONING_FORMAT)
+    ) {
+      blocks.push(encodeNativePayloadForClient(
+        item.native_item,
+        ANTHROPIC_CLAUDE_REASONING_FORMAT
+      ));
+      continue;
+    }
     if (item.type === 'message') {
       for (const content of item.content) {
         if (content.type !== 'output_text' || !content.text) {
@@ -229,7 +265,8 @@ function collectAnthropicContentBlocks(response: StandardResponse): Array<Record
               item.thought_signature,
               undefined,
               'signature',
-              item.thought_signature_origin
+              item.thought_signature_origin,
+              item.native_item ? { nativeItem: item.native_item } : undefined
             )
       );
     }
@@ -271,6 +308,28 @@ function collectGeminiParts(response: StandardResponse): Array<Record<string, un
   let pendingThoughtPart: Record<string, unknown> | undefined;
 
   for (const item of response.output) {
+    if (item.type === 'provider_native_item') {
+      if (
+        item.source_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT &&
+        isProviderNativePayloadStructurallyValid(item, GEMINI_GENERATE_CONTENT_REASONING_FORMAT)
+      ) {
+        parts.push(encodeNativePayloadForClient(
+          item,
+          GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+        ));
+      }
+      continue;
+    }
+    if (
+      item.native_item?.source_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT &&
+      isProviderNativePayloadStructurallyValid(item.native_item, GEMINI_GENERATE_CONTENT_REASONING_FORMAT)
+    ) {
+      parts.push(encodeNativePayloadForClient(
+        item.native_item,
+        GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+      ));
+      continue;
+    }
     if (item.type === 'message') {
       for (const content of item.content) {
         if (content.type !== 'output_text' || !content.text) {
@@ -364,7 +423,8 @@ function collectGeminiParts(response: StandardResponse): Array<Record<string, un
               item.thought_signature,
               undefined,
               'signature',
-              item.thought_signature_origin
+              item.thought_signature_origin,
+              item.native_item ? { nativeItem: item.native_item } : undefined
             );
       if (item.thought_signature_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT) {
         thoughtSignature = encodedSignature;
@@ -398,6 +458,28 @@ function collectGeminiParts(response: StandardResponse): Array<Record<string, un
 function collectGeminiInteractionSteps(response: StandardResponse): Array<Record<string, unknown>> {
   const steps: Array<Record<string, unknown>> = [];
   for (const item of response.output) {
+    if (item.type === 'provider_native_item') {
+      if (
+        item.source_format === GEMINI_INTERACTIONS_REASONING_FORMAT &&
+        isProviderNativePayloadStructurallyValid(item, GEMINI_INTERACTIONS_REASONING_FORMAT)
+      ) {
+        steps.push(encodeNativePayloadForClient(
+          item,
+          GEMINI_INTERACTIONS_REASONING_FORMAT
+        ));
+      }
+      continue;
+    }
+    if (
+      item.native_item?.source_format === GEMINI_INTERACTIONS_REASONING_FORMAT &&
+      isProviderNativePayloadStructurallyValid(item.native_item, GEMINI_INTERACTIONS_REASONING_FORMAT)
+    ) {
+      steps.push(encodeNativePayloadForClient(
+        item.native_item,
+        GEMINI_INTERACTIONS_REASONING_FORMAT
+      ));
+      continue;
+    }
     if (item.type === 'reasoning') {
       const summary = item.summary.map((entry) => entry.text).filter(Boolean).join('\n').trim();
       const text = collectReasoningText(item);
@@ -440,7 +522,8 @@ function collectGeminiInteractionSteps(response: StandardResponse): Array<Record
           item.thought_signature,
           undefined,
           'signature',
-          item.thought_signature_origin
+          item.thought_signature_origin,
+          item.native_item ? { nativeItem: item.native_item } : undefined
         )
       });
     }
@@ -476,7 +559,8 @@ function formatAnthropicThinkingBlocks(item: StandardResponseReasoning): Array<R
     item.reasoning_details,
     item.source_format,
     item.id,
-    item.source_origin
+    item.source_origin,
+    item.native_item
   );
   if (blocks.length > 0) {
     return blocks;
@@ -523,6 +607,7 @@ interface ReasoningOpaqueState {
   kind: 'signature' | 'encrypted';
   partIndex?: number;
   origin?: ReasoningStateOrigin;
+  nativeItem?: ProviderNativeItem;
 }
 
 function readReasoningOpaqueState(item: StandardResponseReasoning): ReasoningOpaqueState | undefined {
@@ -549,6 +634,7 @@ function readReasoningOpaqueState(item: StandardResponseReasoning): ReasoningOpa
           id: asOptionalString(record.id) || item.id,
           kind: signature ? 'signature' : 'encrypted',
           ...(item.source_origin ? { origin: item.source_origin } : {}),
+          ...(item.native_item ? { nativeItem: item.native_item } : {}),
           ...(typeof record.index === 'number' && Number.isFinite(record.index)
             ? { partIndex: record.index }
             : {})
@@ -563,7 +649,8 @@ function readReasoningOpaqueState(item: StandardResponseReasoning): ReasoningOpa
       format: item.source_format,
       id: item.id,
       kind: 'encrypted',
-      ...(item.source_origin ? { origin: item.source_origin } : {})
+      ...(item.source_origin ? { origin: item.source_origin } : {}),
+      ...(item.native_item ? { nativeItem: item.native_item } : {})
     };
   }
 
@@ -585,15 +672,56 @@ function encodeOpaqueStateForClient(
         state.data,
         state.id,
         state.kind,
-        state.origin
+        state.origin,
+        state.nativeItem ? { nativeItem: state.nativeItem } : undefined
       );
+}
+
+function encodeNativePayloadForClient(
+  item: ProviderNativeItem,
+  destinationFormat: string
+): Record<string, unknown> {
+  if (item.source_origin.endpoint === 'pending' || item.source_origin.endpoint === 'unverified') {
+    return { ...item.raw_payload };
+  }
+  const visit = (value: unknown, key?: string): unknown => {
+    if (typeof value === 'string') {
+      const isOpaqueField = key === 'signature' || key === 'thoughtSignature' ||
+        key === 'thought_signature' || key === 'encrypted_content' ||
+        (key === 'data' && /redacted|compaction|thought|reasoning/.test(item.item_type));
+      if (!isOpaqueField || !value || decodeReasoningTransportEnvelope(value)) {
+        return value;
+      }
+      return encodeReasoningTransportEnvelope(
+        item.source_format,
+        value,
+        item.native_id,
+        key === 'data' || key === 'encrypted_content' ? 'encrypted' : 'signature',
+        item.source_origin,
+        { nativeItem: item }
+      );
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => visit(entry));
+    }
+    if (typeof value !== 'object' || value === null) {
+      return value;
+    }
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .map(([childKey, child]) => [childKey, visit(child, childKey)])
+    );
+  };
+  const payload = visit(item.raw_payload) as Record<string, unknown>;
+  return item.source_format === destinationFormat ? payload : { ...payload };
 }
 
 function anthropicBlocksFromReasoningDetails(
   value: unknown[] | undefined,
   fallbackFormat?: string,
   fallbackId?: string,
-  origin?: ReasoningStateOrigin
+  origin?: ReasoningStateOrigin,
+  nativeItem?: ProviderNativeItem
 ): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) {
     return [];
@@ -632,7 +760,14 @@ function anthropicBlocksFromReasoningDetails(
         const encodedData =
           format === ANTHROPIC_CLAUDE_REASONING_FORMAT && !origin
             ? data
-            : encodeReasoningTransportEnvelope(format, data, id, 'encrypted', origin);
+            : encodeReasoningTransportEnvelope(
+                format,
+                data,
+                id,
+                'encrypted',
+                origin,
+                nativeItem ? { nativeItem } : undefined
+              );
         blocks.push({
           type: 'redacted_thinking',
           data: encodedData
@@ -654,7 +789,14 @@ function anthropicBlocksFromReasoningDetails(
       block.signature =
         format === ANTHROPIC_CLAUDE_REASONING_FORMAT && !origin
           ? signature
-          : encodeReasoningTransportEnvelope(format, signature, id, 'signature', origin);
+          : encodeReasoningTransportEnvelope(
+              format,
+              signature,
+              id,
+              'signature',
+              origin,
+              nativeItem ? { nativeItem } : undefined
+            );
     }
     blocks.push(block);
   }
@@ -721,7 +863,8 @@ function collectOpenAIChatReasoning(response: StandardResponse): {
               item.encrypted_content,
               item.id,
               'encrypted',
-              item.source_origin
+              item.source_origin,
+              item.native_item ? { nativeItem: item.native_item } : undefined
             )
           : item.encrypted_content,
         id: item.id,
@@ -768,7 +911,8 @@ function encodeReasoningDetailsForClient(item: StandardResponseReasoning): unkno
       signature || encrypted!,
       id,
       signature ? 'signature' : 'encrypted',
-      item.source_origin
+      item.source_origin,
+      item.native_item ? { nativeItem: item.native_item } : undefined
     );
     if (signature) {
       const {

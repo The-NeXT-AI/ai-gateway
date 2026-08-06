@@ -1793,4 +1793,147 @@ describe('geminiGenerateContentTargetAdapter', () => {
       }
     ]);
   });
+
+  it('preserves a signature that is present on an empty Gemini text Part', () => {
+    const rawParts = [
+      {
+        text: '',
+        thoughtSignature: 'empty-text-part-signature'
+      },
+      {
+        text: 'Visible answer.'
+      }
+    ];
+    const parsed = geminiGenerateContentTargetAdapter.toStandardResponse({
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: rawParts
+          },
+          finishReason: 'STOP'
+        }
+      ],
+      usageMetadata: {
+        promptTokenCount: 6,
+        candidatesTokenCount: 3,
+        totalTokenCount: 9
+      },
+      modelVersion: 'gemini-3.5-flash'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    expect(parsed.value.output[0]).toMatchObject({
+      type: 'message',
+      content: [{ type: 'output_text', text: '' }],
+      native_item: {
+        item_type: 'part',
+        raw_payload: rawParts[0],
+        capture_state: 'complete',
+        position: { item: 0 }
+      }
+    });
+    const formatted = formatGeminiGenerateContentResponse(parsed.value) as Record<string, any>;
+    expect(formatted.candidates[0].content.parts).toEqual(rawParts);
+  });
+
+  it('keeps parallel Gemini calls and results in FC1, FC2, FR1, FR2 order', () => {
+    const parsed = parseGeminiGenerateContentRequest(
+      {
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: 'Look up both cities.' }]
+          },
+          {
+            role: 'model',
+            parts: [
+              {
+                thoughtSignature: 'signature-fc-1',
+                functionCall: {
+                  id: 'call_fc_1',
+                  name: 'get_weather',
+                  args: { city: 'Wuhu' }
+                }
+              },
+              {
+                thoughtSignature: 'signature-fc-2',
+                functionCall: {
+                  id: 'call_fc_2',
+                  name: 'get_weather',
+                  args: { city: 'Hefei' }
+                }
+              }
+            ]
+          },
+          {
+            role: 'user',
+            parts: [
+              {
+                functionResponse: {
+                  id: 'call_fc_1',
+                  name: 'get_weather',
+                  response: { content: '22 C' }
+                }
+              },
+              {
+                functionResponse: {
+                  id: 'call_fc_2',
+                  name: 'get_weather',
+                  response: { content: '24 C' }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      'gemini-3.5-flash'
+    );
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-3.5-flash:generateContent'
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const contents = (built.value.body as Record<string, unknown>).contents as Array<{
+      role: string;
+      parts: Array<Record<string, unknown>>;
+    }>;
+    expect(contents[1]?.parts.map((part) =>
+      (part.functionCall as Record<string, unknown> | undefined)?.id
+    )).toEqual(['call_fc_1', 'call_fc_2']);
+    expect(contents[2]?.parts.map((part) =>
+      (part.functionResponse as Record<string, unknown> | undefined)?.id
+    )).toEqual(['call_fc_1', 'call_fc_2']);
+    expect([
+      ...contents[1]!.parts.map((part) =>
+        `FC${(part.functionCall as Record<string, unknown>).id === 'call_fc_1' ? '1' : '2'}`
+      ),
+      ...contents[2]!.parts.map((part) =>
+        `FR${(part.functionResponse as Record<string, unknown>).id === 'call_fc_1' ? '1' : '2'}`
+      )
+    ]).toEqual(['FC1', 'FC2', 'FR1', 'FR2']);
+  });
 });

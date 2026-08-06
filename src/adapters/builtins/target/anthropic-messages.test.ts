@@ -964,4 +964,218 @@ describe('anthropicMessagesTargetAdapter', () => {
       }
     ]);
   });
+
+  it('captures empty thinking, signatures, redacted thinking, and block order exactly', () => {
+    const rawContent = [
+      {
+        type: 'thinking',
+        thinking: '',
+        signature: 'anthropic-empty-thinking-signature'
+      },
+      {
+        type: 'redacted_thinking',
+        data: 'anthropic-redacted-state'
+      },
+      {
+        type: 'tool_use',
+        id: 'toolu_ordered',
+        name: 'get_weather',
+        input: { city: 'Wuhu' }
+      },
+      {
+        type: 'text',
+        text: 'Waiting for the tool result.'
+      }
+    ];
+    const parsed = anthropicMessagesTargetAdapter.toStandardResponse(
+      {
+        id: 'msg_ordered_native_blocks',
+        model: 'claude-sonnet-4-5',
+        content: rawContent,
+        stop_reason: 'tool_use',
+        usage: { input_tokens: 8, output_tokens: 6 }
+      },
+      {
+        standardRequest: {
+          model: 'claude-sonnet-4-5',
+          input: 'Use a tool.',
+          thinking: { type: 'adaptive' }
+        }
+      } as never
+    );
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    expect(parsed.value.output.map((item) => item.type)).toEqual([
+      'reasoning',
+      'reasoning',
+      'function_call',
+      'message'
+    ]);
+    expect(parsed.value.output[0]).toMatchObject({
+      type: 'reasoning',
+      reasoning_details: [
+        {
+          type: 'thinking',
+          thinking: '',
+          signature: 'anthropic-empty-thinking-signature'
+        }
+      ],
+      native_item: {
+        item_type: 'thinking',
+        raw_payload: rawContent[0],
+        readable_text: '',
+        capture_state: 'complete',
+        provider_mode: 'adaptive',
+        position: { item: 0 }
+      }
+    });
+    expect(parsed.value.output[1]).toMatchObject({
+      type: 'reasoning',
+      encrypted_content: 'anthropic-redacted-state',
+      native_item: {
+        item_type: 'redacted_thinking',
+        raw_payload: rawContent[1],
+        capture_state: 'complete',
+        position: { item: 1 }
+      }
+    });
+    const nativeItems = parsed.value.output.map((item) =>
+      item.type === 'provider_native_item'
+        ? item
+        : 'native_item' in item
+          ? item.native_item
+          : undefined
+    );
+    expect(nativeItems.map((item) => item?.raw_payload)).toEqual(rawContent);
+    expect(nativeItems.slice(0, 3).map((item) => item?.group_id)).toEqual([
+      'toolu_ordered',
+      'toolu_ordered',
+      'toolu_ordered'
+    ]);
+  });
+
+  it('allows adaptive mixed history but rejects disabling thinking during an active native tool turn', () => {
+    const adaptive = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: {
+        model: 'claude-sonnet-4-5',
+        thinking: { type: 'adaptive' },
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'input_text', text: 'A prior answer without thinking.' }]
+          },
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Continue.' }]
+          }
+        ]
+      },
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+    expect(adaptive.ok).toBe(true);
+    if (adaptive.ok) {
+      expect((adaptive.value.body as Record<string, unknown>).thinking).toEqual({
+        type: 'adaptive'
+      });
+    }
+
+    const activeNativeTool = {
+      type: 'provider_native_item',
+      item_type: 'tool_use',
+      native_id: 'toolu_active',
+      raw_payload: {
+        type: 'tool_use',
+        id: 'toolu_active',
+        name: 'get_weather',
+        input: { city: 'Wuhu' }
+      },
+      provider_schema_version: 'anthropic-messages-2023-06-01',
+      source_format: 'anthropic-claude-v1',
+      source_origin: {
+        provider: 'anthropic',
+        endpoint: 'anthropic-endpoint',
+        model: 'claude-sonnet-4-5',
+        credentialScope: 'account-scope'
+      },
+      position: { turn: 0, step: 0, item: 0 },
+      group_id: 'toolu_active',
+      call_id: 'toolu_active',
+      pair_id: 'toolu_active',
+      capture_state: 'complete',
+      provider_mode: 'adaptive'
+    };
+    const disabled = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: {
+        model: 'claude-sonnet-4-5',
+        thinking: { type: 'disabled' },
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'toolu_active',
+                name: 'get_weather',
+                input: { city: 'Wuhu' },
+                native_item: activeNativeTool
+              }
+            ],
+            native_items: [activeNativeTool]
+          }
+        ]
+      } as never,
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+    expect(disabled).toEqual({
+      ok: false,
+      error: 'incompatible_anthropic_thinking_mode'
+    });
+
+    const switchedToManual = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: {
+        model: 'claude-sonnet-4-5',
+        thinking: { type: 'enabled', budget_tokens: 2048 },
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'toolu_active',
+                name: 'get_weather',
+                input: { city: 'Wuhu' },
+                native_item: activeNativeTool
+              }
+            ],
+            native_items: [activeNativeTool]
+          }
+        ]
+      } as never,
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+    expect(switchedToManual).toEqual({
+      ok: false,
+      error: 'incompatible_anthropic_thinking_mode'
+    });
+  });
 });

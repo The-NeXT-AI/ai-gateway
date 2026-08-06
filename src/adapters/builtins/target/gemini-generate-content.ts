@@ -16,7 +16,8 @@ import { asBoolean, asNumber, asString, collectStandardInputMessages, isObject }
 import { buildGeminiInteractionsUrl, buildGeminiUrl } from '../common';
 import {
   GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
-  GEMINI_INTERACTIONS_REASONING_FORMAT
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
+  isProviderNativePayloadStructurallyValid
 } from '../reasoning-envelope';
 import { parseGeminiToStandardResponse } from './shared';
 import {
@@ -49,6 +50,9 @@ export const geminiGenerateContentTargetAdapter: TargetAdapter = {
   providerTypes: ['gemini_generate_content', 'gemini_interactions'],
   providerFallback: true,
   buildRequestFromStandard(input) {
+    if (input.standardRequest.native_state_error) {
+      return err(input.standardRequest.native_state_error);
+    }
     if (input.targetProviderConfig?.type === 'gemini_interactions') {
       return buildGeminiInteractionsRequestFromStandard(input);
     }
@@ -263,6 +267,25 @@ function standardInputToGeminiInteractionsInput(
     };
 
     for (const item of message.content) {
+      if (item.type === 'provider_native_item') {
+        flushText();
+        if (
+          item.source_format === GEMINI_INTERACTIONS_REASONING_FORMAT &&
+          isProviderNativePayloadStructurallyValid(item, GEMINI_INTERACTIONS_REASONING_FORMAT)
+        ) {
+          steps.push({ ...item.raw_payload });
+        }
+        continue;
+      }
+      const nativeItem = 'native_item' in item ? item.native_item : undefined;
+      if (
+        nativeItem?.source_format === GEMINI_INTERACTIONS_REASONING_FORMAT &&
+        isProviderNativePayloadStructurallyValid(nativeItem, GEMINI_INTERACTIONS_REASONING_FORMAT)
+      ) {
+        flushText();
+        steps.push({ ...nativeItem.raw_payload });
+        continue;
+      }
       if (item.type === 'input_text') {
         if (item.text.trim()) {
           pendingText.push(item.text);
@@ -587,6 +610,23 @@ function standardContentToGeminiParts(
   };
 
   for (const item of content) {
+    if (item.type === 'provider_native_item') {
+      if (
+        item.source_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT &&
+        isProviderNativePayloadStructurallyValid(item, GEMINI_GENERATE_CONTENT_REASONING_FORMAT)
+      ) {
+        parts.push({ ...item.raw_payload });
+      }
+      continue;
+    }
+    const nativeItem = 'native_item' in item ? item.native_item : undefined;
+    if (
+      nativeItem?.source_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT &&
+      isProviderNativePayloadStructurallyValid(nativeItem, GEMINI_GENERATE_CONTENT_REASONING_FORMAT)
+    ) {
+      parts.push({ ...nativeItem.raw_payload });
+      continue;
+    }
     if (item.type === 'input_text') {
       if (item.text.trim()) {
         pendingText.push(item.text);

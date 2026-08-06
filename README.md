@@ -50,6 +50,16 @@ docker compose up --build
 - [Publishing and CI/CD](docs/publishing.md)
 - [MCP WebSocket deployment templates](deploy/mcp-ws/README.md)
 
+## Provider-native reasoning continuity
+
+The gateway carries lossless OpenAI Responses, Anthropic thinking, Gemini Part, and Gemini Interactions state in a bounded carrier-v3 envelope. Native state is replayed only when its protocol, provider service, endpoint, credential scope, model rules, capture completeness, provider status, and dependency group are compatible. Readable reasoning can be projected only to protocols that explicitly support it; otherwise optional reasoning is removed. Active native tool groups fail closed, while closed historical groups are removed atomically so calls and results are never orphaned.
+
+Responses history configuration remains backward compatible: `encrypted` means native history (including encrypted reasoning), `plaintext` sends only readable reasoning, and `strip` removes reasoning. An explicit `strip` may discard compacted context. An `auto` decision that resolves to `strip` is not treated as consent to lose a compaction that is the only representation of older history; that request fails with `incompatible_compacted_history`. Stateful IDs are reused only on the same service, endpoint, and credential route; otherwise the gateway falls back to complete manual history or returns a compatibility error.
+
+Carrier replay is designed for trusted local clients and single-tenant deployments. Carrier origin fields are routing provenance, not multi-tenant authentication, and the carrier intentionally has no HMAC. Public proxy and untrusted-client deployments are outside this trust boundary; a non-loopback listener emits a startup warning. Logs redact raw native payloads, ciphertext, signatures, fingerprints, and carrier strings.
+
+Limits derive from `bodyLimitBytes`: total encoded carriers are capped at `min(16 MiB, bodyLimitBytes / 2)`, each decoded payload at `min(8 MiB, bodyLimitBytes / 4)`, native items at 4096, and JSON nesting at 32. Gemini signature envelopes in `tool_call.id` are signature-only and capped at 64 KiB. Oversize carriers return 413; malformed, duplicate/conflicting, or cyclic state returns 400.
+
 ## npm Publishing
 
 This repository includes `.npmignore`, `prepack` builds, GitHub Actions CI/CD, and a release command that publishes a specific npm version:

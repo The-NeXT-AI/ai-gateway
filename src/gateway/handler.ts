@@ -7126,7 +7126,7 @@ function findProviderConfigByName(
   return providers.find((item) => item.name.trim().toLowerCase() === normalized);
 }
 
-function overrideUpstreamBaseUrl(
+export function overrideUpstreamBaseUrl(
   url: string,
   overriddenBaseUrl: string,
   provider: Provider,
@@ -7139,6 +7139,14 @@ function overrideUpstreamBaseUrl(
 
   if (url.startsWith(defaultBaseUrl)) {
     return `${overriddenBaseUrl}${url.slice(defaultBaseUrl.length)}`;
+  }
+
+  // The conversion-path adapters already build the URL from the target
+  // provider's own base URL. Prepending the base path again would double it
+  // (e.g. /anthropic/anthropic/v1/messages), so leave it untouched.
+  const normalizedOverrideBase = trimRightSlash(overriddenBaseUrl);
+  if (url === normalizedOverrideBase || url.startsWith(`${normalizedOverrideBase}/`)) {
+    return url;
   }
 
   try {

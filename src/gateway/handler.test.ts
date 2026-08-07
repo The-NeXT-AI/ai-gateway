@@ -3,6 +3,7 @@ import { anthropicMessagesTargetAdapter } from '../adapters/builtins/target/anth
 import { openAIResponsesTargetAdapter } from '../adapters/builtins/target/openai-responses';
 import {
   buildGatewayBillingTraceSnapshot,
+  overrideUpstreamBaseUrl,
   extractGatewayRequestClientContext,
   hydrateVirtualMultimodalReferences,
   rewriteVirtualModelMultimodalInput,
@@ -1399,3 +1400,40 @@ function createSseResponse(chunks: string[]): Response {
     }
   });
 }
+
+describe('overrideUpstreamBaseUrl', () => {
+  const config = { anthropicBaseUrl: 'https://open.bigmodel.cn/api/anthropic' } as never;
+
+  it('leaves provider-specific conversion URLs untouched when another provider owns the default base', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.xiaomimimo.com/anthropic/v1/messages',
+        'https://api.xiaomimimo.com/anthropic',
+        'anthropic',
+        config
+      )
+    ).toBe('https://api.xiaomimimo.com/anthropic/v1/messages');
+  });
+
+  it('rewrites passthrough URLs built on the default base to the target provider base', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://open.bigmodel.cn/api/anthropic/v1/messages',
+        'https://api.xiaomimimo.com/anthropic',
+        'anthropic',
+        config
+      )
+    ).toBe('https://api.xiaomimimo.com/anthropic/v1/messages');
+  });
+
+  it('keeps cross-host fallback concatenation for non-provider URLs', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://proxy.example/relay/v1/messages',
+        'https://api.xiaomimimo.com/anthropic',
+        'anthropic',
+        config
+      )
+    ).toBe('https://api.xiaomimimo.com/anthropic/relay/v1/messages');
+  });
+});

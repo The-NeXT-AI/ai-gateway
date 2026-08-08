@@ -408,15 +408,13 @@ describe('gateway routes protocol conversion', () => {
   it.each([
     {
       name: 'known plaintext-compatible endpoint',
-      baseurl: 'https://api.deepseek.com/v1',
-      expectedReasoning: true
+      baseurl: 'https://api.deepseek.com/v1'
     },
     {
       name: 'unknown endpoint',
-      baseurl: 'https://responses.example.test/v1',
-      expectedReasoning: false
+      baseurl: 'https://responses.example.test/v1'
     }
-  ])('applies the auto Responses history policy for a $name', async ({ baseurl, expectedReasoning }) => {
+  ])('replays plaintext reasoning in auto Responses history for a $name', async ({ baseurl }) => {
     let upstreamBody: Record<string, unknown> = {};
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
       upstreamBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
@@ -485,16 +483,12 @@ describe('gateway routes protocol conversion', () => {
       expect(response.statusCode).toBe(200);
       const input = upstreamBody.input as Array<Record<string, unknown>>;
       const reasoning = input.find((item) => item.type === 'reasoning');
-      if (expectedReasoning) {
-        expect(reasoning).toMatchObject({
-          type: 'reasoning',
-          content: [{ type: 'reasoning_text', text: 'Readable prior reasoning.' }]
-        });
-        expect(reasoning).not.toHaveProperty('encrypted_content');
-        expect(reasoning).not.toHaveProperty('summary');
-      } else {
-        expect(reasoning).toBeUndefined();
-      }
+      expect(reasoning).toMatchObject({
+        type: 'reasoning',
+        content: [{ type: 'reasoning_text', text: 'Readable prior reasoning.' }]
+      });
+      expect(reasoning).not.toHaveProperty('encrypted_content');
+      expect(reasoning).not.toHaveProperty('summary');
       expect(JSON.stringify(upstreamBody)).not.toContain('foreign-anthropic-signature');
       expect(JSON.stringify(upstreamBody)).toContain('First answer.');
       expect(JSON.stringify(upstreamBody)).toContain('Second turn');

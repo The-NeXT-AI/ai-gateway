@@ -1436,4 +1436,147 @@ describe('overrideUpstreamBaseUrl', () => {
       )
     ).toBe('https://api.xiaomimimo.com/anthropic/relay/v1/messages');
   });
+
+  it('skips the default-base rewrite when the default base is a parent of the override base', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test/anthropic/v1/messages',
+        'https://api.vendor.test/anthropic',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test' } as never
+      )
+    ).toBe('https://api.vendor.test/anthropic/v1/messages');
+  });
+
+  it('does not treat a path-prefix sibling as sitting under the override base', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test/anthropic-eu/v1/messages',
+        'https://api.vendor.test/anthropic',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test' } as never
+      )
+    ).toBe('https://api.vendor.test/anthropic/anthropic-eu/v1/messages');
+  });
+
+  it('rewrites passthrough URLs built on a bare-host default base', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test/v1/messages',
+        'https://api.vendor.test/anthropic',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test' } as never
+      )
+    ).toBe('https://api.vendor.test/anthropic/v1/messages');
+  });
+
+  it('preserves query strings when rewriting passthrough URLs', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test/v1/messages?stream=true',
+        'https://api.vendor.test/anthropic',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test' } as never
+      )
+    ).toBe('https://api.vendor.test/anthropic/v1/messages?stream=true');
+  });
+
+  it('falls back to concatenation for lookalike hosts', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test.evil.com/anthropic/v1/messages',
+        'https://api.vendor.test/anthropic',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test' } as never
+      )
+    ).toBe('https://api.vendor.test/anthropic/anthropic/v1/messages');
+  });
+
+  it('leaves a URL equal to the override base untouched', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test/anthropic',
+        'https://api.vendor.test/anthropic',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test' } as never
+      )
+    ).toBe('https://api.vendor.test/anthropic');
+  });
+
+  it('leaves conversion URLs untouched when the override base has a trailing slash', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test/anthropic/v1/messages',
+        'https://api.vendor.test/anthropic/',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test' } as never
+      )
+    ).toBe('https://api.vendor.test/anthropic/v1/messages');
+  });
+
+  it('rewrites passthrough URLs for sibling-path bases', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test/v1/messages',
+        'https://api.vendor.test/anthropic',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test/v1' } as never
+      )
+    ).toBe('https://api.vendor.test/anthropic/messages');
+  });
+
+  it('does not mistake a path-prefix sibling of the default base for a match', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test/v10/messages',
+        'https://api.vendor.test/anthropic',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test/v1' } as never
+      )
+    ).toBe('https://api.vendor.test/anthropic/v10/messages');
+  });
+
+  it('leaves conversion URLs untouched for sibling-path bases', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test/anthropic/v1/messages',
+        'https://api.vendor.test/anthropic',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test/v1' } as never
+      )
+    ).toBe('https://api.vendor.test/anthropic/v1/messages');
+  });
+
+  it('matches bases with explicit ports by origin', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test:8443/anthropic/v1/messages',
+        'https://api.vendor.test:8443/anthropic',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test:8443' } as never
+      )
+    ).toBe('https://api.vendor.test:8443/anthropic/v1/messages');
+  });
+
+  it('falls back to concatenation when only the port differs', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test:9443/anthropic/v1/messages',
+        'https://api.vendor.test:8443/anthropic',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test:8443' } as never
+      )
+    ).toBe('https://api.vendor.test:8443/anthropic/anthropic/v1/messages');
+  });
+
+  it('preserves query strings in cross-host fallback concatenation', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://proxy.example/relay/v1/messages?a=1',
+        'https://api.xiaomimimo.com/anthropic',
+        'anthropic',
+        config
+      )
+    ).toBe('https://api.xiaomimimo.com/anthropic/relay/v1/messages?a=1');
+  });
 });

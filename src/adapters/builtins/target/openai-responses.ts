@@ -441,7 +441,7 @@ function inferOpenAIResponsesReasoningHistoryPolicy(
 ): NativeHistoryPolicy {
   const value = targetBaseUrl?.trim();
   if (!value) {
-    return 'strip';
+    return 'plaintext';
   }
 
   try {
@@ -464,10 +464,10 @@ function inferOpenAIResponsesReasoningHistoryPolicy(
       return 'plaintext';
     }
   } catch {
-    // Unknown or non-URL endpoints use the safe default below.
+    // Unknown or non-URL endpoints use the plaintext-only default below.
   }
 
-  return 'strip';
+  return 'plaintext';
 }
 
 function providerModelMetadata(

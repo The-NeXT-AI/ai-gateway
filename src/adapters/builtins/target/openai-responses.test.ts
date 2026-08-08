@@ -455,7 +455,7 @@ describe('openAIResponsesTargetAdapter', () => {
     expect(JSON.stringify(body.input)).not.toContain('foreign_ciphertext');
   });
 
-  it('infers encrypted, plaintext, and strip policies from known Responses endpoints', () => {
+  it('infers encrypted policy for official endpoints and plaintext policy otherwise', () => {
     const input = [
       {
         type: 'message' as const,
@@ -509,6 +509,10 @@ describe('openAIResponsesTargetAdapter', () => {
       provider,
       'https://responses.example.test/v1'
     );
+    const missingBaseUrl = buildOpenAIResponsesBodyFromStandardRequest(
+      { model: 'reasoning-model', input },
+      provider
+    );
 
     for (const body of [official, codex]) {
       expect((body.input as Array<Record<string, unknown>>)[0]).toEqual({
@@ -518,20 +522,13 @@ describe('openAIResponsesTargetAdapter', () => {
         encrypted_content: 'encrypted reasoning'
       });
     }
-    for (const body of [deepSeek, mimo, mimoTokenPlan]) {
+    for (const body of [deepSeek, mimo, mimoTokenPlan, unknown, missingBaseUrl]) {
       expect((body.input as Array<Record<string, unknown>>)[0]).toEqual({
         type: 'reasoning',
         id: 'rs_previous',
         content: [{ type: 'reasoning_text', text: 'readable reasoning' }]
       });
     }
-    expect(unknown.input).toEqual([
-      {
-        type: 'message',
-        role: 'assistant',
-        content: [{ type: 'output_text', text: 'answer' }]
-      }
-    ]);
   });
 
   it('lets a model override the provider policy and optionally converts summaries to plaintext content', () => {

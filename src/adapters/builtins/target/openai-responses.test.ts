@@ -494,6 +494,16 @@ describe('openAIResponsesTargetAdapter', () => {
       provider,
       'https://api.deepseek.com/v1'
     );
+    const mimo = buildOpenAIResponsesBodyFromStandardRequest(
+      { model: 'reasoning-model', input },
+      provider,
+      'https://api.xiaomimimo.com/v1'
+    );
+    const mimoTokenPlan = buildOpenAIResponsesBodyFromStandardRequest(
+      { model: 'reasoning-model', input },
+      provider,
+      'https://token-plan-cn.xiaomimimo.com/v1'
+    );
     const unknown = buildOpenAIResponsesBodyFromStandardRequest(
       { model: 'reasoning-model', input },
       provider,
@@ -508,11 +518,13 @@ describe('openAIResponsesTargetAdapter', () => {
         encrypted_content: 'encrypted reasoning'
       });
     }
-    expect((deepSeek.input as Array<Record<string, unknown>>)[0]).toEqual({
-      type: 'reasoning',
-      id: 'rs_previous',
-      content: [{ type: 'reasoning_text', text: 'readable reasoning' }]
-    });
+    for (const body of [deepSeek, mimo, mimoTokenPlan]) {
+      expect((body.input as Array<Record<string, unknown>>)[0]).toEqual({
+        type: 'reasoning',
+        id: 'rs_previous',
+        content: [{ type: 'reasoning_text', text: 'readable reasoning' }]
+      });
+    }
     expect(unknown.input).toEqual([
       {
         type: 'message',

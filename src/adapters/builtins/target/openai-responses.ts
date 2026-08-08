@@ -457,6 +457,12 @@ function inferOpenAIResponsesReasoningHistoryPolicy(
     if (hostname === 'api.deepseek.com') {
       return 'plaintext';
     }
+    // Xiaomi MiMo returns readable reasoning_content and requires it to be
+    // replayed on assistant tool-call turns (official docs), same plaintext
+    // family as DeepSeek. Subdomains cover the regional Token Plan endpoints.
+    if (hostname === 'xiaomimimo.com' || hostname.endsWith('.xiaomimimo.com')) {
+      return 'plaintext';
+    }
   } catch {
     // Unknown or non-URL endpoints use the safe default below.
   }

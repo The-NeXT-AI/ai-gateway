@@ -646,6 +646,26 @@ describe('reasoning transport envelope v3', () => {
     expect(containsReasoningTransportCarrier({ tool_call_id: carrierId })).toBe(true);
     expect(decodeGeminiThoughtSignatureToolCallId('normal__thought__not-an-envelope')).toBeUndefined();
   });
+
+  it('does not treat ordinary IDs containing __thought__ as reasoning carriers', () => {
+    const ordinaryIds = {
+      id: 'record__thought__literal',
+      tool_calls: [{ id: 'call__thought__literal' }],
+      tool_call_id: 'result__thought__literal'
+    };
+    expect(containsReasoningTransportCarrier(ordinaryIds)).toBe(false);
+    expect(validateReasoningTransportCarriers(ordinaryIds, 1024 * 1024))
+      .toMatchObject({ ok: true, itemCount: 0 });
+
+    const malformedCarrier = {
+      tool_calls: [{
+        id: `call__thought__${REASONING_TRANSPORT_ENVELOPE_V3_PREFIX}not-valid-base64-json`
+      }]
+    };
+    expect(containsReasoningTransportCarrier(malformedCarrier)).toBe(true);
+    expect(validateReasoningTransportCarriers(malformedCarrier, 1024 * 1024))
+      .toMatchObject({ ok: false, status: 400, code: 'invalid_tool_call_id_carrier' });
+  });
 });
 
 describe('target reasoning-state filtering', () => {
@@ -1016,6 +1036,49 @@ describe('same-protocol passthrough wrapping', () => {
     });
     expect(wire.indexOf('signature_delta')).toBeLessThan(wire.indexOf('content_block_stop'));
   });
+
+  it('forwards a complete passthrough event before the upstream stream closes', async () => {
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const upstream = new Response(
+      new ReadableStream<Uint8Array>({
+        start(nextController) {
+          controller = nextController;
+          nextController.enqueue(new TextEncoder().encode(
+            'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_live"}}\n\n'
+          ));
+        }
+      }),
+      { headers: { 'content-type': 'text/event-stream' } }
+    );
+    const stream = createReasoningAwarePassthroughSseStream(
+      upstream,
+      'anthropic_messages',
+      origin
+    );
+    const iterator = stream[Symbol.asyncIterator]();
+    const nextChunk = iterator.next();
+    const timedOut = Symbol('timed-out');
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const first = await Promise.race([
+      nextChunk,
+      new Promise<typeof timedOut>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(timedOut), 1000);
+      })
+    ]);
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+    controller?.close();
+
+    if (first === timedOut) {
+      await nextChunk;
+    }
+    await iterator.return?.();
+    expect(first).not.toBe(timedOut);
+    if (first !== timedOut) {
+      expect(String(first.value)).toContain('message_start');
+    }
+  });
 });
 
 describe('provider-native group decisions', () => {
@@ -1357,6 +1420,33 @@ describe('provider-native group decisions', () => {
     ]);
   });
 
+  it('keeps a message whose replayable state exists only in native_items', () => {
+    const nativeOnly = nativeTestItem({ native_id: 'native_only_reasoning' });
+    const prepared = prepareReasoningStateForTargetResult(
+      {
+        model: 'gpt-5.6-sol',
+        input: [{
+          type: 'message',
+          role: 'assistant',
+          content: [],
+          native_items: [nativeOnly]
+        }]
+      },
+      OPENAI_RESPONSES_REASONING_FORMAT,
+      openAIOrigin,
+      { historyPolicy: 'native' }
+    );
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok || typeof prepared.value.input === 'string') {
+      return;
+    }
+    expect(prepared.value.input).toHaveLength(1);
+    expect(prepared.value.input[0]).toMatchObject({
+      content: [],
+      native_items: [{ native_id: 'native_only_reasoning' }]
+    });
+  });
+
   it('rejects an incompatible active Program group and drops a closed historical group atomically', () => {
     const activeProgram = nativeTestItem({
       item_type: 'program',
@@ -1693,14 +1783,18 @@ describe('bounded carrier validation', () => {
     );
     expect(
       validateReasoningTransportCarriers(
-        { id: `call_full__thought__${fullNativeSignature}` },
+        { tool_calls: [{ id: `call_full__thought__${fullNativeSignature}` }] },
         64 * 1024 * 1024
       )
     ).toMatchObject({ ok: false, status: 400, code: 'invalid_tool_call_id_carrier' });
 
     expect(
       validateReasoningTransportCarriers(
-        { id: `call_large__thought__${'x'.repeat(65 * 1024)}` },
+        {
+          tool_calls: [{
+            id: `call_large__thought__${REASONING_TRANSPORT_ENVELOPE_V3_PREFIX}${'x'.repeat(65 * 1024)}`
+          }]
+        },
         64 * 1024 * 1024
       )
     ).toMatchObject({ ok: false, status: 413, code: 'tool_call_id_carrier_too_large' });

@@ -21,6 +21,7 @@ import {
   GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
   GEMINI_INTERACTIONS_REASONING_FORMAT,
   OPENAI_RESPONSES_REASONING_FORMAT,
+  validateReasoningTransportCarrierSseStream,
   validateReasoningTransportCarriersInSseFrames
 } from '../adapters/builtins/reasoning-envelope';
 import { splitNamespacedToolCallName } from '../adapters/builtins/target/tools';
@@ -375,7 +376,7 @@ export function relayConvertedStreamFromUpstreamResponse(
   }
 
   if (convertedStream) {
-    stream = Readable.from(bufferAndValidateReasoningCarrierStream(convertedStream, bodyLimitBytes));
+    stream = Readable.from(validateReasoningTransportCarrierSseStream(convertedStream, bodyLimitBytes));
   } else {
     stream = Readable.fromWeb(upstreamResponse.body as unknown as ReadableStream<Uint8Array>);
   }
@@ -384,23 +385,6 @@ export function relayConvertedStreamFromUpstreamResponse(
     upstreamResponse.body?.cancel(abortSignal?.reason).catch(() => undefined);
   });
   return reply.send(stream);
-}
-
-async function* bufferAndValidateReasoningCarrierStream(
-  stream: Readable,
-  bodyLimitBytes: number
-): AsyncGenerator<string> {
-  const frames: string[] = [];
-  for await (const chunk of stream) {
-    frames.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
-  }
-  const validation = validateReasoningTransportCarriersInSseFrames(frames, bodyLimitBytes);
-  if (!validation.ok) {
-    throw new Error(`Reasoning stream rejected: ${validation.code}`);
-  }
-  for (const frame of frames) {
-    yield frame;
-  }
 }
 
 export function canRelayOptimisticOpenAIChatStream(source: GatewaySourceContext): boolean {

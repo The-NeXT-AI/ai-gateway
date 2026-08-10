@@ -611,6 +611,7 @@ function standardContentToGeminiParts(
 
   for (const item of content) {
     if (item.type === 'provider_native_item') {
+      flushText();
       if (
         item.source_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT &&
         isProviderNativePayloadStructurallyValid(item, GEMINI_GENERATE_CONTENT_REASONING_FORMAT)
@@ -624,6 +625,7 @@ function standardContentToGeminiParts(
       nativeItem?.source_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT &&
       isProviderNativePayloadStructurallyValid(nativeItem, GEMINI_GENERATE_CONTENT_REASONING_FORMAT)
     ) {
+      flushText();
       parts.push({ ...nativeItem.raw_payload });
       continue;
     }

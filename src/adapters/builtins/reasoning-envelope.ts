@@ -65,6 +65,10 @@ export type ReasoningCarrierValidationResult =
   | { ok: true; itemCount: number; encodedBytes: number }
   | { ok: false; status: 400 | 413; code: string; message: string };
 
+export interface ReasoningTransportCarrierValidator {
+  validate(value: unknown): ReasoningCarrierValidationResult;
+}
+
 export function reasoningCarrierLimits(bodyLimitBytes = DEFAULT_BODY_LIMIT_BYTES): ReasoningCarrierLimits {
   const normalizedBodyLimit = Number.isFinite(bodyLimitBytes) && bodyLimitBytes > 0
     ? Math.floor(bodyLimitBytes)
@@ -212,7 +216,8 @@ export function decodeGeminiThoughtSignatureToolCallId(
   if (Buffer.byteLength(value, 'utf8') > limits.maxGeminiSignatureIdBytes) {
     return undefined;
   }
-  const separatorIndex = value.lastIndexOf(GEMINI_THOUGHT_SIGNATURE_TOOL_CALL_ID_SEPARATOR);
+  const marker = `${GEMINI_THOUGHT_SIGNATURE_TOOL_CALL_ID_SEPARATOR}${REASONING_TRANSPORT_ENVELOPE_V3_PREFIX}`;
+  const separatorIndex = value.lastIndexOf(marker);
   if (separatorIndex <= 0) {
     return undefined;
   }
@@ -232,13 +237,17 @@ export function decodeGeminiThoughtSignatureToolCallId(
 }
 
 export function containsReasoningTransportCarrier(value: unknown): boolean {
-  if (typeof value === 'string') {
-    return isCarrierPrefixed(value) || value.includes(GEMINI_THOUGHT_SIGNATURE_TOOL_CALL_ID_SEPARATOR);
-  }
-  if (Array.isArray(value)) {
-    return value.some(containsReasoningTransportCarrier);
-  }
-  return isRecord(value) && Object.values(value).some(containsReasoningTransportCarrier);
+  const visit = (candidate: unknown, path: Array<string | number>): boolean => {
+    if (typeof candidate === 'string') {
+      return isCarrierPrefixed(candidate) || isGeminiToolCallIdCarrier(candidate, path);
+    }
+    if (Array.isArray(candidate)) {
+      return candidate.some((entry, index) => visit(entry, [...path, index]));
+    }
+    return isRecord(candidate) && Object.entries(candidate)
+      .some(([key, entry]) => visit(entry, [...path, key]));
+  };
+  return visit(value, []);
 }
 
 /** Performs bounded validation before a request is normalized or routed. */
@@ -246,6 +255,13 @@ export function validateReasoningTransportCarriers(
   value: unknown,
   bodyLimitBytes: number
 ): ReasoningCarrierValidationResult {
+  return createReasoningTransportCarrierValidator(bodyLimitBytes).validate(value);
+}
+
+/** Maintains cumulative limits and dependency checks while an SSE response is streamed. */
+export function createReasoningTransportCarrierValidator(
+  bodyLimitBytes: number
+): ReasoningTransportCarrierValidator {
   const limits = reasoningCarrierLimits(bodyLimitBytes);
   let encodedBytes = 0;
   let itemCount = 0;
@@ -258,7 +274,7 @@ export function validateReasoningTransportCarriers(
     failure ??= { ok: false, status, code, message };
   };
 
-  const visit = (candidate: unknown, parentKey?: string, depth = 1): void => {
+  const visit = (candidate: unknown, path: Array<string | number>, depth = 1): void => {
     if (failure) {
       return;
     }
@@ -267,8 +283,7 @@ export function validateReasoningTransportCarriers(
       return;
     }
     if (typeof candidate === 'string') {
-      const hasGeminiIdCarrier = parentKey === 'id' &&
-        candidate.includes(GEMINI_THOUGHT_SIGNATURE_TOOL_CALL_ID_SEPARATOR);
+      const hasGeminiIdCarrier = isGeminiToolCallIdCarrier(candidate, path);
       if (
         hasGeminiIdCarrier &&
         Buffer.byteLength(candidate, 'utf8') > limits.maxGeminiSignatureIdBytes
@@ -302,16 +317,12 @@ export function validateReasoningTransportCarriers(
         reject(413, 'carrier_payload_too_large', 'A decoded reasoning carrier payload exceeds the configured limit.');
         return;
       }
-      if (parentKey === 'id' && Buffer.byteLength(candidate, 'utf8') > limits.maxGeminiSignatureIdBytes) {
-        reject(413, 'tool_call_id_carrier_too_large', 'Gemini signature carrier in tool_call.id exceeds 64 KiB.');
-        return;
-      }
       const envelope = decodeReasoningTransportEnvelope(encoded, limits);
       if (!envelope) {
         reject(400, 'malformed_reasoning_carrier', 'Reasoning carrier is malformed or exceeds structural limits.');
         return;
       }
-      if (parentKey === 'id' && (!envelope.kind || envelope.kind !== 'signature' ||
+      if (hasGeminiIdCarrier && (!envelope.kind || envelope.kind !== 'signature' ||
           (envelope.nativeItem && !isSignatureOnlyNativeItem(envelope.nativeItem)))) {
         reject(400, 'invalid_tool_call_id_carrier', 'tool_call.id may contain only a Gemini signature envelope.');
         return;
@@ -356,8 +367,8 @@ export function validateReasoningTransportCarriers(
       return;
     }
     if (Array.isArray(candidate)) {
-      for (const entry of candidate) {
-        visit(entry, parentKey, depth + 1);
+      for (let index = 0; index < candidate.length; index += 1) {
+        visit(candidate[index], [...path, index], depth + 1);
       }
       return;
     }
@@ -365,18 +376,26 @@ export function validateReasoningTransportCarriers(
       return;
     }
     for (const [key, entry] of Object.entries(candidate)) {
-      visit(entry, key, depth + 1);
+      visit(entry, [...path, key], depth + 1);
     }
   };
 
-  visit(value);
-  if (failure) {
-    return failure;
-  }
-  if (hasDependencyCycle(dependencies)) {
-    return { ok: false, status: 400, code: 'cyclic_native_dependency', message: 'Provider native item dependencies contain a cycle.' };
-  }
-  return { ok: true, itemCount, encodedBytes };
+  return {
+    validate(value: unknown): ReasoningCarrierValidationResult {
+      if (failure) {
+        return failure;
+      }
+      visit(value, []);
+      if (!failure && hasDependencyCycle(dependencies)) {
+        reject(
+          400,
+          'cyclic_native_dependency',
+          'Provider native item dependencies contain a cycle.'
+        );
+      }
+      return failure || { ok: true, itemCount, encodedBytes };
+    }
+  };
 }
 
 /** Validates all carrier-bearing JSON payloads in a complete set of SSE frames. */
@@ -384,26 +403,63 @@ export function validateReasoningTransportCarriersInSseFrames(
   frames: readonly string[],
   bodyLimitBytes: number
 ): ReasoningCarrierValidationResult {
-  const payloads: unknown[] = [];
+  const validator = createReasoningTransportCarrierValidator(bodyLimitBytes);
   for (const frame of frames) {
-    for (const eventBlock of frame.split(/\r?\n\r?\n/)) {
-      const data = eventBlock
-        .split(/\r?\n/)
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice('data:'.length).trimStart())
-        .join('\n')
-        .trim();
-      if (!data || data === '[DONE]') {
-        continue;
-      }
-      try {
-        payloads.push(JSON.parse(data) as unknown);
-      } catch {
-        // Non-JSON SSE data cannot contain a structured provider-native carrier.
-      }
+    const result = validateReasoningTransportCarriersInSseText(frame, validator);
+    if (!result.ok) {
+      return result;
     }
   }
-  return validateReasoningTransportCarriers(payloads, bodyLimitBytes);
+  return validator.validate(undefined);
+}
+
+/** Validates each complete SSE event before yielding it, without buffering the response. */
+export async function* validateReasoningTransportCarrierSseStream(
+  stream: AsyncIterable<unknown>,
+  bodyLimitBytes: number
+): AsyncGenerator<string> {
+  const validator = createReasoningTransportCarrierValidator(bodyLimitBytes);
+  const decoder = new TextDecoder();
+  let pending = '';
+
+  const appendChunk = (chunk: unknown): void => {
+    if (typeof chunk === 'string') {
+      pending += decoder.decode();
+      pending += chunk;
+      return;
+    }
+    if (chunk instanceof Uint8Array) {
+      pending += decoder.decode(chunk, { stream: true });
+      return;
+    }
+    pending += decoder.decode();
+    pending += String(chunk);
+  };
+
+  for await (const chunk of stream) {
+    appendChunk(chunk);
+    let boundary = /\r?\n\r?\n/.exec(pending);
+    while (boundary) {
+      const end = boundary.index + boundary[0].length;
+      const frame = pending.slice(0, end);
+      pending = pending.slice(end);
+      const validation = validateReasoningTransportCarriersInSseText(frame, validator);
+      if (!validation.ok) {
+        throw new Error(`Reasoning stream rejected: ${validation.code}`);
+      }
+      yield frame;
+      boundary = /\r?\n\r?\n/.exec(pending);
+    }
+  }
+
+  pending += decoder.decode();
+  if (pending) {
+    const validation = validateReasoningTransportCarriersInSseText(pending, validator);
+    if (!validation.ok) {
+      throw new Error(`Reasoning stream rejected: ${validation.code}`);
+    }
+    yield pending;
+  }
 }
 
 /**
@@ -690,11 +746,51 @@ function isSignatureOnlyNativeItem(item: ProviderNativeItem): boolean {
   return Object.keys(item.raw_payload).every((key) => key === 'data' || key === 'signature');
 }
 
+function isGeminiToolCallIdCarrier(value: string, path: Array<string | number>): boolean {
+  const lastKey = path[path.length - 1];
+  const isToolCallField = lastKey === 'tool_call_id' ||
+    (lastKey === 'id' && path.slice(0, -1).includes('tool_calls'));
+  return isToolCallField && value.includes(
+    `${GEMINI_THOUGHT_SIGNATURE_TOOL_CALL_ID_SEPARATOR}${REASONING_TRANSPORT_ENVELOPE_V3_PREFIX}`
+  );
+}
+
 function isCarrierPrefixed(value: string): boolean {
   return value.startsWith(REASONING_TRANSPORT_ENVELOPE_V3_PREFIX) ||
     value.startsWith(REASONING_TRANSPORT_ENVELOPE_V2_PREFIX) ||
     value.startsWith(REASONING_TRANSPORT_ENVELOPE_PREFIX) ||
     value.startsWith(OPENAI_RESPONSES_REASONING_ENVELOPE_PREFIX);
+}
+
+function validateReasoningTransportCarriersInSseText(
+  text: string,
+  validator: ReasoningTransportCarrierValidator
+): ReasoningCarrierValidationResult {
+  for (const eventBlock of text.split(/\r?\n\r?\n/)) {
+    const data = eventBlock
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice('data:'.length).trimStart())
+      .join('\n')
+      .trim();
+    if (!data || data === '[DONE]') {
+      continue;
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(data) as unknown;
+    } catch {
+      // Non-JSON SSE data cannot contain a structured provider-native carrier.
+      continue;
+    }
+    // Preserve the same nesting budget as validating the historical array of
+    // complete SSE payloads, while keeping only one event in memory.
+    const validation = validator.validate([payload]);
+    if (!validation.ok) {
+      return validation;
+    }
+  }
+  return validator.validate(undefined);
 }
 
 function carrierDecodedPayloadBytes(value: string): number | undefined {

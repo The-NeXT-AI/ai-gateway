@@ -102,6 +102,49 @@ describe('live reasoning conversion matrix', () => {
 });
 
 describe('reasoning stream regressions', () => {
+  it('forwards a converted event before the upstream stream closes', async () => {
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const upstream = new Response(
+      new ReadableStream<Uint8Array>({
+        start(nextController) {
+          controller = nextController;
+          nextController.enqueue(new TextEncoder().encode(
+            'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_live","model":"claude-live","usage":{}}}\n\n'
+          ));
+        }
+      }),
+      { headers: { 'content-type': 'text/event-stream' } }
+    );
+    const stream = relayConvertedStreamFromUpstreamResponse(
+      createReply(),
+      { adapterKey: 'openai_chat' } as never,
+      upstream
+    ) as unknown as AsyncIterable<string | Buffer>;
+    const iterator = stream[Symbol.asyncIterator]();
+    const nextChunk = iterator.next();
+    const timedOut = Symbol('timed-out');
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const first = await Promise.race([
+      nextChunk,
+      new Promise<typeof timedOut>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(timedOut), 1000);
+      })
+    ]);
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+    controller?.close();
+
+    if (first === timedOut) {
+      await nextChunk;
+    }
+    await iterator.return?.();
+    expect(first).not.toBe(timedOut);
+    if (first !== timedOut) {
+      expect(String(first.value)).toContain('chat.completion.chunk');
+    }
+  });
+
   it('keeps every indexed encrypted reasoning detail from a Chat stream', async () => {
     const stream = relayConvertedStreamFromUpstreamResponse(
       createReply(),

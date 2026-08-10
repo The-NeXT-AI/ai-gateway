@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { StandardRequest, StandardResponse } from '../../../types';
+import type { ProviderNativeItem, StandardRequest, StandardResponse } from '../../../types';
 import {
   decodeReasoningTransportEnvelope,
   GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
@@ -1839,6 +1839,90 @@ describe('geminiGenerateContentTargetAdapter', () => {
     });
     const formatted = formatGeminiGenerateContentResponse(parsed.value) as Record<string, any>;
     expect(formatted.candidates[0].content.parts).toEqual(rawParts);
+  });
+
+  it('preserves text and native Part order when replaying Gemini history', () => {
+    const nativePart: ProviderNativeItem = {
+      type: 'provider_native_item',
+      item_type: 'thought',
+      native_id: 'gemini_native_thought',
+      raw_payload: {
+        text: 'native thought',
+        thought: true,
+        thoughtSignature: 'native-signature'
+      },
+      provider_schema_version: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+      item_origin: 'native',
+      source_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+      source_origin: {
+        provider: 'gemini',
+        endpoint: 'gemini-endpoint',
+        model: 'gemini-3.5-flash',
+        credentialScope: 'gemini-account'
+      },
+      position: { turn: 0, step: 0, item: 1 },
+      capture_state: 'complete'
+    };
+    const projectedNativePart: ProviderNativeItem = {
+      ...nativePart,
+      item_type: 'function_call',
+      native_id: 'gemini_native_call',
+      raw_payload: {
+        thoughtSignature: 'call-signature',
+        functionCall: {
+          id: 'call_native',
+          name: 'lookup',
+          args: { query: 'weather' }
+        }
+      },
+      position: { turn: 0, step: 0, item: 3 }
+    };
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-3.5-flash:generateContent'
+      } as never,
+      standardRequest: {
+        model: 'gemini-3.5-flash',
+        input: [{
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'input_text', text: 'before native' },
+            nativePart,
+            { type: 'input_text', text: 'between native parts' },
+            {
+              type: 'tool_use',
+              id: 'call_native',
+              name: 'lookup',
+              input: { query: 'weather' },
+              native_item: projectedNativePart
+            },
+            { type: 'input_text', text: 'after native' }
+          ]
+        }]
+      },
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+    const contents = (built.value.body as Record<string, unknown>).contents as Array<{
+      parts: Array<Record<string, unknown>>;
+    }>;
+    expect(contents[0]?.parts).toEqual([
+      { text: 'before native' },
+      nativePart.raw_payload,
+      { text: 'between native parts' },
+      projectedNativePart.raw_payload,
+      { text: 'after native' }
+    ]);
   });
 
   it('keeps parallel Gemini calls and results in FC1, FC2, FR1, FR2 order', () => {

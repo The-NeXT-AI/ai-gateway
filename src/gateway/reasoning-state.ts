@@ -25,7 +25,7 @@ import {
   GEMINI_INTERACTIONS_REASONING_FORMAT,
   isProviderNativePayloadStructurallyValid,
   OPENAI_RESPONSES_REASONING_FORMAT,
-  validateReasoningTransportCarriersInSseFrames
+  validateReasoningTransportCarrierSseStream
 } from '../adapters/builtins/reasoning-envelope';
 import { parseSseChunks } from '../sse';
 import { readBearerToken, readHeader } from '../utils';
@@ -384,7 +384,7 @@ export function prepareReasoningStateForTargetResult(
         ...(nativeItems && nativeItems.length > 0 ? { native_items: nativeItems } : { native_items: undefined })
       };
     })
-    .filter((message) => message.content.length > 0);
+    .filter((message) => message.content.length > 0 || (message.native_items?.length || 0) > 0);
 
   return ok({
     ...request,
@@ -1342,39 +1342,11 @@ export function createReasoningAwarePassthroughSseStream(
   bodyLimitBytes = 32 * 1024 * 1024
 ): Readable {
   return Readable.from(
-    bufferReasoningAwarePassthroughSse(
-      response,
-      sourceAdapterKey,
-      origin,
-      abortSignal,
+    validateReasoningTransportCarrierSseStream(
+      relayReasoningAwarePassthroughSse(response, sourceAdapterKey, origin, abortSignal),
       bodyLimitBytes
     )
   );
-}
-
-async function* bufferReasoningAwarePassthroughSse(
-  response: Response,
-  sourceAdapterKey: string,
-  origin: ReasoningStateOrigin,
-  abortSignal: AbortSignal | undefined,
-  bodyLimitBytes: number
-): AsyncGenerator<string> {
-  const frames: string[] = [];
-  for await (const frame of relayReasoningAwarePassthroughSse(
-    response,
-    sourceAdapterKey,
-    origin,
-    abortSignal
-  )) {
-    frames.push(frame);
-  }
-  const validation = validateReasoningTransportCarriersInSseFrames(frames, bodyLimitBytes);
-  if (!validation.ok) {
-    throw new Error(`Reasoning stream rejected: ${validation.code}`);
-  }
-  for (const frame of frames) {
-    yield frame;
-  }
 }
 
 async function* relayReasoningAwarePassthroughSse(

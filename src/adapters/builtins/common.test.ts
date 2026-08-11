@@ -177,6 +177,31 @@ describe('buildAnthropicHeaders', () => {
 
     expect(result.value).not.toHaveProperty('user-agent');
   });
+
+  it('emits authorization Bearer alongside x-api-key for Anthropic upstreams', () => {
+    const result = buildAnthropicHeaders(
+      {
+        'x-api-key': 'x-api-key-token'
+      } as never,
+      {
+        auth: {
+          enabled: false,
+          mode: 'trusted_header'
+        }
+      } as never
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value['x-api-key']).toBe('x-api-key-token');
+    // OpenAI-compatible-hosted Anthropic endpoints (e.g. Ollama Cloud) reject
+    // x-api-key and require the Bearer form. Regression: this was missing and
+    // caused 401 from Ollama on the anthropic_messages forward.
+    expect(result.value['authorization']).toBe('Bearer x-api-key-token');
+  });
 });
 
 describe('buildGeminiUrl', () => {

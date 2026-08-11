@@ -326,6 +326,7 @@ export function parseOpenAIToStandardResponse(payload: unknown): Result<Standard
       asNumber(inputDetails?.cache_creation_tokens) ??
       asNumber(usageRaw?.cache_creation_tokens) ??
       asNumber(usageRaw?.cache_write_tokens),
+    input_includes_cache_tokens: true,
     cache_duration_seconds: extractCacheDurationSeconds(usageRaw, inputDetails),
     server_tool_use: normalizeServerToolUse(
       isObject(usageRaw?.server_tool_use) ? usageRaw.server_tool_use : undefined
@@ -412,6 +413,7 @@ export function parseGeminiToStandardResponse(payload: unknown): Result<Standard
     output_tokens: asNumber(usageRaw?.candidatesTokenCount),
     total_tokens: asNumber(usageRaw?.totalTokenCount),
     cache_read_tokens: asNumber(usageRaw?.cachedContentTokenCount),
+    input_includes_cache_tokens: true,
     cache_duration_seconds: extractCacheDurationSeconds(usageRaw)
   };
 
@@ -440,7 +442,8 @@ function parseGeminiInteractionToStandardResponse(payload: Record<string, unknow
     input_tokens: asNumber(usageRaw?.total_input_tokens),
     output_tokens: asNumber(usageRaw?.total_output_tokens),
     total_tokens: asNumber(usageRaw?.total_tokens),
-    cache_read_tokens: asNumber(usageRaw?.total_cached_tokens)
+    cache_read_tokens: asNumber(usageRaw?.total_cached_tokens),
+    input_includes_cache_tokens: true
   };
 
   const status = asString(payload.status);

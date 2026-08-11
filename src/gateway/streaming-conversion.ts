@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import type { FastifyReply } from 'fastify';
+import { anthropicInputTokens, toAnthropicInputTokens } from '../shared/usage';
 import {
   mapFinishReasonToAnthropic,
   mapFinishReasonToGemini,
@@ -93,6 +94,8 @@ interface AnthropicRelayState {
   messageId: string;
   model: string;
   inputTokens?: number;
+  /** See `StandardUsage.input_includes_cache_tokens`. */
+  inputIncludesCacheTokens?: boolean;
   outputTokens: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
@@ -792,6 +795,7 @@ function applyStandardUsageToAnthropicRelayState(
   usage: StandardUsage
 ): void {
   state.inputTokens = usage.input_tokens;
+  state.inputIncludesCacheTokens = usage.input_includes_cache_tokens;
   state.outputTokens = usage.output_tokens ?? state.outputTokens;
   state.cacheReadInputTokens = usage.cache_read_tokens;
   state.cacheCreationInputTokens = usage.cache_write_tokens;
@@ -1551,7 +1555,7 @@ function buildOpenAIChatUsage(usage: StandardResponse['usage']): Record<string, 
 
 function buildAnthropicMessageStartUsage(usage: StandardResponse['usage']): Record<string, unknown> {
   const payload: Record<string, unknown> = {
-    input_tokens: usage.input_tokens ?? 0,
+    input_tokens: anthropicInputTokens(usage) ?? 0,
     output_tokens: 0
   };
   addStandardCacheUsageToAnthropicUsage(payload, usage);
@@ -1564,7 +1568,7 @@ function buildAnthropicMessageDeltaUsageFromStandard(usage: StandardResponse['us
     output_tokens: usage.output_tokens ?? 0
   };
   if (usage.input_tokens !== undefined) {
-    payload.input_tokens = usage.input_tokens;
+    payload.input_tokens = anthropicInputTokens(usage);
   }
   addStandardCacheUsageToAnthropicUsage(payload, usage);
   addServerToolUseToAnthropicUsage(payload, usage.server_tool_use);
@@ -1581,6 +1585,15 @@ function addStandardCacheUsageToAnthropicUsage(
   if (usage.cache_write_tokens !== undefined) {
     payload.cache_creation_input_tokens = usage.cache_write_tokens;
   }
+}
+
+function relayAnthropicInputTokens(state: AnthropicRelayState): number | undefined {
+  return toAnthropicInputTokens(
+    state.inputTokens,
+    state.cacheReadInputTokens,
+    state.cacheCreationInputTokens,
+    state.inputIncludesCacheTokens
+  );
 }
 
 function addServerToolUseToAnthropicUsage(
@@ -5350,7 +5363,7 @@ function finalizeAnthropicRelay(state: AnthropicRelayState): string[] {
 
 function buildAnthropicMessageStartFrame(state: AnthropicRelayState): string {
   const usage: Record<string, unknown> = {
-    input_tokens: state.inputTokens ?? 0,
+    input_tokens: relayAnthropicInputTokens(state) ?? 0,
     output_tokens: 0
   };
   if (state.cacheCreationInputTokens !== undefined) {
@@ -5381,7 +5394,7 @@ function buildAnthropicMessageDeltaUsage(state: AnthropicRelayState): Record<str
     output_tokens: state.outputTokens
   };
   if (state.inputTokens !== undefined) {
-    usage.input_tokens = state.inputTokens;
+    usage.input_tokens = relayAnthropicInputTokens(state);
   }
   if (state.cacheCreationInputTokens !== undefined) {
     usage.cache_creation_input_tokens = state.cacheCreationInputTokens;
@@ -5411,6 +5424,9 @@ function updateAnthropicRelayUsage(
   const inputTokens = asNumber(usage.input_tokens) ?? asNumber(usage.prompt_tokens);
   if (inputTokens !== undefined) {
     state.inputTokens = inputTokens;
+    // `prompt_tokens` is the OpenAI-style counter, which already includes the cached
+    // prefix; Anthropic's `input_tokens` excludes it.
+    state.inputIncludesCacheTokens = asNumber(usage.input_tokens) === undefined;
   }
 
   const outputTokens = asNumber(usage.output_tokens) ?? asNumber(usage.completion_tokens);

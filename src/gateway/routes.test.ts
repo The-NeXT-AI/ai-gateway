@@ -3346,8 +3346,10 @@ describe('gateway routes protocol conversion', () => {
         .find((line) => line.startsWith('data: ') && line.includes('"type":"message_delta"'));
       expect(messageDeltaLine).toBeDefined();
       const messageDelta = JSON.parse(String(messageDeltaLine).slice('data: '.length));
+      // Upstream reported prompt_tokens=12 which already includes cached_tokens=3.
+      // Anthropic's input_tokens excludes the cached prefix, so 9 + 3 must equal 12.
       expect(messageDelta.usage).toMatchObject({
-        input_tokens: 12,
+        input_tokens: 9,
         output_tokens: 16,
         cache_read_input_tokens: 3
       });
@@ -3401,8 +3403,9 @@ describe('gateway routes protocol conversion', () => {
         stop_reason: 'end_turn',
         stop_sequence: null
       });
+      // prompt_tokens=4 includes cached_tokens=2, so the exclusive count is 2.
       expect(messageDelta.usage).toMatchObject({
-        input_tokens: 4,
+        input_tokens: 2,
         output_tokens: 1,
         cache_read_input_tokens: 2
       });

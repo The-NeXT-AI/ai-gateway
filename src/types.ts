@@ -902,6 +902,16 @@ export interface StandardUsage {
   total_tokens?: number;
   cache_read_tokens?: number;
   cache_write_tokens?: number;
+  /**
+   * Whether `input_tokens` already counts `cache_read_tokens` / `cache_write_tokens`.
+   *
+   * OpenAI (`prompt_tokens`) and Gemini (`promptTokenCount`) report an inclusive
+   * counter, while Anthropic `messages` reports `input_tokens` exclusive of the cached
+   * prefix. Set at the point the upstream response is parsed so Anthropic-facing
+   * formatters can emit a spec-conformant exclusive count. Left unset for upstreams
+   * that are already exclusive.
+   */
+  input_includes_cache_tokens?: boolean;
   cache_duration_seconds?: number;
   cache_ttl_seconds?: number;
   cache_age_seconds?: number;

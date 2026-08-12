@@ -4583,6 +4583,30 @@ async function resolveTransparentToolCalls(
  * keeps them in the transcript the client stores and replays, so later turns can use
  * them without re-running the tool.
  */
+/**
+ * MCP tool output arrives as a serialized `{content: [{type, text}]}` envelope. This
+ * text is going into the transcript a person reads, so unwrap it to the text parts
+ * when it has that shape and leave anything else untouched.
+ */
+function readableToolOutput(raw: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+  if (!isObject(parsed) || !Array.isArray(parsed.content)) {
+    return raw;
+  }
+  const parts: string[] = [];
+  for (const item of parsed.content) {
+    if (isObject(item) && item.type === 'text' && typeof item.text === 'string' && item.text.trim()) {
+      parts.push(item.text.trim());
+    }
+  }
+  return parts.length > 0 ? parts.join('\n\n') : raw;
+}
+
 function maybeFoldInternalToolResults(
   profile: VirtualModelProfileConfig,
   response: StandardResponse,
@@ -4608,7 +4632,7 @@ function foldInternalToolResultsIntoResponse(
     if (result.type !== 'tool_result' || typeof result.content !== 'string' || !result.content.trim()) {
       continue;
     }
-    texts.push(result.content.trim());
+    texts.push(readableToolOutput(result.content.trim()));
   }
   if (texts.length === 0) {
     // Nothing usable came back; still strip the calls so the client is not handed a

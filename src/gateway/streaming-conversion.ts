@@ -274,7 +274,7 @@ export interface OptimisticOpenAIChatStreamTurnResult {
   deferredAnthropicBlocks?: OptimisticAnthropicDeferredBlock[];
 }
 
-type OptimisticOpenAIChatRelay =
+export type OptimisticOpenAIChatRelay =
   | {
       sourceAdapterKey: 'openai_responses';
       state: OpenAIResponsesRelayState;
@@ -684,6 +684,63 @@ export function relayOptimisticOpenAIChatStreamToolCalls(
   return relay.sourceAdapterKey === 'openai_responses'
     ? frames.map((frame) => normalizeOpenAIResponsesSseFrame(relay.state, frame))
     : frames;
+}
+
+/**
+ * Emit assistant text into a relay that is already streaming.
+ *
+ * The gateway uses this for the output of its own tools. That output has no other way
+ * to reach the client — the client never declared the tool, so the call is stripped
+ * before the response goes back — and holding it until the loop's next upstream turn
+ * would mean the client sees nothing at all while the tool runs.
+ */
+export function relayOptimisticStreamText(
+  relay: OptimisticOpenAIChatRelay,
+  text: string
+): string[] {
+  if (!text) {
+    return [];
+  }
+
+  const payload: Record<string, unknown> = {
+    id:
+      relay.sourceAdapterKey === 'openai_responses'
+        ? relay.state.responseId
+        : relay.state.messageId,
+    object: 'chat.completion.chunk',
+    model: relay.state.model,
+    choices: [
+      {
+        index: 0,
+        delta: {
+          content: text
+        }
+      }
+    ]
+  };
+
+  const frames =
+    relay.sourceAdapterKey === 'openai_responses'
+      ? emitOpenAIResponsesFramesFromChatChunk(relay.state, payload, relay.tools)
+      : emitAnthropicFramesFromOpenAIChatChunk(relay.state, payload);
+  return relay.sourceAdapterKey === 'openai_responses'
+    ? frames.map((frame) => normalizeOpenAIResponsesSseFrame(relay.state, frame))
+    : frames;
+}
+
+/**
+ * A frame that carries no content but keeps the connection warm.
+ *
+ * A gateway-owned tool can hold the turn for minutes, and an idle socket that long gets
+ * dropped by intermediate proxies and client read timeouts. Anthropic has a `ping` event
+ * for exactly this; every other source gets an SSE comment, which the spec requires
+ * parsers to ignore.
+ */
+export function optimisticStreamKeepAliveFrame(relay: OptimisticOpenAIChatRelay): string {
+  if (relay.sourceAdapterKey === 'anthropic_messages' && relay.state.started) {
+    return encodeSseEvent('ping', { type: 'ping' });
+  }
+  return ': keep-alive\n\n';
 }
 
 export function relayOptimisticAnthropicDeferredContent(

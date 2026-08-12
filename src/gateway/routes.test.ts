@@ -9634,6 +9634,199 @@ export function createGatewayPlugin() {
     }
   });
 
+  it('streams internal tool output as it lands when foldInternalResults is enabled', async () => {
+    const firstStream = [
+      'data: {"id":"chatcmpl_fold_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+      'data: {"id":"chatcmpl_fold_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"reading the page. "}}]}\n\n',
+      'data: {"id":"chatcmpl_fold_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_vision_stream_1","type":"function","function":{"name":"vision_understand"}}]}}]}\n\n',
+      'data: {"id":"chatcmpl_fold_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"prompt\\":\\"transcribe\\"}"}}]}}]}\n\n',
+      'data: {"id":"chatcmpl_fold_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}\n\n',
+      'data: [DONE]\n\n'
+    ].join('');
+    const secondStream = [
+      'data: {"id":"chatcmpl_fold_stream_2","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+      'data: {"id":"chatcmpl_fold_stream_2","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"The invoice totals 41.70."}}]}\n\n',
+      'data: {"id":"chatcmpl_fold_stream_2","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}\n\n',
+      'data: [DONE]\n\n'
+    ].join('');
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(firstStream, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      )
+      .mockResolvedValueOnce(
+        new Response(secondStream, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const toolProvider = {
+      listDefinitions: async () => [
+        { name: 'vision_understand', description: 'Read an image', inputSchema: { type: 'object', properties: {} } }
+      ],
+      has: async () => true,
+      // Gateway tools speak MCP, so the raw result is an envelope the client should
+      // never have to read.
+      execute: async () => ({ content: [{ type: 'text', text: 'INVOICE #4417 — total 41.70' }] }),
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'fold-stream-profile',
+          key: 'fold-stream',
+          displayName: 'Fold Stream',
+          enabled: true,
+          match: { exactAliases: [], prefixes: [], suffixes: [':fold-stream'] },
+          baseModel: { mode: 'strip_suffix' },
+          tools: [{ name: 'vision_understand', visibility: 'internal' }],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 4,
+            clientToolsPolicy: 'allow',
+            foldInternalResults: true,
+            streamMode: 'optimistic'
+          },
+          materialization: { enabled: true, includeInGatewayModels: true }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: { 'content-type': 'application/json' },
+        payload: {
+          model: 'openai-main/glm-5:fold-stream',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'What does this page say?' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      const body = response.body;
+      expect(body).toContain('"text":"reading the page. "');
+      // The tool output reaches the client as text, with the MCP envelope unwrapped...
+      expect(body).toContain('[vision_understand]');
+      expect(body).toContain('INVOICE #4417');
+      expect(body).not.toContain('"content":[{\\"type\\":\\"text\\"');
+      // ...while the call itself stays invisible — the client never declared this tool.
+      expect(body).not.toContain('call_vision_stream_1');
+      expect(body).not.toContain('"name":"vision_understand"');
+      // It arrives before the model's own answer, not bundled in at the end.
+      expect(body.indexOf('INVOICE #4417')).toBeLessThan(body.indexOf('The invoice totals 41.70.'));
+      expect(body).toContain('"stop_reason":"end_turn"');
+      expect(body).not.toContain('event: error');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('streams internal tool output when the same optimistic turn also calls a client tool', async () => {
+    const firstStream = [
+      'data: {"id":"chatcmpl_mixed_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+      'data: {"id":"chatcmpl_mixed_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"on it. "}}]}\n\n',
+      'data: {"id":"chatcmpl_mixed_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_vision_mixed_1","type":"function","function":{"name":"vision_understand"}},{"index":1,"id":"call_bash_mixed_1","type":"function","function":{"name":"Bash"}}]}}]}\n\n',
+      'data: {"id":"chatcmpl_mixed_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"prompt\\":\\"transcribe\\"}"}},{"index":1,"function":{"arguments":"{\\"command\\":\\"date\\"}"}}]}}]}\n\n',
+      'data: {"id":"chatcmpl_mixed_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":4,"total_tokens":11}}\n\n',
+      'data: [DONE]\n\n'
+    ].join('');
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(firstStream, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const executed: string[] = [];
+    const toolProvider = {
+      listDefinitions: async () => [
+        { name: 'vision_understand', description: 'Read an image', inputSchema: { type: 'object', properties: {} } }
+      ],
+      has: async () => true,
+      execute: async (name: string) => {
+        executed.push(name);
+        return { content: [{ type: 'text', text: 'INVOICE #4417 — total 41.70' }] };
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'mixed-stream-profile',
+          key: 'mixed-stream',
+          displayName: 'Mixed Stream',
+          enabled: true,
+          match: { exactAliases: [], prefixes: [], suffixes: [':mixed-stream'] },
+          baseModel: { mode: 'strip_suffix' },
+          tools: [{ name: 'vision_understand', visibility: 'internal' }],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 4,
+            clientToolsPolicy: 'allow',
+            foldInternalResults: true,
+            streamMode: 'optimistic'
+          },
+          materialization: { enabled: true, includeInGatewayModels: true }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: { 'content-type': 'application/json' },
+        payload: {
+          model: 'openai-main/glm-5:mixed-stream',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'Read this page, then tell me the date' }],
+          tools: [
+            {
+              name: 'Bash',
+              description: 'Run a command',
+              input_schema: { type: 'object', properties: { command: { type: 'string' } } }
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      // The turn goes back for the client tool after one upstream call...
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // ...and the internal call ran instead of being dropped along with it.
+      expect(executed).toEqual(['vision_understand']);
+
+      const body = response.body;
+      expect(body).toContain('INVOICE #4417');
+      expect(body).toContain('"type":"tool_use","id":"call_bash_mixed_1","name":"Bash"');
+      expect(body).toContain('"stop_reason":"tool_use"');
+      expect(body).not.toContain('call_vision_mixed_1');
+      expect(body).not.toContain('"name":"vision_understand"');
+      expect(body).not.toContain('event: error');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('prioritizes client-visible calls when an optimistic turn also requests an internal tool', async () => {
     let releaseUpstream!: () => void;
     const upstreamRelease = new Promise<void>((resolve) => {

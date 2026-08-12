@@ -54,11 +54,14 @@ import {
   collectOpenAINonStreamPayloadFromEventStream,
   createOptimisticOpenAIChatStreamRelay,
   finalizeOptimisticOpenAIChatStreamRelay,
+  type OptimisticOpenAIChatRelay,
   type OptimisticOpenAIChatStreamTurnResult,
+  optimisticStreamKeepAliveFrame,
   relayOptimisticAnthropicDeferredContent,
   relayOptimisticAnthropicMessagesStreamTurn,
   relayOptimisticOpenAIChatStreamToolCalls,
   relayOptimisticOpenAIChatStreamTurn,
+  relayOptimisticStreamText,
   relayConvertedStreamFromStandardResponse,
   relayConvertedStreamFromUpstreamResponse
 } from './streaming-conversion';
@@ -2556,8 +2559,13 @@ async function handleVirtualModelRequest(
         // cannot answer a tool it never saw, and the loop cannot continue without the
         // client's result, so the turn has to go back. Run the internal calls first and
         // fold their output in as text: dropping them loses the work silently, and the
-        // model has no way to learn its call went nowhere.
-        if (callPartition.internal.length > 0) {
+        // model has no way to learn its call went nowhere. Without folding there is
+        // nowhere for the output to go — the calls are stripped and the loop returns —
+        // so running them would only burn an upstream call.
+        if (
+          callPartition.internal.length > 0 &&
+          virtualModel.profile.execution.foldInternalResults
+        ) {
           const mixedResults = await executeInternalVirtualToolCalls(
             runtime,
             virtualModel.profile,
@@ -3837,6 +3845,29 @@ async function* runOptimisticVirtualModelStream(input: {
       if (callPartition.client.length > 0 || callPartition.unknown.length > 0) {
         // Client-owned calls take precedence for a mixed turn: the gateway cannot
         // continue an internal tool loop until the client has supplied its results.
+        // The internal calls still run first when their output can be surfaced —
+        // dropping them unrun would silently discard the work and leave the model
+        // believing its call went nowhere.
+        if (
+          callPartition.internal.length > 0 &&
+          input.virtualModel.profile.execution.foldInternalResults
+        ) {
+          internalToolCalls += callPartition.internal.length;
+          const mixedResults: StandardRequestInputContent[] = [];
+          yield* streamInternalVirtualToolCalls({
+            runtime: input.runtime,
+            profile: input.virtualModel.profile,
+            toolOwners: input.mergedToolingResult.toolOwners,
+            multimodalReferences: input.multimodalReferences,
+            relay,
+            calls: callPartition.internal,
+            collected: mixedResults
+          });
+          aggregatedUsage = addServerToolUseToStandardUsage(
+            aggregatedUsage,
+            countInternalWebSearchToolCalls(input.virtualModel.profile, callPartition.internal)
+          );
+        }
         const finalResponse = filterInternalToolCallsFromStandardResponse(
           lastResponse,
           input.mergedToolingResult.toolOwners,
@@ -3898,13 +3929,16 @@ async function* runOptimisticVirtualModelStream(input: {
         return;
       }
 
-      const toolResults = await executeInternalVirtualToolCalls(
-        input.runtime,
-        input.virtualModel.profile,
-        callPartition.internal,
-        input.mergedToolingResult.toolOwners,
-        input.multimodalReferences
-      );
+      const toolResults: StandardRequestInputContent[] = [];
+      yield* streamInternalVirtualToolCalls({
+        runtime: input.runtime,
+        profile: input.virtualModel.profile,
+        toolOwners: input.mergedToolingResult.toolOwners,
+        multimodalReferences: input.multimodalReferences,
+        relay,
+        calls: callPartition.internal,
+        collected: toolResults
+      });
       aggregatedUsage = addServerToolUseToStandardUsage(
         aggregatedUsage,
         countInternalWebSearchToolCalls(input.virtualModel.profile, callPartition.internal)
@@ -4619,14 +4653,16 @@ function maybeFoldInternalToolResults(
   return foldInternalToolResultsIntoResponse(response, calls, results);
 }
 
-function foldInternalToolResultsIntoResponse(
-  response: StandardResponse,
+/**
+ * Render executed gateway-owned tool calls as the assistant text a person reads.
+ *
+ * Shared by the buffered path, which folds this into the finished response, and the
+ * streaming path, which emits it the moment each call returns.
+ */
+function renderInternalToolResultsText(
   executedCalls: StandardResponseFunctionCall[],
   results: StandardRequestInputContent[]
-): StandardResponse {
-  const executedIds = new Set(executedCalls.map((call) => call.call_id || call.id));
-  const executedNames = executedCalls.map((call) => call.name);
-
+): string | undefined {
   const texts: string[] = [];
   for (const result of results) {
     if (result.type !== 'tool_result' || typeof result.content !== 'string' || !result.content.trim()) {
@@ -4635,6 +4671,23 @@ function foldInternalToolResultsIntoResponse(
     texts.push(readableToolOutput(result.content.trim()));
   }
   if (texts.length === 0) {
+    return undefined;
+  }
+
+  const executedNames = executedCalls.map((call) => call.name);
+  const label = executedNames.length === 1 ? executedNames[0] : executedNames.join(', ');
+  return `[${label}]\n${texts.join('\n\n')}`;
+}
+
+function foldInternalToolResultsIntoResponse(
+  response: StandardResponse,
+  executedCalls: StandardResponseFunctionCall[],
+  results: StandardRequestInputContent[]
+): StandardResponse {
+  const executedIds = new Set(executedCalls.map((call) => call.call_id || call.id));
+  const text = renderInternalToolResultsText(executedCalls, results);
+
+  if (text === undefined) {
     // Nothing usable came back; still strip the calls so the client is not handed a
     // tool_use it cannot answer.
     return {
@@ -4644,9 +4697,6 @@ function foldInternalToolResultsIntoResponse(
       )
     };
   }
-
-  const label = executedNames.length === 1 ? executedNames[0] : executedNames.join(', ');
-  const text = `[${label}]\n${texts.join('\n\n')}`;
 
   const output = response.output.filter(
     (item) => item.type !== 'function_call' || !executedIds.has(item.call_id || item.id)
@@ -4666,6 +4716,101 @@ function foldInternalToolResultsIntoResponse(
     ],
     output_text: response.output_text ? `${response.output_text}\n\n${text}` : text
   };
+}
+
+/**
+ * How long the stream may go quiet while a gateway-owned tool runs before a keep-alive
+ * frame goes out. Well under the 60s idle timeout common to proxies and HTTP clients.
+ */
+const INTERNAL_TOOL_STREAM_KEEP_ALIVE_MS = 10_000;
+
+/**
+ * Run gateway-owned tool calls inside a live stream, one at a time.
+ *
+ * The buffered path can afford to run every call and fold the output into the finished
+ * response. A stream cannot: a vision or search call holds the turn for minutes, and a
+ * client that sees no bytes in that window times out and loses the whole turn. So each
+ * call keeps the connection warm while it runs, and its output goes out as assistant
+ * text the moment it lands rather than waiting for the loop to come back around.
+ */
+export async function* streamInternalVirtualToolCalls(input: {
+  runtime: GatewayRuntime;
+  profile: VirtualModelProfileConfig;
+  toolOwners: Map<string, VirtualToolOwner>;
+  multimodalReferences: VirtualMultimodalReference[];
+  relay: OptimisticOpenAIChatRelay;
+  calls: StandardResponseFunctionCall[];
+  collected: StandardRequestInputContent[];
+  keepAliveIntervalMs?: number;
+}): AsyncGenerator<string> {
+  const keepAliveFrame = optimisticStreamKeepAliveFrame(input.relay);
+  const keepAliveIntervalMs = input.keepAliveIntervalMs ?? INTERNAL_TOOL_STREAM_KEEP_ALIVE_MS;
+
+  for (const call of input.calls) {
+    const pending = executeInternalVirtualToolCalls(
+      input.runtime,
+      input.profile,
+      [call],
+      input.toolOwners,
+      input.multimodalReferences
+    );
+    yield* keepAliveWhilePending(pending, keepAliveFrame, keepAliveIntervalMs);
+
+    const results = await pending;
+    input.collected.push(...results);
+    if (!input.profile.execution.foldInternalResults) {
+      continue;
+    }
+
+    const text = renderInternalToolResultsText([call], results);
+    if (text) {
+      yield* relayOptimisticStreamText(input.relay, `${text}\n\n`);
+    }
+  }
+}
+
+/**
+ * Yield `frame` every `intervalMs` until `pending` settles. Yields nothing if it settles
+ * first, so a fast tool adds no frames at all.
+ */
+export async function* keepAliveWhilePending(
+  pending: Promise<unknown>,
+  frame: string,
+  intervalMs: number
+): AsyncGenerator<string> {
+  if (!frame || intervalMs <= 0) {
+    return;
+  }
+
+  let settled = false;
+  // The caller awaits `pending` itself; this derived promise only tracks completion, so
+  // swallowing the rejection here is right — it would otherwise look unhandled.
+  const settledPromise = pending.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    }
+  );
+
+  while (!settled) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      settledPromise.then(() => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), intervalMs);
+      })
+    ]);
+    if (timer) {
+      clearTimeout(timer);
+    }
+    if (!timedOut || settled) {
+      return;
+    }
+
+    yield frame;
+  }
 }
 
 function handleTransparentUnknownTool(

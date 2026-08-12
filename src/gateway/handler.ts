@@ -4674,6 +4674,9 @@ function mergeStandardUsage(base: StandardUsage, next: StandardUsage): StandardU
       (base.cache_duration_seconds || 0) + (next.cache_duration_seconds || 0) || undefined,
     cache_ttl_seconds: next.cache_ttl_seconds ?? base.cache_ttl_seconds,
     cache_age_seconds: next.cache_age_seconds ?? base.cache_age_seconds,
+    // Both sides come from the same upstream, so the convention is shared. Losing it
+    // here would make Anthropic egress forward an inclusive counter again.
+    input_includes_cache_tokens: base.input_includes_cache_tokens ?? next.input_includes_cache_tokens,
     server_tool_use: mergeServerToolUse(base.server_tool_use, next.server_tool_use)
   };
 }

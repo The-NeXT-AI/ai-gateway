@@ -2183,6 +2183,12 @@ async function handleVirtualModelRequest(
       model
     };
     let aggregatedUsage: StandardUsage = {};
+      // Internal tools run inside this loop, so the client never sees their
+      // tool_use/tool_result pair. Keep their output here and fold it into the
+      // reply — otherwise the work only survives if the model happens to restate
+      // it, which is exactly how a later turn ends up blind to what was read.
+      const internalCallsRun: StandardResponseFunctionCall[] = [];
+      const internalResultsRun: StandardRequestInputContent[] = [];
     let internalToolCalls = 0;
     let lastUpstreamRequest: UpstreamRequest | undefined;
     let lastResponse: StandardResponse | undefined;
@@ -2528,10 +2534,15 @@ async function handleVirtualModelRequest(
           targetProviderConfig,
           attempts.length,
           lastAttemptSequence,
-        filterInternalToolCallsFromStandardResponse(
-          lastResponse,
-          mergedToolingResult.toolOwners,
-          aggregatedUsage
+        maybeFoldInternalToolResults(
+          virtualModel.profile,
+          filterInternalToolCallsFromStandardResponse(
+            lastResponse,
+            mergedToolingResult.toolOwners,
+            aggregatedUsage
+          ),
+          internalCallsRun,
+          internalResultsRun
         ),
         isStreaming,
         model,
@@ -2541,6 +2552,26 @@ async function handleVirtualModelRequest(
       }
 
       if (callPartition.client.length > 0 || callPartition.unknown.length > 0) {
+        // The turn mixes internal tools with tools only the client can run. The client
+        // cannot answer a tool it never saw, and the loop cannot continue without the
+        // client's result, so the turn has to go back. Run the internal calls first and
+        // fold their output in as text: dropping them loses the work silently, and the
+        // model has no way to learn its call went nowhere.
+        if (callPartition.internal.length > 0) {
+          const mixedResults = await executeInternalVirtualToolCalls(
+            runtime,
+            virtualModel.profile,
+            callPartition.internal,
+            mergedToolingResult.toolOwners,
+            multimodalRewrite.references
+          );
+          aggregatedUsage = addServerToolUseToStandardUsage(
+            aggregatedUsage,
+            countInternalWebSearchToolCalls(virtualModel.profile, callPartition.internal)
+          );
+          internalCallsRun.push(...callPartition.internal);
+          internalResultsRun.push(...mixedResults);
+        }
         return sendVirtualModelResponse(
           reply,
           request,
@@ -2551,10 +2582,15 @@ async function handleVirtualModelRequest(
           targetProviderConfig,
           attempts.length,
           lastAttemptSequence,
-        filterInternalToolCallsFromStandardResponse(
-          lastResponse,
-          mergedToolingResult.toolOwners,
-          aggregatedUsage
+        maybeFoldInternalToolResults(
+          virtualModel.profile,
+          filterInternalToolCallsFromStandardResponse(
+            lastResponse,
+            mergedToolingResult.toolOwners,
+            aggregatedUsage
+          ),
+          internalCallsRun,
+          internalResultsRun
         ),
         isStreaming,
         model,
@@ -2585,6 +2621,8 @@ async function handleVirtualModelRequest(
         mergedToolingResult.toolOwners,
         multimodalRewrite.references
       );
+      internalCallsRun.push(...callPartition.internal);
+      internalResultsRun.push(...toolResults);
       aggregatedUsage = addServerToolUseToStandardUsage(
         aggregatedUsage,
         countInternalWebSearchToolCalls(virtualModel.profile, callPartition.internal)
@@ -4545,6 +4583,18 @@ async function resolveTransparentToolCalls(
  * keeps them in the transcript the client stores and replays, so later turns can use
  * them without re-running the tool.
  */
+function maybeFoldInternalToolResults(
+  profile: VirtualModelProfileConfig,
+  response: StandardResponse,
+  calls: StandardResponseFunctionCall[],
+  results: StandardRequestInputContent[]
+): StandardResponse {
+  if (!profile.execution.foldInternalResults || calls.length === 0) {
+    return response;
+  }
+  return foldInternalToolResultsIntoResponse(response, calls, results);
+}
+
 function foldInternalToolResultsIntoResponse(
   response: StandardResponse,
   executedCalls: StandardResponseFunctionCall[],

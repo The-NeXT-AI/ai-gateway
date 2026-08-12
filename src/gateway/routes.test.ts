@@ -8654,6 +8654,220 @@ export function createGatewayPlugin() {
     }
   });
 
+  it('folds internal tool output into the reply when foldInternalResults is enabled', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 'chatcmpl_fold_1',
+            model: 'glm-5',
+            choices: [
+              {
+                index: 0,
+                finish_reason: 'tool_calls',
+                message: {
+                  role: 'assistant',
+                  content: '',
+                  tool_calls: [
+                    { id: 'call_i1', type: 'function', function: { name: 'search_web', arguments: '{"query":"page 1"}' } }
+                  ]
+                }
+              }
+            ],
+            usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 }
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 'chatcmpl_fold_2',
+            model: 'glm-5',
+            choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'fresh answer' } }],
+            usage: { prompt_tokens: 6, completion_tokens: 2, total_tokens: 8 }
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const executed: string[] = [];
+    const toolProvider = {
+      listDefinitions: async () => [
+        { name: 'search_web', description: 'Search', inputSchema: { type: 'object', properties: {} } }
+      ],
+      has: async () => true,
+      execute: async (name: string) => {
+        executed.push(name);
+        return { transcript: 'Ghisha Expert hours, inside the air gap.' };
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'fold-profile',
+          key: 'fold-profile',
+          displayName: 'Fold',
+          enabled: true,
+          match: { exactAliases: [], prefixes: [], suffixes: [':search'] },
+          baseModel: { mode: 'strip_suffix' },
+          tools: [{ name: 'search_web', visibility: 'internal' }],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 4,
+            clientToolsPolicy: 'allow',
+            foldInternalResults: true,
+            streamMode: 'buffered'
+          },
+          materialization: { enabled: true, includeInGatewayModels: true }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: { 'content-type': 'application/json' },
+        payload: {
+          model: 'openai-main/glm-5:search',
+          messages: [{ role: 'user', content: 'Transcribe page 1' }],
+          tools: [{ type: 'function', function: { name: 'Bash', parameters: { type: 'object', properties: {} } } }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const message = JSON.parse(response.body).choices[0]?.message;
+      // Without the fold the transcript exists only in the gateway's working history,
+      // so the next turn — which replays the client's transcript — cannot see it.
+      expect(String(message?.content)).toContain('Ghisha Expert hours, inside the air gap.');
+      expect(String(message?.content)).toContain('fresh answer');
+      expect(message?.tool_calls).toBeUndefined();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('runs internal tools when the same turn also calls a client tool', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 'chatcmpl_fold_1',
+            model: 'glm-5',
+            choices: [
+              {
+                index: 0,
+                finish_reason: 'tool_calls',
+                message: {
+                  role: 'assistant',
+                  content: '',
+                  tool_calls: [
+                    { id: 'call_i1', type: 'function', function: { name: 'search_web', arguments: '{"query":"page 1"}' } },
+                    { id: 'call_c1', type: 'function', function: { name: 'Bash', arguments: '{"command":"date"}' } }
+                  ]
+                }
+              }
+            ],
+            usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 }
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 'chatcmpl_fold_2',
+            model: 'glm-5',
+            choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'fresh answer' } }],
+            usage: { prompt_tokens: 6, completion_tokens: 2, total_tokens: 8 }
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const executed: string[] = [];
+    const toolProvider = {
+      listDefinitions: async () => [
+        { name: 'search_web', description: 'Search', inputSchema: { type: 'object', properties: {} } }
+      ],
+      has: async () => true,
+      execute: async (name: string) => {
+        executed.push(name);
+        return { transcript: 'Ghisha Expert hours, inside the air gap.' };
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'fold-profile',
+          key: 'fold-profile',
+          displayName: 'Fold',
+          enabled: true,
+          match: { exactAliases: [], prefixes: [], suffixes: [':search'] },
+          baseModel: { mode: 'strip_suffix' },
+          tools: [{ name: 'search_web', visibility: 'internal' }],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 4,
+            clientToolsPolicy: 'allow',
+            foldInternalResults: true,
+            streamMode: 'buffered'
+          },
+          materialization: { enabled: true, includeInGatewayModels: true }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: { 'content-type': 'application/json' },
+        payload: {
+          model: 'openai-main/glm-5:search',
+          messages: [{ role: 'user', content: 'Transcribe page 1' }],
+          tools: [{ type: 'function', function: { name: 'Bash', parameters: { type: 'object', properties: {} } } }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      // The turn goes back for the client tool after a single upstream call...
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // ...but the internal tool ran instead of being discarded with it.
+      expect(executed).toEqual(['search_web']);
+
+      const message = JSON.parse(response.body).choices[0]?.message;
+      expect(String(message?.content)).toContain('Ghisha Expert hours, inside the air gap.');
+      const names = (message?.tool_calls || []).map((c: { function: { name: string } }) => c.function.name);
+      expect(names).toEqual(['Bash']);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('executes internal virtual model tools without exposing tool calls to the client', async () => {
     const fetchMock = vi
       .fn()

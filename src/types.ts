@@ -747,6 +747,17 @@ export interface VirtualModelExecutionConfig {
   clientToolsPolicy: 'allow' | 'deny';
   matchMultimodal?: boolean;
   matchWebSearch?: boolean;
+  /**
+   * Fold the output of internal tools into the reply as text.
+   *
+   * Internal tools run inside the gateway, so their tool_use/tool_result pair never
+   * reaches the client and is absent from the history the client replays on the next
+   * turn — the work survives only if the model happens to restate it. Enable this to
+   * carry the output back as assistant text so later turns can use it without
+   * re-running the tool. Off by default: it makes internal tool output visible to the
+   * client, which the default contract does not.
+   */
+  foldInternalResults?: boolean;
   streamMode: 'buffered' | 'optimistic';
 }
 

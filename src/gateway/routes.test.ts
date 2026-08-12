@@ -8452,6 +8452,104 @@ export function createGatewayPlugin() {
     }
   });
 
+  it('runs gateway-owned tools and folds their result into a turn that also calls a client tool', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          id: 'chatcmpl_mixed_1',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'tool_calls',
+              message: {
+                role: 'assistant',
+                content: '',
+                tool_calls: [
+                  {
+                    id: 'call_vision_1',
+                    type: 'function',
+                    function: { name: 'search_web', arguments: '{"query":"what is in the image"}' }
+                  },
+                  {
+                    id: 'call_client_1',
+                    type: 'function',
+                    function: { name: 'private_client_tool', arguments: '{"value":1}' }
+                  }
+                ]
+              }
+            }
+          ],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 }
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const executedToolCalls: Array<{ name: string; args: unknown }> = [];
+    const toolProvider = {
+      listDefinitions: async () => [
+        { name: 'search_web', description: 'Search the web', inputSchema: { type: 'object', properties: {} } }
+      ],
+      has: async () => true,
+      execute: async (name: string, input: { args: unknown }) => {
+        executedToolCalls.push({ name, args: input.args });
+        return { summary: 'the image shows a red square' };
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])]);
+    config.transparentToolExecution = {
+      enabled: true,
+      maxTurns: 4,
+      maxToolCalls: 4,
+      requireClientDeclaration: true,
+      unknownToolPolicy: 'return_to_client',
+      allowTools: [],
+      denyTools: []
+    };
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: { 'content-type': 'application/json' },
+        payload: {
+          model: 'openai-main/glm-5',
+          messages: [{ role: 'user', content: 'Look at the image and run the tool' }],
+          tools: [
+            { type: 'function', function: { name: 'search_web', parameters: { type: 'object', properties: {} } } },
+            { type: 'function', function: { name: 'private_client_tool', parameters: { type: 'object', properties: {} } } }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      // The turn still goes back to the client after one upstream call...
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // ...but the gateway-owned tool ran instead of being discarded.
+      expect(executedToolCalls).toEqual([
+        { name: 'search_web', args: { query: 'what is in the image' } }
+      ]);
+
+      const payload = JSON.parse(response.body);
+      const message = payload.choices[0]?.message;
+      // Its result is carried back as text so it survives in the client's transcript.
+      expect(String(message?.content)).toContain('the image shows a red square');
+      // The client only sees the tool it declared and can actually run.
+      const returnedTools = (message?.tool_calls || []).map((call: { function: { name: string } }) => call.function.name);
+      expect(returnedTools).toEqual(['private_client_tool']);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('returns ordinary tool calls to the client when transparent tools are unknown', async () => {
     const fetchMock = vi.fn(async () =>
       new Response(

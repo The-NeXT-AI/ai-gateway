@@ -207,7 +207,7 @@ type TransparentToolResolution =
     }
   | {
       ok: true;
-      executableCalls: [];
+      executableCalls: StandardResponseFunctionCall[];
       bindings: Map<string, TransparentToolBinding>;
       returnToClient: true;
     };
@@ -1649,11 +1649,38 @@ async function runTransparentToolExecutionLoop(input: {
     }
 
     if ('returnToClient' in toolResolution) {
+      // The turn mixes gateway-owned tools with client-owned ones. The client cannot
+      // produce a tool_result for a tool it never declared, and the gateway cannot
+      // continue the loop without the client's result, so the turn must go back. Run
+      // the gateway-owned calls first and fold their output into the assistant message
+      // as text: that keeps the result in the conversation the client stores, so it
+      // survives into later turns instead of being silently discarded.
+      let responseForClient = lastResponse;
+      if (toolResolution.executableCalls.length > 0) {
+        const internalResults = await executeTransparentToolCalls(
+          input.runtime,
+          input.source,
+          input.targetProvider,
+          input.targetProviderConfig,
+          toolResolution.executableCalls,
+          toolResolution.bindings
+        );
+        aggregatedUsage = addServerToolUseToStandardUsage(
+          aggregatedUsage,
+          countTransparentWebSearchToolCalls(toolResolution.executableCalls, toolResolution.bindings)
+        );
+        responseForClient = foldInternalToolResultsIntoResponse(
+          lastResponse,
+          toolResolution.executableCalls,
+          internalResults
+        );
+      }
+
       return {
         ok: true,
         standardRequest: workingRequest,
         standardResponse: {
-          ...lastResponse,
+          ...responseForClient,
           usage: aggregatedUsage
         },
         upstreamRequest: lastUpstreamRequest,
@@ -4427,23 +4454,37 @@ async function resolveTransparentToolCalls(
   const bindings = new Map<string, TransparentToolBinding>();
   const executableCalls: StandardResponseFunctionCall[] = [];
 
+  const unknownToolPolicy = executionConfig?.unknownToolPolicy || 'return_to_client';
+  let hasClientOwnedCall = false;
+
   for (const toolCall of toolCalls) {
     if (
       executionConfig?.requireClientDeclaration !== false &&
       !declaredToolNames.has(toolCall.name)
     ) {
-      return handleTransparentUnknownTool(
-        executionConfig?.unknownToolPolicy || 'return_to_client',
-        `Transparent tool execution cannot run undeclared tool: ${toolCall.name}`
-      );
+      if (unknownToolPolicy === 'fail') {
+        return handleTransparentUnknownTool(
+          unknownToolPolicy,
+          `Transparent tool execution cannot run undeclared tool: ${toolCall.name}`
+        );
+      }
+      hasClientOwnedCall = true;
+      continue;
     }
 
     const resolvedTool = resolveRuntimeToolDefinition(toolCall.name, definitions);
     if (!resolvedTool) {
-      return handleTransparentUnknownTool(
-        executionConfig?.unknownToolPolicy || 'return_to_client',
-        `Transparent tool is not available from MCP provider: ${toolCall.name}`
-      );
+      if (unknownToolPolicy === 'fail') {
+        return handleTransparentUnknownTool(
+          unknownToolPolicy,
+          `Transparent tool is not available from MCP provider: ${toolCall.name}`
+        );
+      }
+      // A tool the client owns (it declared it, the gateway cannot run it). The turn has
+      // to go back so the client can execute it, but any gateway-owned call in the same
+      // turn is still run below and folded into the response as text.
+      hasClientOwnedCall = true;
+      continue;
     }
 
     if ('error' in resolvedTool) {
@@ -4479,10 +4520,77 @@ async function resolveTransparentToolCalls(
     executableCalls.push(toolCall);
   }
 
+  if (hasClientOwnedCall) {
+    return {
+      ok: true,
+      executableCalls,
+      bindings,
+      returnToClient: true
+    };
+  }
+
   return {
     ok: true,
     executableCalls,
     bindings
+  };
+}
+
+/**
+ * Drop the gateway-owned function calls from a response and append their results as
+ * assistant text instead.
+ *
+ * The client never declared these tools, so forwarding the calls would be meaningless
+ * to it and dropping them outright would lose the work. Rendering the results as text
+ * keeps them in the transcript the client stores and replays, so later turns can use
+ * them without re-running the tool.
+ */
+function foldInternalToolResultsIntoResponse(
+  response: StandardResponse,
+  executedCalls: StandardResponseFunctionCall[],
+  results: StandardRequestInputContent[]
+): StandardResponse {
+  const executedIds = new Set(executedCalls.map((call) => call.call_id || call.id));
+  const executedNames = executedCalls.map((call) => call.name);
+
+  const texts: string[] = [];
+  for (const result of results) {
+    if (result.type !== 'tool_result' || typeof result.content !== 'string' || !result.content.trim()) {
+      continue;
+    }
+    texts.push(result.content.trim());
+  }
+  if (texts.length === 0) {
+    // Nothing usable came back; still strip the calls so the client is not handed a
+    // tool_use it cannot answer.
+    return {
+      ...response,
+      output: response.output.filter(
+        (item) => item.type !== 'function_call' || !executedIds.has(item.call_id || item.id)
+      )
+    };
+  }
+
+  const label = executedNames.length === 1 ? executedNames[0] : executedNames.join(', ');
+  const text = `[${label}]\n${texts.join('\n\n')}`;
+
+  const output = response.output.filter(
+    (item) => item.type !== 'function_call' || !executedIds.has(item.call_id || item.id)
+  );
+
+  return {
+    ...response,
+    output: [
+      {
+        type: 'message',
+        id: `msg_${randomUUID()}`,
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text, annotations: [] }]
+      },
+      ...output
+    ],
+    output_text: response.output_text ? `${response.output_text}\n\n${text}` : text
   };
 }
 

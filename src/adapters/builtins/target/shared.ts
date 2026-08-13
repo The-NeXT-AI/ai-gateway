@@ -1,17 +1,24 @@
 import { randomUUID } from 'node:crypto';
 import type {
+  ProviderNativeItem,
   Result,
   ProviderConfig,
   StandardRequest,
   StandardResponse,
   StandardResponseFunctionCall,
+  StandardResponseMessageContent,
   StandardResponseReasoning,
   StandardResponseOutputItem,
   StandardUsage
 } from '../../../types';
 import { err, ok } from '../../../types';
 import { asBoolean, asNumber, asString, extractTextFromPart, isObject } from '../../../utils';
-import { OPENAI_RESPONSES_REASONING_FORMAT } from '../reasoning-envelope';
+import {
+  ANTHROPIC_CLAUDE_REASONING_FORMAT,
+  GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
+  OPENAI_RESPONSES_REASONING_FORMAT
+} from '../reasoning-envelope';
 import { resolveOpenAIChatProviderThinkingAdapter } from './openai-chat-compat';
 
 interface OpenAIChatCompatibleRewriteOptions {
@@ -288,7 +295,10 @@ export function shouldIncludeOpenAIChatStreamUsage(
   );
 }
 
-export function parseOpenAIToStandardResponse(payload: unknown): Result<StandardResponse> {
+export function parseOpenAIToStandardResponse(
+  payload: unknown,
+  options: { compactionMode?: ProviderNativeItem['compaction_mode'] } = {}
+): Result<StandardResponse> {
   if (!isObject(payload)) {
     return err('Invalid OpenAI response payload.');
   }
@@ -300,12 +310,19 @@ export function parseOpenAIToStandardResponse(payload: unknown): Result<Standard
   const toolCalls = extractOpenAIFunctionCalls(payload);
   const reasoningItems = extractOpenAIReasoningItems(payload);
   const responseIncomplete = asString(payload.status) === 'incomplete';
+  const orderedResponsesOutput = Array.isArray(payload.output)
+    ? buildOrderedOpenAIResponsesOutputItems(
+        payload.output,
+        options.compactionMode
+      )
+    : undefined;
 
   if (
     !responseIncomplete &&
     !outputText &&
     toolCalls.length === 0 &&
-    reasoningItems.length === 0
+    reasoningItems.length === 0 &&
+    (!orderedResponsesOutput || orderedResponsesOutput.length === 0)
   ) {
     return err('OpenAI response does not contain text output, reasoning output, or tool calls.');
   }
@@ -336,7 +353,7 @@ export function parseOpenAIToStandardResponse(payload: unknown): Result<Standard
     id: asString(payload.id) || `resp_${randomUUID()}`,
     model: asString(payload.model) || 'unknown',
     outputText,
-    outputItems: buildStandardResponseOutputItems(outputText, toolCalls, reasoningItems),
+    outputItems: orderedResponsesOutput || buildStandardResponseOutputItems(outputText, toolCalls, reasoningItems),
     usage,
     finishReason: responseIncomplete
       ? asString(isObject(payload.incomplete_details) ? payload.incomplete_details.reason : undefined) ||
@@ -346,7 +363,10 @@ export function parseOpenAIToStandardResponse(payload: unknown): Result<Standard
   }));
 }
 
-export function parseAnthropicToStandardResponse(payload: unknown): Result<StandardResponse> {
+export function parseAnthropicToStandardResponse(
+  payload: unknown,
+  options: { providerMode?: string } = {}
+): Result<StandardResponse> {
   if (!isObject(payload)) {
     return err('Invalid Anthropic response payload.');
   }
@@ -354,6 +374,9 @@ export function parseAnthropicToStandardResponse(payload: unknown): Result<Stand
   const text = extractAnthropicText(payload.content);
   const toolCalls = extractAnthropicFunctionCalls(payload.content);
   const reasoningItems = extractAnthropicReasoningItems(payload.content);
+  const orderedContent = Array.isArray(payload.content)
+    ? buildOrderedAnthropicOutputItems(payload.content, options.providerMode)
+    : undefined;
   if (!text && toolCalls.length === 0 && reasoningItems.length === 0) {
     return err('Anthropic response does not contain text output, reasoning output, or tool calls.');
   }
@@ -379,7 +402,7 @@ export function parseAnthropicToStandardResponse(payload: unknown): Result<Stand
     id: asString(payload.id) || `msg_${randomUUID()}`,
     model: asString(payload.model) || 'unknown',
     outputText: text,
-    outputItems: buildStandardResponseOutputItems(text, toolCalls, reasoningItems),
+    outputItems: orderedContent || buildStandardResponseOutputItems(text, toolCalls, reasoningItems),
     usage,
     finishReason: asString(payload.stop_reason)
   }));
@@ -401,6 +424,7 @@ export function parseGeminiToStandardResponse(payload: unknown): Result<Standard
   const text = extractGeminiText(parts);
   const toolCalls = extractGeminiFunctionCalls(parts);
   const reasoningItems = extractGeminiReasoningItems(parts);
+  const orderedParts = buildOrderedGeminiGenerateContentOutputItems(parts);
 
   if (!text && toolCalls.length === 0 && reasoningItems.length === 0) {
     return err('Gemini response does not contain text output, reasoning output, or tool calls.');
@@ -419,7 +443,9 @@ export function parseGeminiToStandardResponse(payload: unknown): Result<Standard
     id: `gem_${randomUUID()}`,
     model: asString(payload.modelVersion) || 'unknown',
     outputText: text,
-    outputItems: buildStandardResponseOutputItems(text, toolCalls, reasoningItems),
+    outputItems: orderedParts.length > 0
+      ? orderedParts
+      : buildStandardResponseOutputItems(text, toolCalls, reasoningItems),
     usage,
     finishReason: toolCalls.length > 0 ? 'tool_use' : asString(first?.finishReason)
   }));
@@ -430,6 +456,7 @@ function parseGeminiInteractionToStandardResponse(payload: Record<string, unknow
   const outputText = extractGeminiInteractionOutputText(steps);
   const toolCalls = extractGeminiInteractionFunctionCalls(steps);
   const reasoningItems = extractGeminiInteractionReasoningItems(steps);
+  const orderedSteps = buildOrderedGeminiInteractionOutputItems(steps);
 
   if (!outputText && toolCalls.length === 0 && reasoningItems.length === 0) {
     return err('Gemini interaction response does not contain text output, reasoning output, or tool calls.');
@@ -448,10 +475,228 @@ function parseGeminiInteractionToStandardResponse(payload: Record<string, unknow
     id: asString(payload.id) || `gemini_interaction_${randomUUID().replace(/-/g, '')}`,
     model: asString(payload.model) || asString(payload.agent) || 'unknown',
     outputText,
-    outputItems: buildStandardResponseOutputItems(outputText, toolCalls, reasoningItems),
+    outputItems: orderedSteps.length > 0
+      ? orderedSteps
+      : buildStandardResponseOutputItems(outputText, toolCalls, reasoningItems),
     usage,
     finishReason: toolCalls.length > 0 ? 'tool_use' : mapGeminiInteractionStatusToFinishReason(status)
   }));
+}
+
+function buildOrderedGeminiGenerateContentOutputItems(
+  parts: unknown[]
+): StandardResponseOutputItem[] {
+  const output: StandardResponseOutputItem[] = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!isObject(part)) {
+      continue;
+    }
+    const functionCall = isObject(part.functionCall)
+      ? part.functionCall
+      : isObject(part.function_call)
+        ? part.function_call
+        : undefined;
+    const functionResponse = isObject(part.functionResponse)
+      ? part.functionResponse
+      : isObject(part.function_response)
+        ? part.function_response
+        : undefined;
+    const signature = readGeminiThoughtSignature(part, functionCall);
+    const isThought = asBoolean(part.thought) === true;
+    const itemType = functionCall
+      ? 'function_call'
+      : functionResponse
+        ? 'function_response'
+        : isThought
+          ? 'thought'
+          : signature
+            ? 'part'
+            : 'part';
+    const callId = functionCall
+      ? asString(functionCall.id) || asString(functionCall.call_id)
+      : functionResponse
+        ? asString(functionResponse.id) || asString(functionResponse.call_id)
+        : undefined;
+    const text = extractTextFromPart(part);
+    const nativeItem: ProviderNativeItem = {
+      type: 'provider_native_item',
+      item_type: itemType,
+      ...(callId ? { native_id: callId, group_id: callId, call_id: callId, pair_id: callId } : {}),
+      raw_payload: part,
+      provider_schema_version: 'gemini-generate-content-v1beta',
+      item_origin: 'native',
+      source_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+      source_origin: { provider: 'gemini', endpoint: 'pending' },
+      position: { turn: 0, step: 0, item: index },
+      capture_state: 'complete',
+      ...(isThought && text ? { readable_text: text } : {})
+    };
+
+    if (functionCall) {
+      const name = asString(functionCall.name);
+      if (!name) {
+        output.push(nativeItem);
+        continue;
+      }
+      const id = callId || `gemini_call_${randomUUID().replace(/-/g, '')}`;
+      output.push({
+        id,
+        type: 'function_call',
+        call_id: id,
+        name,
+        arguments: normalizeFunctionCallArguments(functionCall.args ?? functionCall.arguments),
+        ...(signature ? {
+          thought_signature: signature,
+          thought_signature_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+        } : {}),
+        status: 'completed',
+        native_item: { ...nativeItem, native_id: id, group_id: id, call_id: id, pair_id: id }
+      });
+      continue;
+    }
+
+    if (isThought) {
+      const details: unknown[] = [
+        ...(text ? [{
+          type: 'reasoning.text',
+          text,
+          format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+          index
+        }] : []),
+        ...(signature ? [{
+          type: 'reasoning.encrypted',
+          data: signature,
+          format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+          index
+        }] : [])
+      ];
+      output.push({
+        id: asString(part.id) || `rs_${randomUUID().replace(/-/g, '')}`,
+        type: 'reasoning',
+        status: 'completed',
+        summary: [],
+        ...(text ? { content: [{ type: 'reasoning_text', text }] } : {}),
+        ...(signature ? { encrypted_content: signature } : {}),
+        reasoning_details: details,
+        source_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+        native_item: nativeItem
+      });
+      continue;
+    }
+
+    if (!functionResponse && (typeof part.text === 'string' || text)) {
+      const rawText = typeof part.text === 'string' ? part.text : text;
+      output.push({
+        id: asString(part.id) || `msg_${randomUUID().replace(/-/g, '')}`,
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        native_item: { ...nativeItem, ...(rawText ? { readable_text: rawText } : {}) },
+        content: [{ type: 'output_text', text: rawText, annotations: [] }]
+      });
+      continue;
+    }
+
+    output.push(nativeItem);
+  }
+  return output;
+}
+
+function buildOrderedGeminiInteractionOutputItems(
+  steps: unknown[]
+): StandardResponseOutputItem[] {
+  const output: StandardResponseOutputItem[] = [];
+  for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index];
+    if (!isObject(step)) {
+      continue;
+    }
+    const type = asString(step.type) || 'unknown';
+    const signedNative = type === 'thought' || isGeminiInteractionsSignedBuiltInStepType(type);
+    const signature = typeof step.signature === 'string' ? step.signature : undefined;
+    const nativeItem: ProviderNativeItem | undefined = signedNative
+      ? {
+          type: 'provider_native_item',
+          item_type: type,
+          ...(asString(step.id) ? { native_id: asString(step.id) } : {}),
+          raw_payload: step,
+          provider_schema_version: 'gemini-interactions-v1beta',
+          item_origin: 'native',
+          source_format: GEMINI_INTERACTIONS_REASONING_FORMAT,
+          source_origin: { provider: 'gemini', endpoint: 'pending' },
+          position: { turn: 0, step: index, item: 0 },
+          ...(asString(step.call_id) ? {
+            group_id: asString(step.call_id),
+            call_id: asString(step.call_id),
+            pair_id: asString(step.call_id)
+          } : {}),
+          capture_state: 'complete'
+        }
+      : undefined;
+
+    if (type === 'thought') {
+      const summary = extractGeminiInteractionThoughtSummary(step.summary) ||
+        extractGeminiInteractionThoughtSummary(step.thought_summary);
+      const text = asString(step.text) || asString(step.thought);
+      output.push({
+        id: asString(step.id) || `rs_${randomUUID().replace(/-/g, '')}`,
+        type: 'reasoning',
+        status: 'completed',
+        summary: summary ? [{ type: 'summary_text', text: summary }] : [],
+        ...(text ? { content: [{ type: 'reasoning_text', text }] } : {}),
+        ...(signature ? { encrypted_content: signature } : {}),
+        reasoning_details: [
+          ...(summary ? [{ type: 'reasoning.summary', summary, format: GEMINI_INTERACTIONS_REASONING_FORMAT, index }] : []),
+          ...(text ? [{ type: 'reasoning.text', text, format: GEMINI_INTERACTIONS_REASONING_FORMAT, index }] : []),
+          ...(signature ? [{ type: 'reasoning.encrypted', data: signature, format: GEMINI_INTERACTIONS_REASONING_FORMAT, index }] : [])
+        ],
+        source_format: GEMINI_INTERACTIONS_REASONING_FORMAT,
+        ...(nativeItem ? { native_item: { ...nativeItem, ...(text ? { readable_text: text } : {}), ...(summary ? { readable_summary: summary } : {}) } } : {})
+      });
+      continue;
+    }
+
+    if (type === 'model_output') {
+      const content = Array.isArray(step.content) ? step.content : [];
+      const text = content.map(extractTextFromPart).filter(Boolean).join('\n').trim();
+      if (text) {
+        output.push({
+          id: asString(step.id) || `msg_${randomUUID().replace(/-/g, '')}`,
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text, annotations: [] }]
+        });
+      }
+      continue;
+    }
+
+    if (type === 'function_call') {
+      const name = asString(step.name);
+      if (name) {
+        const id = asString(step.id) || asString(step.call_id) || `gemini_call_${randomUUID().replace(/-/g, '')}`;
+        output.push({
+          id,
+          type: 'function_call',
+          call_id: id,
+          name,
+          arguments: normalizeFunctionCallArguments(step.arguments),
+          status: 'completed'
+        });
+      }
+      continue;
+    }
+
+    if (nativeItem) {
+      output.push(nativeItem);
+    }
+  }
+  return output;
+}
+
+function isGeminiInteractionsSignedBuiltInStepType(type: string): boolean {
+  return /^(?:code_execution|file_search|google_maps|google_search|retrieval)_(?:call|result)$/.test(type);
 }
 
 function createStandardResponse(args: {
@@ -525,16 +770,17 @@ function extractGeminiInteractionFunctionCalls(steps: unknown[]): StandardRespon
 }
 
 function extractGeminiInteractionReasoningItems(steps: unknown[]): StandardResponseReasoning[] {
-  const reasoningContent: NonNullable<StandardResponseReasoning['content']> = [];
-  const reasoningSummary: NonNullable<StandardResponseReasoning['summary']> = [];
-  const reasoningDetails: unknown[] = [];
-  let encryptedContent: string | undefined;
+  const reasoningItems: StandardResponseReasoning[] = [];
 
-  for (const step of steps) {
+  for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index];
     if (!isObject(step) || asString(step.type) !== 'thought') {
       continue;
     }
 
+    const reasoningContent: NonNullable<StandardResponseReasoning['content']> = [];
+    const reasoningSummary: NonNullable<StandardResponseReasoning['summary']> = [];
+    const reasoningDetails: unknown[] = [];
     const summary =
       extractGeminiInteractionThoughtSummary(step.summary) ||
       extractGeminiInteractionThoughtSummary(step.thought_summary);
@@ -546,7 +792,8 @@ function extractGeminiInteractionReasoningItems(steps: unknown[]): StandardRespo
       reasoningDetails.push({
         type: 'reasoning.summary',
         summary,
-        format: 'google-interactions-v1'
+        format: GEMINI_INTERACTIONS_REASONING_FORMAT,
+        index
       });
     }
 
@@ -559,47 +806,38 @@ function extractGeminiInteractionReasoningItems(steps: unknown[]): StandardRespo
       reasoningDetails.push({
         type: 'reasoning.text',
         text,
-        format: 'google-interactions-v1'
+        format: GEMINI_INTERACTIONS_REASONING_FORMAT,
+        index
       });
     }
 
     const signature = asString(step.signature);
     if (signature) {
-      encryptedContent = encryptedContent || signature;
       reasoningDetails.push({
         type: 'reasoning.encrypted',
         data: signature,
-        format: 'google-interactions-v1'
+        format: GEMINI_INTERACTIONS_REASONING_FORMAT,
+        index
       });
     }
+
+    if (reasoningDetails.length === 0) {
+      continue;
+    }
+
+    reasoningItems.push({
+      id: asString(step.id) || `rs_${randomUUID().replace(/-/g, '')}`,
+      type: 'reasoning',
+      status: 'completed',
+      summary: reasoningSummary,
+      ...(reasoningContent.length > 0 ? { content: reasoningContent } : {}),
+      ...(signature ? { encrypted_content: signature } : {}),
+      reasoning_details: reasoningDetails,
+      source_format: GEMINI_INTERACTIONS_REASONING_FORMAT
+    });
   }
 
-  if (
-    reasoningContent.length === 0 &&
-    reasoningSummary.length === 0 &&
-    reasoningDetails.length === 0 &&
-    !encryptedContent
-  ) {
-    return [];
-  }
-
-  const reasoning: StandardResponseReasoning = {
-    id: `rs_${randomUUID().replace(/-/g, '')}`,
-    type: 'reasoning',
-    status: 'completed',
-    summary: reasoningSummary
-  };
-  if (reasoningContent.length > 0) {
-    reasoning.content = reasoningContent;
-  }
-  if (encryptedContent) {
-    reasoning.encrypted_content = encryptedContent;
-  }
-  if (reasoningDetails.length > 0) {
-    reasoning.reasoning_details = reasoningDetails;
-  }
-
-  return [reasoning];
+  return reasoningItems;
 }
 
 function extractGeminiInteractionThoughtSummary(value: unknown): string {
@@ -671,6 +909,165 @@ function buildStandardResponseOutputItems(
 
   output.push(...toolCalls);
   return output;
+}
+
+function buildOrderedOpenAIResponsesOutputItems(
+  rawOutput: unknown[],
+  compactionMode: ProviderNativeItem['compaction_mode'] | undefined
+): StandardResponseOutputItem[] {
+  const output: StandardResponseOutputItem[] = [];
+  for (let index = 0; index < rawOutput.length; index += 1) {
+    const rawItem = rawOutput[index];
+    if (!isObject(rawItem)) {
+      continue;
+    }
+
+    const nativeItem = captureOpenAIResponsesOutputItem(
+      rawItem,
+      index,
+      compactionMode
+    );
+    const type = asString(rawItem.type);
+    if (type === 'reasoning') {
+      const reasoning = normalizeOpenAIResponsesReasoningItem(rawItem);
+      if (reasoning) {
+        output.push({
+          ...reasoning,
+          status: asString(rawItem.status) === 'incomplete' ? 'incomplete' : 'completed',
+          native_item: nativeItem
+        });
+      } else {
+        output.push(nativeItem);
+      }
+      continue;
+    }
+
+    if (type === 'message') {
+      const content = normalizeOpenAIResponsesOutputMessageContent(rawItem.content);
+      output.push({
+        id: asString(rawItem.id) || `msg_${randomUUID().replace(/-/g, '')}`,
+        type: 'message',
+        role: 'assistant',
+        status: asString(rawItem.status) === 'incomplete' ? 'incomplete' : 'completed',
+        ...(asString(rawItem.phase) ? { phase: asString(rawItem.phase) } : {}),
+        native_item: nativeItem,
+        content
+      });
+      continue;
+    }
+
+    const isCompletedClientToolSearch = type === 'tool_search_call' &&
+      asString(rawItem.execution) === 'client' &&
+      asString(rawItem.status) === 'completed' &&
+      Boolean(asString(rawItem.call_id));
+    if (type === 'function_call' || type === 'tool_call' || isCompletedClientToolSearch) {
+      const functionPayload = isObject(rawItem.function) ? rawItem.function : undefined;
+      const name = isCompletedClientToolSearch
+        ? 'ToolSearch'
+        : asString(rawItem.name) || asString(functionPayload?.name);
+      if (!name) {
+        output.push(nativeItem);
+        continue;
+      }
+      const id = asString(rawItem.id) ||
+        (isCompletedClientToolSearch ? asString(rawItem.call_id) : undefined) ||
+        `fc_${randomUUID().replace(/-/g, '')}`;
+      output.push({
+        id,
+        type: 'function_call',
+        call_id: asString(rawItem.call_id) || id,
+        name,
+        arguments: normalizeFunctionCallArguments(
+          rawItem.arguments ?? functionPayload?.arguments ?? rawItem.input
+        ),
+        status: asString(rawItem.status) === 'incomplete' ? 'incomplete' : 'completed',
+        ...(isObject(rawItem.caller) ? { caller: rawItem.caller } : {}),
+        native_item: nativeItem
+      });
+      continue;
+    }
+
+    // Program, Program Output, Compaction, function-call outputs, and unknown
+    // future items stay lossless internally. Their protocol projector decides
+    // whether the exact raw item is safe to replay.
+    output.push(nativeItem);
+  }
+  return output;
+}
+
+function normalizeOpenAIResponsesOutputMessageContent(
+  value: unknown
+): StandardResponseMessageContent[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const content: StandardResponseMessageContent[] = [];
+  for (const part of value) {
+    if (!isObject(part)) {
+      continue;
+    }
+    const text = asString(part.text);
+    if (asString(part.type) !== 'output_text' || text === undefined) {
+      continue;
+    }
+    content.push({
+      type: 'output_text',
+      text,
+      annotations: Array.isArray(part.annotations) ? part.annotations : []
+    });
+  }
+  return content;
+}
+
+function captureOpenAIResponsesOutputItem(
+  rawItem: Record<string, unknown>,
+  itemIndex: number,
+  compactionMode: ProviderNativeItem['compaction_mode'] | undefined
+): ProviderNativeItem {
+  const itemType = asString(rawItem.type) || 'unknown';
+  const callId = asString(rawItem.call_id) || asString(rawItem.program_id);
+  const caller = isObject(rawItem.caller) ? rawItem.caller : undefined;
+  const callerId = asString(caller?.id) || asString(caller?.caller_id);
+  const rawDependsOn = Array.isArray(rawItem.depends_on)
+    ? rawItem.depends_on.map(asString).filter((value): value is string => Boolean(value))
+    : [];
+  const dependsOn = [
+    ...rawDependsOn,
+    ...(asString(rawItem.program_id) ? [asString(rawItem.program_id)!] : [])
+  ];
+  const readableText = itemType === 'message'
+    ? extractOpenAIResponseOutputText([rawItem])
+    : normalizeReasoningContentParts(rawItem.content).map((part) => part.text).join('\n').trim();
+  const readableSummary = normalizeReasoningSummaryParts(rawItem.summary)
+    .map((part) => part.text)
+    .join('\n')
+    .trim();
+
+  return {
+    type: 'provider_native_item',
+    item_type: itemType,
+    ...(asString(rawItem.id) ? { native_id: asString(rawItem.id) } : {}),
+    raw_payload: rawItem,
+    provider_schema_version: 'openai-responses-v1',
+    item_origin: 'native',
+    source_format: OPENAI_RESPONSES_REASONING_FORMAT,
+    source_origin: {
+      provider: 'openai',
+      endpoint: 'pending',
+      ...(asString(rawItem.model) ? { model: asString(rawItem.model) } : {})
+    },
+    position: { turn: 0, step: 0, item: itemIndex },
+    ...(callerId || callId ? { group_id: callerId || callId } : {}),
+    ...(callId ? { call_id: callId, pair_id: callId } : {}),
+    ...(dependsOn.length > 0 ? { depends_on: [...new Set(dependsOn)] } : {}),
+    capture_state: 'complete',
+    ...(asString(rawItem.status) ? { provider_status: asString(rawItem.status) } : {}),
+    ...(readableText ? { readable_text: readableText } : {}),
+    ...(readableSummary ? { readable_summary: readableSummary } : {}),
+    ...(itemType === 'compaction'
+      ? { compaction_mode: compactionMode || 'server_side' }
+      : {})
+  };
 }
 
 function extractOpenAIResponseOutputText(output: unknown): string {
@@ -829,6 +1226,9 @@ function extractOpenAIChatReasoningItems(choices: unknown): StandardResponseReas
   if (details.rawDetails.length > 0) {
     reasoning.reasoning_details = details.rawDetails;
   }
+  if (details.sourceFormat) {
+    reasoning.source_format = details.sourceFormat;
+  }
 
   return [reasoning];
 }
@@ -891,6 +1291,7 @@ function normalizeReasoningContentParts(value: unknown): NonNullable<StandardRes
 
 function normalizeChatReasoningDetails(value: unknown): {
   id?: string;
+  sourceFormat?: string;
   content: NonNullable<StandardResponseReasoning['content']>;
   summary: StandardResponseReasoning['summary'];
   encryptedContent?: string;
@@ -898,6 +1299,7 @@ function normalizeChatReasoningDetails(value: unknown): {
 } {
   const normalized: {
     id?: string;
+    sourceFormat?: string;
     content: NonNullable<StandardResponseReasoning['content']>;
     summary: StandardResponseReasoning['summary'];
     encryptedContent?: string;
@@ -930,6 +1332,10 @@ function normalizeChatReasoningDetails(value: unknown): {
     const id = asString(detail.id);
     if (id && !normalized.id) {
       normalized.id = id;
+    }
+    const format = asString(detail.format);
+    if (format && !normalized.sourceFormat) {
+      normalized.sourceFormat = format;
     }
 
     const type = asString(detail.type);
@@ -1102,6 +1508,121 @@ function extractOpenAIFinishReason(choices: unknown): string | undefined {
   return asString(first.finish_reason);
 }
 
+function buildOrderedAnthropicOutputItems(
+  content: unknown[],
+  providerMode: string | undefined
+): StandardResponseOutputItem[] {
+  const output: StandardResponseOutputItem[] = [];
+  for (let index = 0; index < content.length; index += 1) {
+    const block = content[index];
+    if (!isObject(block)) {
+      continue;
+    }
+    const type = asString(block.type) || 'unknown';
+    const nextToolId = findNextAnthropicToolUseId(content, index + 1);
+    const toolId = type === 'tool_use' ? asString(block.id) : undefined;
+    const groupId = toolId || ((type === 'thinking' || type === 'redacted_thinking') ? nextToolId : undefined);
+    const nativeItem: ProviderNativeItem = {
+      type: 'provider_native_item',
+      item_type: type,
+      ...(asString(block.id) ? { native_id: asString(block.id) } : {}),
+      raw_payload: block,
+      provider_schema_version: 'anthropic-messages-2023-06-01',
+      item_origin: 'native',
+      source_format: ANTHROPIC_CLAUDE_REASONING_FORMAT,
+      source_origin: { provider: 'anthropic', endpoint: 'pending' },
+      position: { turn: 0, step: 0, item: index },
+      ...(groupId ? { group_id: groupId, call_id: groupId } : {}),
+      capture_state: 'complete',
+      ...(providerMode ? { provider_mode: providerMode } : {})
+    };
+
+    if (type === 'thinking' || type === 'redacted_thinking') {
+      const thinking = typeof block.thinking === 'string' ? block.thinking : undefined;
+      const signature = typeof block.signature === 'string' ? block.signature : undefined;
+      const data = typeof block.data === 'string' ? block.data : undefined;
+      const details = type === 'thinking'
+        ? [{
+            type: 'thinking',
+            thinking: thinking ?? '',
+            ...(signature !== undefined ? { signature } : {}),
+            format: ANTHROPIC_CLAUDE_REASONING_FORMAT
+          }]
+        : [{
+            type: 'redacted_thinking',
+            ...(data !== undefined ? { data } : {}),
+            format: ANTHROPIC_CLAUDE_REASONING_FORMAT
+          }];
+      output.push({
+        id: asString(block.id) || `rs_${randomUUID().replace(/-/g, '')}`,
+        type: 'reasoning',
+        status: 'completed',
+        summary: [],
+        ...(thinking ? { content: [{ type: 'reasoning_text', text: thinking }] } : {}),
+        ...(data ? { encrypted_content: data } : {}),
+        reasoning_details: details,
+        source_format: ANTHROPIC_CLAUDE_REASONING_FORMAT,
+        native_item: {
+          ...nativeItem,
+          ...(thinking !== undefined ? { readable_text: thinking } : {})
+        }
+      });
+      continue;
+    }
+
+    if (type === 'text') {
+      const text = typeof block.text === 'string' ? block.text : '';
+      output.push({
+        id: asString(block.id) || `msg_${randomUUID().replace(/-/g, '')}`,
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        native_item: { ...nativeItem, ...(text ? { readable_text: text } : {}) },
+        content: [{ type: 'output_text', text, annotations: [] }]
+      });
+      continue;
+    }
+
+    if (type === 'tool_use') {
+      const name = asString(block.name);
+      if (name && toolId) {
+        output.push({
+          id: toolId,
+          type: 'function_call',
+          call_id: toolId,
+          name,
+          arguments: normalizeFunctionCallArguments(block.input),
+          status: 'completed',
+          native_item: nativeItem
+        });
+      } else {
+        output.push(nativeItem);
+      }
+      continue;
+    }
+
+    output.push(nativeItem);
+  }
+  return output;
+}
+
+function findNextAnthropicToolUseId(content: unknown[], startIndex: number): string | undefined {
+  for (let index = startIndex; index < content.length; index += 1) {
+    const block = content[index];
+    if (!isObject(block)) {
+      continue;
+    }
+    const type = asString(block.type);
+    if (type === 'tool_use') {
+      return asString(block.id);
+    }
+    if (type === 'text') {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 function extractAnthropicText(content: unknown): string {
   if (typeof content === 'string') {
     return content.trim();
@@ -1161,18 +1682,22 @@ function extractAnthropicReasoningItems(content: unknown): StandardResponseReaso
     const type = asString(block.type);
     if (type === 'thinking') {
       const thinking = asString(block.thinking);
-      if (!thinking) {
+      const signature = asString(block.signature);
+      if (!thinking && !signature) {
         continue;
       }
 
-      reasoningContent.push({
-        type: 'reasoning_text',
-        text: thinking
-      });
+      if (thinking) {
+        reasoningContent.push({
+          type: 'reasoning_text',
+          text: thinking
+        });
+      }
       reasoningDetails.push({
         type: 'thinking',
-        thinking,
-        ...(asString(block.signature) ? { signature: asString(block.signature) } : {})
+        thinking: thinking || '',
+        ...(signature ? { signature } : {}),
+        format: ANTHROPIC_CLAUDE_REASONING_FORMAT
       });
       continue;
     }
@@ -1186,7 +1711,8 @@ function extractAnthropicReasoningItems(content: unknown): StandardResponseReaso
       encryptedContent = encryptedContent || data;
       reasoningDetails.push({
         type: 'redacted_thinking',
-        data
+        data,
+        format: ANTHROPIC_CLAUDE_REASONING_FORMAT
       });
     }
   }
@@ -1199,7 +1725,8 @@ function extractAnthropicReasoningItems(content: unknown): StandardResponseReaso
     id: `rs_${randomUUID().replace(/-/g, '')}`,
     type: 'reasoning',
     status: 'completed',
-    summary: []
+    summary: [],
+    source_format: ANTHROPIC_CLAUDE_REASONING_FORMAT
   };
 
   if (reasoningContent.length > 0) {
@@ -1259,6 +1786,9 @@ function extractGeminiFunctionCalls(parts: unknown[]): StandardResponseFunctionC
       name,
       arguments: normalizeFunctionCallArguments(functionCall.args ?? functionCall.arguments),
       ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
+      ...(thoughtSignature
+        ? { thought_signature_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT }
+        : {}),
       status: 'completed'
     });
   }
@@ -1280,44 +1810,60 @@ function readGeminiThoughtSignature(
 }
 
 function extractGeminiReasoningItems(parts: unknown[]): StandardResponseReasoning[] {
-  const reasoningContent: NonNullable<StandardResponseReasoning['content']> = [];
-  const reasoningDetails: unknown[] = [];
+  const reasoningItems: StandardResponseReasoning[] = [];
 
-  for (const part of parts) {
-    if (!isObject(part) || asBoolean(part.thought) !== true) {
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!isObject(part)) {
       continue;
     }
 
-    const text = extractTextFromPart(part);
-    if (!text) {
+    const functionCall = isObject(part.functionCall) || isObject(part.function_call);
+    const isThought = asBoolean(part.thought) === true;
+    const text = isThought ? extractTextFromPart(part) : '';
+    const thoughtSignature = functionCall
+      ? undefined
+      : readGeminiThoughtSignature(part);
+    if (!text && !thoughtSignature) {
       continue;
     }
 
-    reasoningContent.push({
-      type: 'reasoning_text',
-      text
-    });
-    reasoningDetails.push({
-      type: 'reasoning.text',
-      text,
-      format: 'google-gemini-v1'
-    });
-  }
+    const reasoningContent: NonNullable<StandardResponseReasoning['content']> = [];
+    const reasoningDetails: unknown[] = [];
+    if (text) {
+      reasoningContent.push({
+        type: 'reasoning_text',
+        text
+      });
+      reasoningDetails.push({
+        type: 'reasoning.text',
+        text,
+        format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+        index
+      });
+    }
+    if (thoughtSignature) {
+      reasoningDetails.push({
+        type: 'reasoning.encrypted',
+        data: thoughtSignature,
+        format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+        index
+      });
+    }
 
-  if (reasoningContent.length === 0 && reasoningDetails.length === 0) {
-    return [];
-  }
-
-  return [
-    {
+    reasoningItems.push({
       id: `rs_${randomUUID().replace(/-/g, '')}`,
       type: 'reasoning',
       status: 'completed',
       summary: [],
-      content: reasoningContent,
-      reasoning_details: reasoningDetails
-    }
-  ];
+      ...(reasoningContent.length > 0 ? { content: reasoningContent } : {}),
+      ...(thoughtSignature ? { encrypted_content: thoughtSignature } : {}),
+      reasoning_details: reasoningDetails,
+      source_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+    });
+  }
+
+  return reasoningItems;
 }
 
 function normalizeFunctionCallArguments(value: unknown): string {

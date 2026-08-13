@@ -1,7 +1,12 @@
 import type { StandardRequestInputContent, StandardRequestInputMessage, TargetAdapter } from '../../../types';
-import { ok } from '../../../types';
+import { err, ok } from '../../../types';
 import { asString, collectStandardInputMessages, isObject } from '../../../utils';
 import { buildAnthropicHeaders } from '../common';
+import {
+  ANTHROPIC_CLAUDE_REASONING_FORMAT,
+  isProviderNativePayloadStructurallyValid,
+  normalizeAnthropicThinkingMode
+} from '../reasoning-envelope';
 import { parseAnthropicToStandardResponse } from './shared';
 import {
   anthropicWebSearchToolType,
@@ -39,6 +44,9 @@ export const anthropicMessagesTargetAdapter: TargetAdapter = {
   providerTypes: ['anthropic_messages'],
   providerFallback: true,
   buildRequestFromStandard(input) {
+    if (input.standardRequest.native_state_error) {
+      return err(input.standardRequest.native_state_error);
+    }
     const headersResult = buildAnthropicHeaders(input.request.headers, {
       ...input.config,
       anthropicApiKey: input.targetProviderConfig?.apikey || input.config.anthropicApiKey
@@ -48,6 +56,23 @@ export const anthropicMessagesTargetAdapter: TargetAdapter = {
     }
 
     const toolsDisabled = isAnthropicToolChoiceNone(input.standardRequest.tool_choice);
+    const activeNativeToolState = activeAnthropicNativeToolState(
+      input.standardRequest.input
+    );
+    const requestedThinkingMode = normalizeAnthropicThinkingMode(
+      input.standardRequest.thinking
+    );
+    if (
+      activeNativeToolState.active &&
+      (
+        isAnthropicThinkingDisabled(input.standardRequest.thinking) ||
+        [...activeNativeToolState.providerModes].some(
+          (providerMode) => providerMode !== requestedThinkingMode
+        )
+      )
+    ) {
+      return err('incompatible_anthropic_thinking_mode');
+    }
     const toolContext = buildAnthropicToolContext(
       input.standardRequest.input,
       input.standardRequest.tools,
@@ -85,6 +110,10 @@ export const anthropicMessagesTargetAdapter: TargetAdapter = {
       body.stream = input.standardRequest.stream;
     }
 
+    if (input.standardRequest.thinking !== undefined) {
+      body.thinking = input.standardRequest.thinking;
+    }
+
     const tools = toolsDisabled ? undefined : mapStandardToolsToAnthropicTools(toolContext.tools);
     if (tools) {
       body.tools = tools;
@@ -101,13 +130,17 @@ export const anthropicMessagesTargetAdapter: TargetAdapter = {
     }
 
     return ok({
-      url: `${input.config.anthropicBaseUrl}/v1/messages`,
+      url: `${input.targetProviderConfig?.baseurl || input.config.anthropicBaseUrl}/v1/messages`,
       headers: headersResult.value,
       body
     });
   },
-  toStandardResponse(payload) {
-    return parseAnthropicToStandardResponse(payload);
+  toStandardResponse(payload, input) {
+    return parseAnthropicToStandardResponse(payload, {
+      ...(input
+        ? { providerMode: normalizeAnthropicThinkingMode(input.standardRequest.thinking) }
+        : {})
+    });
   }
 };
 
@@ -314,6 +347,23 @@ function standardContentToAnthropicBlocks(
 ): Array<Record<string, unknown>> {
   const blocks: Array<Record<string, unknown>> = [];
   for (const item of content) {
+    if (item.type === 'provider_native_item') {
+      if (
+        item.source_format === ANTHROPIC_CLAUDE_REASONING_FORMAT &&
+        isProviderNativePayloadStructurallyValid(item, ANTHROPIC_CLAUDE_REASONING_FORMAT)
+      ) {
+        blocks.push({ ...item.raw_payload });
+      }
+      continue;
+    }
+    const nativeItem = 'native_item' in item ? item.native_item : undefined;
+    if (
+      nativeItem?.source_format === ANTHROPIC_CLAUDE_REASONING_FORMAT &&
+      isProviderNativePayloadStructurallyValid(nativeItem, ANTHROPIC_CLAUDE_REASONING_FORMAT)
+    ) {
+      blocks.push({ ...nativeItem.raw_payload });
+      continue;
+    }
     if (item.type === 'input_text') {
       const text = item.text.trim();
       if (!text) {
@@ -432,7 +482,14 @@ function normalizeAnthropicToolInput(value: unknown): Record<string, unknown> {
 function standardReasoningToAnthropicBlocks(
   item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
 ): Array<Record<string, unknown>> {
-  const blocks = anthropicBlocksFromReasoningDetails(item.reasoning_details);
+  if (standardReasoningFormat(item) !== ANTHROPIC_CLAUDE_REASONING_FORMAT) {
+    return [];
+  }
+
+  const blocks = anthropicBlocksFromReasoningDetails(
+    item.reasoning_details,
+    ANTHROPIC_CLAUDE_REASONING_FORMAT
+  );
   if (blocks.length > 0) {
     return blocks;
   }
@@ -445,7 +502,10 @@ function standardReasoningToAnthropicBlocks(
     });
   }
 
-  if (item.encrypted_content) {
+  if (
+    item.encrypted_content &&
+    item.source_format === ANTHROPIC_CLAUDE_REASONING_FORMAT
+  ) {
     blocks.push({
       type: 'redacted_thinking',
       data: item.encrypted_content
@@ -455,28 +515,24 @@ function standardReasoningToAnthropicBlocks(
   return blocks;
 }
 
-function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Array<Record<string, unknown>> {
+function anthropicBlocksFromReasoningDetails(
+  value: unknown[] | undefined,
+  expectedFormat: string
+): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) {
     return [];
   }
 
   const blocks: Array<Record<string, unknown>> = [];
   for (const detail of value) {
-    if (typeof detail === 'string') {
-      const thinking = detail.trim();
-      if (thinking) {
-        blocks.push({
-          type: 'thinking',
-          thinking
-        });
-      }
-      continue;
-    }
-
     if (!isObject(detail)) {
       continue;
     }
 
+    const format = asString(detail.format);
+    if (format !== expectedFormat) {
+      continue;
+    }
     const type = asString(detail.type);
     const thinking =
       asString(detail.thinking) ||
@@ -484,6 +540,7 @@ function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Arra
       asString(detail.reasoning) ||
       asString(detail.summary);
     const data = asString(detail.data) || asString(detail.encrypted_content);
+    const signature = asString(detail.signature);
 
     if (type === 'reasoning.encrypted' || type === 'redacted_thinking' || (!thinking && data)) {
       if (data) {
@@ -495,15 +552,14 @@ function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Arra
       continue;
     }
 
-    if (!thinking) {
+    if (!thinking && !signature) {
       continue;
     }
 
     const block: Record<string, unknown> = {
       type: 'thinking',
-      thinking
+      thinking: thinking || ''
     };
-    const signature = asString(detail.signature);
     if (signature) {
       block.signature = signature;
     }
@@ -511,6 +567,26 @@ function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Arra
   }
 
   return blocks;
+}
+
+function standardReasoningFormat(
+  item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
+): string | undefined {
+  if (item.source_format) {
+    return item.source_format;
+  }
+
+  for (const detail of item.reasoning_details || []) {
+    if (!isObject(detail)) {
+      continue;
+    }
+    const format = asString(detail.format);
+    if (format) {
+      return format;
+    }
+  }
+
+  return undefined;
 }
 
 function mapStandardToolsToAnthropicTools(tools: unknown[] | undefined): Record<string, unknown>[] | undefined {
@@ -702,4 +778,49 @@ function isAnthropicToolChoiceNone(toolChoice: unknown): boolean {
   }
 
   return asString(toolChoice.type) === 'none';
+}
+
+function isAnthropicThinkingDisabled(value: unknown): boolean {
+  if (!isObject(value)) {
+    return false;
+  }
+  const type = asString(value.type)?.toLowerCase();
+  return type === 'disabled' || type === 'off' || type === 'none';
+}
+
+function activeAnthropicNativeToolState(
+  input: string | StandardRequestInputMessage[]
+): { active: boolean; providerModes: Set<string> } {
+  if (typeof input === 'string') {
+    return { active: false, providerModes: new Set() };
+  }
+  const results = new Set<string>();
+  for (const message of input) {
+    for (const item of message.content) {
+      if (item.type === 'tool_result') {
+        results.add(item.tool_use_id);
+      }
+    }
+  }
+  const providerModes = new Set<string>();
+  let active = false;
+  for (const message of input) {
+    if (message.role !== 'assistant') {
+      continue;
+    }
+    for (const item of message.content) {
+      if (
+        item.type !== 'tool_use' ||
+        item.native_item?.source_format !== ANTHROPIC_CLAUDE_REASONING_FORMAT ||
+        results.has(item.id)
+      ) {
+        continue;
+      }
+      active = true;
+      if (item.native_item.provider_mode) {
+        providerModes.add(item.native_item.provider_mode);
+      }
+    }
+  }
+  return { active, providerModes };
 }

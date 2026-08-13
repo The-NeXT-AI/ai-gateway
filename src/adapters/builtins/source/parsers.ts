@@ -1,4 +1,5 @@
 import type {
+  ProviderNativeItem,
   Result,
   SourceAdapterRequestInput,
   StandardRequest,
@@ -17,13 +18,21 @@ import {
   normalizeMessageRole
 } from '../../../utils';
 import {
-  decodeOpenAIResponsesReasoningEnvelope,
+  ANTHROPIC_CLAUDE_REASONING_FORMAT,
+  decodeGeminiThoughtSignatureToolCallId,
+  decodeReasoningTransportEnvelope,
+  GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
+  normalizeAnthropicThinkingMode,
   OPENAI_RESPONSES_REASONING_FORMAT
 } from '../reasoning-envelope';
 import { normalizeNamespacedToolName } from '../target/tools';
 
-export function parseOpenAIResponsesRequest(body: Record<string, unknown>): Result<StandardRequest> {
-  const inputResult = normalizeResponsesInput(body.input);
+export function parseOpenAIResponsesRequest(
+  body: Record<string, unknown>,
+  operation: 'create' | 'compact' = 'create'
+): Result<StandardRequest> {
+  const inputResult = normalizeResponsesInput(body.input, operation);
   if (!inputResult.ok) {
     return inputResult;
   }
@@ -49,7 +58,19 @@ export function parseOpenAIResponsesRequest(body: Record<string, unknown>): Resu
     reasoning: readReasoningOption(body),
     thinking: readOptionalRequestOption(body.thinking),
     output_config: readOptionalRequestOption(body.output_config),
-    text: readOptionalRequestOption(body.text)
+    text: readOptionalRequestOption(body.text),
+    openai_responses: {
+      operation,
+      ...(asString(body.previous_response_id)
+        ? { previous_response_id: asString(body.previous_response_id) }
+        : {}),
+      ...(asBoolean(body.store) !== undefined ? { store: asBoolean(body.store) } : {}),
+      ...(body.conversation !== undefined ? { conversation: body.conversation } : {}),
+      ...(body.context_management !== undefined
+        ? { context_management: body.context_management }
+        : {}),
+      ...(body.include !== undefined ? { include: body.include } : {})
+    }
   });
 }
 
@@ -117,15 +138,24 @@ export function parseOpenAIChatCompletionsRequest(body: Record<string, unknown>)
 export function parseAnthropicMessagesRequest(body: Record<string, unknown>): Result<StandardRequest> {
   const inputMessages: StandardRequestInputMessage[] = [];
   const instructions = extractAnthropicSystem(body.system);
+  const sourceModel = asString(body.model);
+  const providerMode = normalizeAnthropicThinkingMode(body.thinking);
 
   const rawMessages = Array.isArray(body.messages) ? body.messages : [];
-  for (const rawMessage of rawMessages) {
+  for (let messageIndex = 0; messageIndex < rawMessages.length; messageIndex += 1) {
+    const rawMessage = rawMessages[messageIndex];
     if (!isObject(rawMessage)) {
       continue;
     }
 
     const role = normalizeConversationRole(rawMessage.role);
-    const content = extractAnthropicMessageContent(role, rawMessage.content);
+    const content = extractAnthropicMessageContent(
+      role,
+      rawMessage.content,
+      messageIndex,
+      sourceModel,
+      providerMode
+    );
     if (content.length === 0) {
       continue;
     }
@@ -133,9 +163,12 @@ export function parseAnthropicMessagesRequest(body: Record<string, unknown>): Re
     inputMessages.push({
       type: 'message',
       role,
-      content
+      content,
+      ...collectNativeItemsFromInputContent(content)
     });
   }
+
+  linkAnthropicNativeToolGroups(inputMessages);
 
   const input = ensureInputWithInstructions(inputMessages, instructions);
   if (!input) {
@@ -143,7 +176,7 @@ export function parseAnthropicMessagesRequest(body: Record<string, unknown>): Re
   }
 
   return ok({
-    model: asString(body.model),
+    model: sourceModel,
     instructions,
     input,
     temperature: asNumber(body.temperature),
@@ -167,6 +200,7 @@ export function parseGeminiGenerateContentRequest(
   const inputMessages: StandardRequestInputMessage[] = [];
   const instructions = extractGeminiSystemInstruction(body.systemInstruction);
   const geminiToolState = createGeminiToolCallState();
+  const sourceModel = modelFromPath || asString(body.model);
 
   const contents = Array.isArray(body.contents) ? body.contents : [];
   for (let itemIndex = 0; itemIndex < contents.length; itemIndex += 1) {
@@ -177,7 +211,13 @@ export function parseGeminiGenerateContentRequest(
 
     const role = normalizeConversationRole(item.role === 'model' ? 'assistant' : item.role);
     const parts = Array.isArray(item.parts) ? item.parts : [];
-    const content = extractGeminiMessageContent(role, parts, geminiToolState, itemIndex);
+    const content = extractGeminiMessageContent(
+      role,
+      parts,
+      geminiToolState,
+      itemIndex,
+      sourceModel
+    );
     if (content.length === 0) {
       continue;
     }
@@ -185,7 +225,8 @@ export function parseGeminiGenerateContentRequest(
     inputMessages.push({
       type: 'message',
       role,
-      content
+      content,
+      ...collectNativeItemsFromInputContent(content)
     });
   }
 
@@ -205,7 +246,7 @@ export function parseGeminiGenerateContentRequest(
   const thinking = readGeminiThinkingOption(generationConfig?.thinkingConfig ?? generationConfig?.thinking_config);
 
   return ok({
-    model: modelFromPath || asString(body.model),
+    model: sourceModel,
     instructions,
     input,
     temperature: asNumber(generationConfig?.temperature),
@@ -291,33 +332,62 @@ export function readGeminiInteractionsMetadata(
   });
 }
 
-function normalizeResponsesInput(input: unknown): Result<string | StandardRequestInputMessage[]> {
+interface OpenAIResponsesRawInputProjection {
+  rawPayload: Record<string, unknown>;
+  position: ProviderNativeItem['position'];
+}
+
+type OpenAIResponsesRawInputProjectionMap = Map<
+  StandardRequestInputContent,
+  OpenAIResponsesRawInputProjection
+>;
+
+function normalizeResponsesInput(
+  input: unknown,
+  operation: 'create' | 'compact' = 'create'
+): Result<string | StandardRequestInputMessage[]> {
   if (typeof input === 'string') {
     return ok(input.trim());
   }
 
   if (!Array.isArray(input)) {
     if (isObject(input)) {
-      const asMessage = normalizeResponsesInputItem(input);
+      const rawItemsByContent: OpenAIResponsesRawInputProjectionMap = new Map();
+      const asMessage = normalizeResponsesInputItem(
+        input,
+        0,
+        operation,
+        rawItemsByContent
+      );
       if (!asMessage) {
         return err('OpenAI responses request contains invalid input item.');
       }
 
-      return ok([asMessage]);
+      const messages = [asMessage];
+      linkOpenAIResponsesNativeToolGroups(messages, rawItemsByContent);
+      return ok(messages);
     }
 
     return err('OpenAI responses request requires input.');
   }
 
   const messages: StandardRequestInputMessage[] = [];
-  for (const item of input) {
-    const normalized = normalizeResponsesInputItem(item);
+  const rawItemsByContent: OpenAIResponsesRawInputProjectionMap = new Map();
+  for (let itemIndex = 0; itemIndex < input.length; itemIndex += 1) {
+    const normalized = normalizeResponsesInputItem(
+      input[itemIndex],
+      itemIndex,
+      operation,
+      rawItemsByContent
+    );
     if (normalized) {
       messages.push(normalized);
     }
   }
 
-  return ok(coalesceResponsesInputMessages(messages));
+  const coalesced = coalesceResponsesInputMessages(messages);
+  linkOpenAIResponsesNativeToolGroups(coalesced, rawItemsByContent);
+  return ok(coalesced);
 }
 
 function normalizeGeminiInteractionsInput(input: unknown): Result<string | StandardRequestInputMessage[]> {
@@ -327,7 +397,7 @@ function normalizeGeminiInteractionsInput(input: unknown): Result<string | Stand
 
   if (!Array.isArray(input)) {
     if (isObject(input)) {
-      const message = normalizeGeminiInteractionInputItem(input);
+      const message = normalizeGeminiInteractionInputItem(input, new Map(), 0);
       if (!message) {
         return err('Gemini interactions request contains invalid input item.');
       }
@@ -339,8 +409,12 @@ function normalizeGeminiInteractionsInput(input: unknown): Result<string | Stand
 
   const messages: StandardRequestInputMessage[] = [];
   const toolNamesById = new Map<string, string>();
-  for (const item of input) {
-    const message = normalizeGeminiInteractionInputItem(item, toolNamesById);
+  for (let itemIndex = 0; itemIndex < input.length; itemIndex += 1) {
+    const message = normalizeGeminiInteractionInputItem(
+      input[itemIndex],
+      toolNamesById,
+      itemIndex
+    );
     if (message) {
       messages.push(message);
     }
@@ -351,7 +425,8 @@ function normalizeGeminiInteractionsInput(input: unknown): Result<string | Stand
 
 function normalizeGeminiInteractionInputItem(
   item: unknown,
-  toolNamesById = new Map<string, string>()
+  toolNamesById = new Map<string, string>(),
+  itemIndex = 0
 ): StandardRequestInputMessage | null {
   if (typeof item === 'string') {
     const text = item.trim();
@@ -415,25 +490,34 @@ function normalizeGeminiInteractionInputItem(
       normalizeGeminiInteractionThoughtSummary(item.summary) ||
       normalizeGeminiInteractionThoughtSummary(item.thought_summary);
     const signature = asString(item.signature);
+    const envelope = signature
+      ? decodeReasoningTransportEnvelope(signature)
+      : undefined;
+    const encryptedContent = envelope?.data || signature;
+    const sourceFormat = envelope?.format || GEMINI_INTERACTIONS_REASONING_FORMAT;
     if (!text && !summary && !signature) {
       return null;
     }
+    const nativeItem = captureGeminiInteractionSignedStep(item, itemIndex, envelope);
     return {
       type: 'message',
       role: 'assistant',
       content: [
         {
           type: 'reasoning',
+          ...(envelope?.id ? { id: envelope.id } : {}),
+          source_format: sourceFormat,
+          ...(envelope?.origin ? { source_origin: envelope.origin } : {}),
           ...(text ? { text } : {}),
           ...(summary ? { summary } : {}),
-          ...(signature ? { encrypted_content: signature } : {}),
+          ...(encryptedContent ? { encrypted_content: encryptedContent } : {}),
           reasoning_details: [
             ...(summary
               ? [
                   {
                     type: 'reasoning.summary',
                     summary,
-                    format: 'google-interactions-v1'
+                    format: sourceFormat
                   }
                 ]
               : []),
@@ -442,22 +526,47 @@ function normalizeGeminiInteractionInputItem(
                   {
                     type: 'reasoning.text',
                     text,
-                    format: 'google-interactions-v1'
+                    format: sourceFormat
                   }
                 ]
               : []),
-            ...(signature
+            ...(encryptedContent
               ? [
-                  {
-                    type: 'reasoning.encrypted',
-                    data: signature,
-                    format: 'google-interactions-v1'
-                  }
+                  envelope?.kind === 'signature'
+                    ? {
+                        type: 'reasoning.text',
+                        signature: encryptedContent,
+                        ...(envelope?.id ? { id: envelope.id } : {}),
+                        format: sourceFormat
+                      }
+                    : {
+                        type: 'reasoning.encrypted',
+                        data: encryptedContent,
+                        ...(envelope?.id ? { id: envelope.id } : {}),
+                        format: sourceFormat
+                      }
                 ]
               : [])
-          ]
+          ],
+          ...(nativeItem ? { native_item: nativeItem } : {})
         }
-      ]
+      ],
+      ...(nativeItem ? { native_items: [nativeItem] } : {})
+    };
+  }
+
+  if (type && isGeminiInteractionsSignedBuiltInStepType(type)) {
+    const signature = asString(item.signature);
+    const envelope = signature ? decodeReasoningTransportEnvelope(signature) : undefined;
+    const nativeItem = captureGeminiInteractionSignedStep(item, itemIndex, envelope);
+    if (!nativeItem) {
+      return null;
+    }
+    return {
+      type: 'message',
+      role: type.endsWith('_result') ? 'user' : 'assistant',
+      content: [nativeItem],
+      native_items: [nativeItem]
     };
   }
 
@@ -514,6 +623,44 @@ function normalizeGeminiInteractionInputItem(
         content: [{ type: 'input_text', text: serialized }]
       }
     : null;
+}
+
+function captureGeminiInteractionSignedStep(
+  step: Record<string, unknown>,
+  stepIndex: number,
+  envelope: ReturnType<typeof decodeReasoningTransportEnvelope>
+): ProviderNativeItem | undefined {
+  if (envelope?.nativeItem) {
+    return envelope.nativeItem;
+  }
+  const itemType = asString(step.type) || 'unknown';
+  const signature = asString(step.signature);
+  if (itemType === 'thought' && !signature) {
+    return undefined;
+  }
+  const callId = asString(step.call_id) || asString(step.id);
+  return {
+    type: 'provider_native_item',
+    item_type: itemType,
+    ...(asString(step.id) ? { native_id: asString(step.id) } : {}),
+    raw_payload: unwrapReasoningTransportCarriers(step),
+    provider_schema_version: 'gemini-interactions-v1beta',
+    item_origin: 'native',
+    source_format: envelope?.format || GEMINI_INTERACTIONS_REASONING_FORMAT,
+    source_origin: envelope?.origin || { provider: 'gemini', endpoint: 'unverified' },
+    position: { turn: 0, step: stepIndex, item: 0 },
+    ...(callId ? { group_id: callId, call_id: callId, pair_id: callId } : {}),
+    capture_state:
+      envelope?.carrierVersion === 2 && envelope.origin ? 'complete' : 'partial',
+    ...(asString(step.text) ? { readable_text: asString(step.text) } : {}),
+    ...(normalizeGeminiInteractionThoughtSummary(step.summary)
+      ? { readable_summary: normalizeGeminiInteractionThoughtSummary(step.summary) }
+      : {})
+  };
+}
+
+function isGeminiInteractionsSignedBuiltInStepType(type: string): boolean {
+  return /^(?:code_execution|file_search|google_maps|google_search|retrieval)_(?:call|result)$/.test(type);
 }
 
 function normalizeGeminiInteractionContent(content: unknown): StandardRequestInputContent[] {
@@ -604,20 +751,28 @@ function coalesceResponsesInputMessages(messages: StandardRequestInputMessage[])
     if (!pendingAssistant) {
       pendingAssistant = {
         ...message,
-        content: [...message.content]
+        content: [...message.content],
+        ...(message.native_items ? { native_items: [...message.native_items] } : {})
       };
       continue;
     }
 
     if (shouldCoalesceResponsesAssistantMessages(pendingAssistant.content, message.content)) {
       pendingAssistant.content.push(...message.content);
+      if (message.native_items) {
+        pendingAssistant.native_items = [
+          ...(pendingAssistant.native_items || []),
+          ...message.native_items
+        ];
+      }
       continue;
     }
 
     flushPendingAssistant();
     pendingAssistant = {
       ...message,
-      content: [...message.content]
+      content: [...message.content],
+      ...(message.native_items ? { native_items: [...message.native_items] } : {})
     };
   }
 
@@ -638,19 +793,29 @@ function hasToolUseContent(content: StandardRequestInputContent[]): boolean {
   );
 }
 
-function normalizeResponsesInputItem(item: unknown): StandardRequestInputMessage | null {
+function normalizeResponsesInputItem(
+  item: unknown,
+  itemIndex = 0,
+  operation: 'create' | 'compact' = 'create',
+  rawItemsByContent?: OpenAIResponsesRawInputProjectionMap
+): StandardRequestInputMessage | null {
   if (!isObject(item)) {
     return null;
   }
 
   const type = asString(item.type);
+  const nativeItem = captureOpenAIResponsesInputNativeItem(item, itemIndex, operation);
 
   const reasoningContent = normalizeOpenAIResponsesReasoningItem(item);
   if (reasoningContent) {
+    if (nativeItem && reasoningContent.type === 'reasoning') {
+      reasoningContent.native_item = nativeItem;
+    }
     return {
       type: 'message',
       role: 'assistant',
-      content: [reasoningContent]
+      content: [reasoningContent],
+      ...(nativeItem ? { native_items: [nativeItem] } : {})
     };
   }
   if (type === 'reasoning') {
@@ -659,51 +824,100 @@ function normalizeResponsesInputItem(item: unknown): StandardRequestInputMessage
 
   const toolSearchCallContent = normalizeOpenAIResponsesToolSearchCallItem(item);
   if (toolSearchCallContent) {
+    rememberOpenAIResponsesRawInputProjection(
+      rawItemsByContent,
+      toolSearchCallContent,
+      item,
+      { turn: itemIndex, step: 0, item: itemIndex }
+    );
+    if (nativeItem && toolSearchCallContent.type === 'tool_search_call') {
+      toolSearchCallContent.native_item = nativeItem;
+    }
     return {
       type: 'message',
       role: 'assistant',
-      content: [toolSearchCallContent]
+      content: [toolSearchCallContent],
+      ...(nativeItem ? { native_items: [nativeItem] } : {})
     };
   }
 
   const toolSearchOutputContent = normalizeOpenAIResponsesToolSearchOutputItem(item);
   if (toolSearchOutputContent) {
+    rememberOpenAIResponsesRawInputProjection(
+      rawItemsByContent,
+      toolSearchOutputContent,
+      item,
+      { turn: itemIndex, step: 0, item: itemIndex }
+    );
+    if (nativeItem && toolSearchOutputContent.type === 'tool_search_output') {
+      toolSearchOutputContent.native_item = nativeItem;
+    }
     return {
       type: 'message',
       role: 'user',
-      content: [toolSearchOutputContent]
+      content: [toolSearchOutputContent],
+      ...(nativeItem ? { native_items: [nativeItem] } : {})
     };
   }
 
   const functionCallContent = normalizeOpenAIResponsesFunctionCallItem(item);
   if (functionCallContent) {
+    rememberOpenAIResponsesRawInputProjection(
+      rawItemsByContent,
+      functionCallContent,
+      item,
+      { turn: itemIndex, step: 0, item: itemIndex }
+    );
+    if (nativeItem && functionCallContent.type === 'tool_use') {
+      functionCallContent.native_item = nativeItem;
+    }
     return {
       type: 'message',
       role: 'assistant',
-      content: [functionCallContent]
+      content: [functionCallContent],
+      ...(nativeItem ? { native_items: [nativeItem] } : {})
     };
   }
 
   const functionCallOutputContent = normalizeOpenAIResponsesFunctionCallOutputItem(item);
   if (functionCallOutputContent) {
+    rememberOpenAIResponsesRawInputProjection(
+      rawItemsByContent,
+      functionCallOutputContent,
+      item,
+      { turn: itemIndex, step: 0, item: itemIndex }
+    );
+    if (nativeItem && functionCallOutputContent.type === 'tool_result') {
+      functionCallOutputContent.native_item = nativeItem;
+    }
     return {
       type: 'message',
       role: 'user',
-      content: [functionCallOutputContent]
+      content: [functionCallOutputContent],
+      ...(nativeItem ? { native_items: [nativeItem] } : {})
     };
   }
 
-  if (type === 'message' || item.role !== undefined || item.content !== undefined) {
+  if (type === 'message' || (!type && (item.role !== undefined || item.content !== undefined))) {
     const role = normalizeConversationRole(item.role);
-    const content = normalizeOpenAIResponsesMessageContent(role, item.content);
+    const content = normalizeOpenAIResponsesMessageContent(
+      role,
+      item.content,
+      rawItemsByContent,
+      itemIndex
+    );
     if (content.length === 0) {
       return null;
     }
 
     return {
       type: 'message',
+      ...(asString(item.id) ? { id: asString(item.id) } : {}),
       role,
-      content
+      content,
+      ...(asString(item.phase) ? { phase: asString(item.phase) } : {}),
+      ...(asString(item.status) ? { status: asString(item.status) } : {}),
+      ...(nativeItem ? { native_items: [nativeItem] } : {})
     };
   }
 
@@ -733,6 +947,15 @@ function normalizeResponsesInputItem(item: unknown): StandardRequestInputMessage
     };
   }
 
+  if (nativeItem && type) {
+    return {
+      type: 'message',
+      role: isOpenAIResponsesResultItemType(type) ? 'user' : 'assistant',
+      content: [nativeItem],
+      native_items: [nativeItem]
+    };
+  }
+
   const fallbackText = extractTextFromPart(item);
   if (fallbackText) {
     return {
@@ -752,6 +975,135 @@ function normalizeResponsesInputItem(item: unknown): StandardRequestInputMessage
     role: 'user',
     content: [{ type: 'input_text', text: serialized }]
   };
+}
+
+function captureOpenAIResponsesInputNativeItem(
+  item: Record<string, unknown>,
+  itemIndex: number,
+  operation: 'create' | 'compact'
+): ProviderNativeItem | undefined {
+  const itemType = asString(item.type);
+  if (!itemType || itemType === 'input_text' || itemType === 'output_text' || itemType === 'text') {
+    return undefined;
+  }
+
+  const envelope = findReasoningTransportEnvelope(item);
+  if (envelope?.nativeItem) {
+    return {
+      ...envelope.nativeItem,
+      item_origin: envelope.nativeItem.item_origin || 'native'
+    };
+  }
+
+  const hasNativeDependency = Boolean(
+    item.caller !== undefined ||
+    item.fingerprint !== undefined ||
+    item.program_id !== undefined ||
+    item.depends_on !== undefined
+  );
+  const hasUnverifiedOpaqueReasoning = itemType === 'reasoning' && Boolean(asString(item.encrypted_content));
+  const inherentlyNative = itemType === 'compaction' || itemType === 'program' ||
+    itemType === 'program_output' || !new Set([
+      'reasoning', 'message', 'function_call', 'function_call_output',
+      'tool_search_call', 'tool_search_output'
+    ]).has(itemType);
+  if (!envelope && !hasNativeDependency && !hasUnverifiedOpaqueReasoning && !inherentlyNative) {
+    return undefined;
+  }
+
+  const callId = asString(item.call_id) || asString(item.program_id);
+  const caller = isObject(item.caller) ? item.caller : undefined;
+  const callerId = asString(caller?.id) || asString(caller?.caller_id);
+  const rawDependsOn = Array.isArray(item.depends_on)
+    ? item.depends_on.map(asString).filter((value): value is string => Boolean(value))
+    : [];
+  const dependsOn = [
+    ...rawDependsOn,
+    ...(asString(item.program_id) ? [asString(item.program_id)!] : [])
+  ];
+  const readableText = itemType === 'message'
+    ? normalizeOpenAIResponsesMessageContent('assistant', item.content)
+        .map((content) => content.type === 'input_text' ? content.text : '')
+        .filter(Boolean)
+        .join('\n')
+        .trim()
+    : normalizeReasoningContentText(item.content) || asString(item.text);
+  const readableSummary = normalizeReasoningSummaryText(item.summary);
+  const sourceOrigin = envelope?.origin || {
+    provider: 'openai',
+    endpoint: 'unverified'
+  };
+
+  return {
+    type: 'provider_native_item',
+    item_type: itemType,
+    ...(envelope?.id || asString(item.id)
+      ? { native_id: envelope?.id || asString(item.id) }
+      : {}),
+    raw_payload: unwrapReasoningTransportCarriers(item),
+    provider_schema_version: 'openai-responses-v1',
+    item_origin: 'native',
+    source_format: envelope?.format || OPENAI_RESPONSES_REASONING_FORMAT,
+    source_origin: sourceOrigin,
+    position: { turn: itemIndex, step: 0, item: itemIndex },
+    ...(callerId || callId ? { group_id: callerId || callId } : {}),
+    ...(callId ? { call_id: callId, pair_id: callId } : {}),
+    ...(dependsOn.length > 0 ? { depends_on: [...new Set(dependsOn)] } : {}),
+    capture_state: envelope?.carrierVersion === 2 && envelope.origin ? 'complete' : 'partial',
+    ...(asString(item.status) ? { provider_status: asString(item.status) } : {}),
+    ...(readableText ? { readable_text: readableText } : {}),
+    ...(readableSummary ? { readable_summary: readableSummary } : {}),
+    ...(itemType === 'compaction'
+      ? { compaction_mode: operation === 'compact' ? 'standalone' : 'server_side' }
+      : {})
+  };
+}
+
+function findReasoningTransportEnvelope(
+  value: unknown
+): ReturnType<typeof decodeReasoningTransportEnvelope> {
+  if (typeof value === 'string') {
+    return decodeReasoningTransportEnvelope(value);
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const envelope = findReasoningTransportEnvelope(entry);
+      if (envelope) {
+        return envelope;
+      }
+    }
+    return undefined;
+  }
+  if (!isObject(value)) {
+    return undefined;
+  }
+  for (const entry of Object.values(value)) {
+    const envelope = findReasoningTransportEnvelope(entry);
+    if (envelope) {
+      return envelope;
+    }
+  }
+  return undefined;
+}
+
+function unwrapReasoningTransportCarriers(value: unknown): Record<string, unknown> {
+  const unwrap = (candidate: unknown): unknown => {
+    if (typeof candidate === 'string') {
+      return decodeReasoningTransportEnvelope(candidate)?.data || candidate;
+    }
+    if (Array.isArray(candidate)) {
+      return candidate.map(unwrap);
+    }
+    if (!isObject(candidate)) {
+      return candidate;
+    }
+    return Object.fromEntries(Object.entries(candidate).map(([key, entry]) => [key, unwrap(entry)]));
+  };
+  return unwrap(value) as Record<string, unknown>;
+}
+
+function isOpenAIResponsesResultItemType(type: string): boolean {
+  return type.endsWith('_output') || type.endsWith('_result') || type === 'function_call_output';
 }
 
 function normalizeOpenAIResponsesToolSearchCallItem(
@@ -804,7 +1156,9 @@ function normalizeOpenAIResponsesToolSearchOutputItem(
 
 function normalizeOpenAIResponsesMessageContent(
   role: 'user' | 'assistant',
-  content: unknown
+  content: unknown,
+  rawItemsByContent?: OpenAIResponsesRawInputProjectionMap,
+  turnIndex = 0
 ): StandardRequestInputContent[] {
   const normalized: StandardRequestInputContent[] = [];
 
@@ -817,7 +1171,8 @@ function normalizeOpenAIResponsesMessageContent(
   }
 
   const blocks = Array.isArray(content) ? content : [content];
-  for (const block of blocks) {
+  for (let blockIndex = 0; blockIndex < blocks.length; blockIndex += 1) {
+    const block = blocks[blockIndex];
     if (typeof block === 'string') {
       const text = block.trim();
       if (text) {
@@ -839,6 +1194,12 @@ function normalizeOpenAIResponsesMessageContent(
 
       const functionCallContent = normalizeOpenAIResponsesFunctionCallItem(block);
       if (functionCallContent) {
+        rememberOpenAIResponsesRawInputProjection(
+          rawItemsByContent,
+          functionCallContent,
+          block,
+          { turn: turnIndex, step: 0, item: blockIndex }
+        );
         normalized.push(functionCallContent);
         continue;
       }
@@ -847,6 +1208,12 @@ function normalizeOpenAIResponsesMessageContent(
     if (role === 'user') {
       const functionCallOutputContent = normalizeOpenAIResponsesFunctionCallOutputItem(block);
       if (functionCallOutputContent) {
+        rememberOpenAIResponsesRawInputProjection(
+          rawItemsByContent,
+          functionCallOutputContent,
+          block,
+          { turn: turnIndex, step: 0, item: blockIndex }
+        );
         normalized.push(functionCallOutputContent);
         continue;
       }
@@ -878,8 +1245,11 @@ function normalizeOpenAIResponsesFunctionCallItem(item: Record<string, unknown>)
   return {
     type: 'tool_use',
     id,
+    ...(asString(item.id) ? { native_id: asString(item.id) } : {}),
     name,
-    input
+    input,
+    ...(asString(item.status) ? { status: asString(item.status) } : {}),
+    ...(isObject(item.caller) ? { caller: item.caller } : {})
   };
 }
 
@@ -890,11 +1260,17 @@ function normalizeOpenAIResponsesReasoningItem(item: Record<string, unknown>): S
 
   const summary = normalizeReasoningSummaryText(item.summary);
   const text = normalizeReasoningContentText(item.content) || asString(item.text);
-  const encryptedContent = asString(item.encrypted_content);
-  const id = asString(item.id);
+  const rawEncryptedContent = asString(item.encrypted_content);
+  const envelope = rawEncryptedContent
+    ? decodeReasoningTransportEnvelope(rawEncryptedContent)
+    : undefined;
+  const encryptedContent = envelope?.data || rawEncryptedContent;
+  const id = envelope?.id || asString(item.id);
   const reasoning: StandardRequestInputContent = {
     type: 'reasoning',
-    source_format: OPENAI_RESPONSES_REASONING_FORMAT
+    source_format: envelope?.format || OPENAI_RESPONSES_REASONING_FORMAT,
+    ...(asString(item.status) ? { status: asString(item.status) } : {}),
+    ...(envelope?.origin ? { source_origin: envelope.origin } : {})
   };
 
   if (id) {
@@ -914,7 +1290,18 @@ function normalizeOpenAIResponsesReasoningItem(item: Record<string, unknown>): S
     return null;
   }
 
-  reasoning.reasoning_details = buildReasoningDetailsForChat(reasoning);
+  reasoning.reasoning_details =
+    envelope?.kind === 'signature'
+      ? [
+          {
+            type: 'reasoning.text',
+            ...(text ? { text } : {}),
+            signature: encryptedContent,
+            ...(id ? { id } : {}),
+            format: reasoning.source_format
+          }
+        ]
+      : buildReasoningDetailsForChat(reasoning);
   return reasoning;
 }
 
@@ -1001,7 +1388,10 @@ function normalizeOpenAIResponsesFunctionCallOutputItem(item: Record<string, unk
   const toolResult: StandardRequestInputContent = {
     type: 'tool_result',
     tool_use_id: toolUseId,
-    content: normalizeToolResultContent(item.output ?? item.content ?? item.result)
+    ...(asString(item.id) ? { native_id: asString(item.id) } : {}),
+    content: normalizeToolResultContent(item.output ?? item.content ?? item.result),
+    ...(asString(item.status) ? { status: asString(item.status) } : {}),
+    ...(isObject(item.caller) ? { caller: item.caller } : {})
   };
   const isError = asBoolean(item.is_error);
   if (isError !== undefined) {
@@ -1088,17 +1478,16 @@ function extractOpenAIChatMessageContent(message: Record<string, unknown>): Stan
 
   const normalized: StandardRequestInputContent[] = [];
   const text = extractMessageText(message.content);
-  if (text) {
-    normalized.push({ type: 'input_text', text });
-  }
-
   if (normalizeMessageRole(message.role) !== 'assistant') {
+    if (text) {
+      normalized.push({ type: 'input_text', text });
+    }
     return normalized;
   }
 
-  const reasoning = normalizeOpenAIChatAssistantReasoning(message);
-  if (reasoning) {
-    normalized.push(reasoning);
+  normalized.push(...normalizeOpenAIChatAssistantReasoning(message));
+  if (text) {
+    normalized.push({ type: 'input_text', text });
   }
   normalized.push(...normalizeOpenAIChatAssistantToolCalls(message.tool_calls));
 
@@ -1110,13 +1499,49 @@ function extractOpenAIChatMessageContent(message: Record<string, unknown>): Stan
   return normalized;
 }
 
-function normalizeOpenAIChatAssistantReasoning(message: Record<string, unknown>): StandardRequestInputContent | null {
+function normalizeOpenAIChatAssistantReasoning(
+  message: Record<string, unknown>
+): StandardRequestInputContent[] {
   const text =
     asString(message.reasoning_content) ||
     asString(message.reasoning) ||
     asString(message.thinking);
-  const details = normalizeOpenAIChatReasoningDetails(message.reasoning_details);
+  const indexedDetailGroups = groupOpenAIChatReasoningDetailsByIndex(
+    message.reasoning_details
+  );
+  if (indexedDetailGroups) {
+    const reasoningItems = indexedDetailGroups
+      .map((group) =>
+        buildOpenAIChatAssistantReasoning(
+          undefined,
+          normalizeOpenAIChatReasoningDetails(group)
+        )
+      )
+      .filter((item): item is StandardRequestInputContent => Boolean(item));
+    if (reasoningItems.length > 0) {
+      return reasoningItems;
+    }
+  }
 
+  const details = normalizeOpenAIChatReasoningDetails(message.reasoning_details);
+  const reasoning = buildOpenAIChatAssistantReasoning(text, details);
+  return reasoning ? [reasoning] : [];
+}
+
+interface NormalizedOpenAIChatReasoningDetails {
+  id?: string;
+  sourceFormat?: string;
+  sourceOrigin?: NonNullable<Extract<StandardRequestInputContent, { type: 'reasoning' }>['source_origin']>;
+  text?: string;
+  summary?: string;
+  encryptedContent?: string;
+  rawDetails: unknown[];
+}
+
+function buildOpenAIChatAssistantReasoning(
+  text: string | undefined,
+  details: NormalizedOpenAIChatReasoningDetails
+): StandardRequestInputContent | null {
   if (!text && !details.text && !details.summary && !details.encryptedContent && details.rawDetails.length === 0) {
     return null;
   }
@@ -1124,6 +1549,15 @@ function normalizeOpenAIChatAssistantReasoning(message: Record<string, unknown>)
   const reasoning: StandardRequestInputContent = {
     type: 'reasoning'
   };
+  if (details.id) {
+    reasoning.id = details.id;
+  }
+  if (details.sourceFormat) {
+    reasoning.source_format = details.sourceFormat;
+  }
+  if (details.sourceOrigin) {
+    reasoning.source_origin = details.sourceOrigin;
+  }
   const mergedText = mergeDistinctReasoningText(details.text, text);
   if (mergedText) {
     reasoning.text = mergedText;
@@ -1142,18 +1576,37 @@ function normalizeOpenAIChatAssistantReasoning(message: Record<string, unknown>)
   return reasoning;
 }
 
-function normalizeOpenAIChatReasoningDetails(value: unknown): {
-  text?: string;
-  summary?: string;
-  encryptedContent?: string;
-  rawDetails: unknown[];
-} {
-  const normalized: {
-    text?: string;
-    summary?: string;
-    encryptedContent?: string;
-    rawDetails: unknown[];
-  } = {
+function groupOpenAIChatReasoningDetailsByIndex(value: unknown): unknown[][] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const groups = new Map<number, unknown[]>();
+  for (const detail of value) {
+    if (!isObject(detail)) {
+      return undefined;
+    }
+
+    const index = asNumber(detail.index);
+    if (index === undefined) {
+      return undefined;
+    }
+
+    const group = groups.get(index);
+    if (group) {
+      group.push(detail);
+    } else {
+      groups.set(index, [detail]);
+    }
+  }
+
+  return groups.size > 1 ? [...groups.values()] : undefined;
+}
+
+function normalizeOpenAIChatReasoningDetails(
+  value: unknown
+): NormalizedOpenAIChatReasoningDetails {
+  const normalized: NormalizedOpenAIChatReasoningDetails = {
     rawDetails: []
   };
 
@@ -1164,8 +1617,8 @@ function normalizeOpenAIChatReasoningDetails(value: unknown): {
   const textParts: string[] = [];
   const summaryParts: string[] = [];
   for (const detail of value) {
-    normalized.rawDetails.push(detail);
     if (typeof detail === 'string') {
+      normalized.rawDetails.push(detail);
       if (detail) {
         textParts.push(detail);
       }
@@ -1173,13 +1626,51 @@ function normalizeOpenAIChatReasoningDetails(value: unknown): {
     }
 
     if (!isObject(detail)) {
+      normalized.rawDetails.push(detail);
       continue;
     }
 
     const type = asString(detail.type);
+    const rawSignature =
+      asString(detail.signature) ||
+      asString(detail.thoughtSignature) ||
+      asString(detail.thought_signature);
+    const rawEncryptedContent = asString(detail.encrypted_content) || asString(detail.data);
+    const envelope = rawSignature || rawEncryptedContent
+      ? decodeReasoningTransportEnvelope(rawSignature || rawEncryptedContent || '')
+      : undefined;
+    const opaqueContent = envelope?.data || rawSignature || rawEncryptedContent;
+    const id = envelope?.id || asString(detail.id);
+    const format = envelope?.format || asString(detail.format);
     const summary = asString(detail.summary);
     const text = asString(detail.text) || asString(detail.reasoning) || asString(detail.thinking);
-    const encryptedContent = asString(detail.encrypted_content) || asString(detail.data);
+    const normalizedDetail: Record<string, unknown> = {
+      ...detail,
+      ...(format ? { format } : {}),
+      ...(id ? { id } : {})
+    };
+    if (envelope) {
+      delete normalizedDetail.thoughtSignature;
+      delete normalizedDetail.thought_signature;
+      delete normalizedDetail.encrypted_content;
+      if (envelope.kind === 'signature' || rawSignature) {
+        delete normalizedDetail.data;
+        normalizedDetail.signature = envelope.data;
+      } else {
+        delete normalizedDetail.signature;
+        normalizedDetail.data = envelope.data;
+      }
+    }
+    normalized.rawDetails.push(normalizedDetail);
+    if (id && !normalized.id) {
+      normalized.id = id;
+    }
+    if (format && !normalized.sourceFormat) {
+      normalized.sourceFormat = format;
+    }
+    if (envelope?.origin && !normalized.sourceOrigin) {
+      normalized.sourceOrigin = envelope.origin;
+    }
 
     if (type === 'reasoning.summary' || (summary && !text)) {
       if (summary || text) {
@@ -1191,8 +1682,8 @@ function normalizeOpenAIChatReasoningDetails(value: unknown): {
     if (text) {
       textParts.push(text);
     }
-    if (encryptedContent && !normalized.encryptedContent) {
-      normalized.encryptedContent = encryptedContent;
+    if (opaqueContent && !normalized.encryptedContent) {
+      normalized.encryptedContent = opaqueContent;
     }
   }
 
@@ -1220,10 +1711,11 @@ function mergeDistinctReasoningText(...values: Array<string | undefined>): strin
 }
 
 function normalizeOpenAIChatToolResultMessage(message: Record<string, unknown>): StandardRequestInputContent[] {
-  const toolUseId = asString(message.tool_call_id) || asString(message.id);
-  if (!toolUseId) {
+  const rawToolUseId = asString(message.tool_call_id) || asString(message.id);
+  if (!rawToolUseId) {
     return [];
   }
+  const toolUseId = decodeGeminiThoughtSignatureToolCallId(rawToolUseId)?.toolCallId || rawToolUseId;
 
   const content = normalizeToolResultContent(message.content);
   if (!content) {
@@ -1260,11 +1752,65 @@ function normalizeOpenAIChatAssistantToolCalls(toolCalls: unknown): StandardRequ
       continue;
     }
 
+    const extraContent = isObject(toolCall.extra_content) ? toolCall.extra_content : undefined;
+    const googleExtra = isObject(extraContent?.google) ? extraContent.google : undefined;
+    const rawThoughtSignature =
+      asString(googleExtra?.thought_signature) ||
+      asString(googleExtra?.thoughtSignature);
+    const rawToolCallId = asString(toolCall.id) || `chatcmpl_call_${name}`;
+    const toolCallIdCarrier = decodeGeminiThoughtSignatureToolCallId(rawToolCallId);
+    const extensionEnvelope = rawThoughtSignature
+      ? decodeReasoningTransportEnvelope(rawThoughtSignature)
+      : undefined;
+    const envelope =
+      extensionEnvelope ||
+      (!rawThoughtSignature || rawThoughtSignature === toolCallIdCarrier?.envelope.data
+        ? toolCallIdCarrier?.envelope
+        : undefined);
+    const thoughtSignature = envelope?.data || rawThoughtSignature;
+    const thoughtSignatureFormat =
+      envelope?.format || (thoughtSignature ? GEMINI_GENERATE_CONTENT_REASONING_FORMAT : undefined);
+    if (
+      thoughtSignature &&
+      thoughtSignatureFormat &&
+      thoughtSignatureFormat !== GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+    ) {
+      normalized.push({
+        type: 'reasoning',
+        ...(envelope?.id ? { id: envelope.id } : {}),
+        source_format: thoughtSignatureFormat,
+        ...(envelope?.origin ? { source_origin: envelope.origin } : {}),
+        encrypted_content: thoughtSignature,
+        reasoning_details: [
+          envelope?.kind === 'signature'
+            ? {
+                type: 'reasoning.text',
+                signature: thoughtSignature,
+                ...(envelope?.id ? { id: envelope.id } : {}),
+                format: thoughtSignatureFormat
+              }
+            : {
+                type: 'reasoning.encrypted',
+                data: thoughtSignature,
+                ...(envelope?.id ? { id: envelope.id } : {}),
+                format: thoughtSignatureFormat
+              }
+        ]
+      });
+    }
+
     normalized.push({
       type: 'tool_use',
-      id: asString(toolCall.id) || `chatcmpl_call_${name}`,
+      id: toolCallIdCarrier?.toolCallId || rawToolCallId,
       name,
-      input: normalizeFunctionArgumentsInput(functionPayload?.arguments ?? toolCall.arguments ?? toolCall.input)
+      input: normalizeFunctionArgumentsInput(functionPayload?.arguments ?? toolCall.arguments ?? toolCall.input),
+      ...(thoughtSignature && thoughtSignatureFormat === GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+        ? {
+            thought_signature: thoughtSignature,
+            thought_signature_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+            ...(envelope?.origin ? { thought_signature_origin: envelope.origin } : {})
+          }
+        : {})
     });
   }
 
@@ -1304,9 +1850,13 @@ function extractAnthropicSystem(system: unknown): string | undefined {
 
 function extractAnthropicMessageContent(
   role: 'user' | 'assistant',
-  content: unknown
+  content: unknown,
+  messageIndex: number,
+  sourceModel: string | undefined,
+  providerMode: string
 ): StandardRequestInputContent[] {
   const normalized: StandardRequestInputContent[] = [];
+  let pendingForeignNativeCall: ProviderNativeItem | undefined;
 
   if (typeof content === 'string') {
     const text = content.trim();
@@ -1332,8 +1882,24 @@ function extractAnthropicMessageContent(
     }
 
     const blockType = asString(block.type);
-    const reasoning = normalizeAnthropicThinkingBlock(block, role, normalized.length);
+    const reasoning = normalizeAnthropicThinkingBlock(
+      block,
+      role,
+      normalized.length,
+      messageIndex,
+      sourceModel,
+      providerMode
+    );
     if (reasoning) {
+      if (
+        reasoning.type === 'reasoning' &&
+        reasoning.native_item &&
+        reasoning.native_item.source_format !== ANTHROPIC_CLAUDE_REASONING_FORMAT &&
+        reasoning.native_item.item_type === 'function_call'
+      ) {
+        pendingForeignNativeCall = reasoning.native_item;
+        delete reasoning.native_item;
+      }
       normalized.push(reasoning);
       continue;
     }
@@ -1349,8 +1915,10 @@ function extractAnthropicMessageContent(
         type: 'tool_use',
         id,
         name,
-        input: block.input ?? {}
+        input: block.input ?? {},
+        ...(pendingForeignNativeCall ? { native_item: pendingForeignNativeCall } : {})
       };
+      pendingForeignNativeCall = undefined;
       const thoughtSignature = readThoughtSignature(block);
       if (thoughtSignature) {
         toolUse.thought_signature = thoughtSignature;
@@ -1394,7 +1962,10 @@ function extractAnthropicMessageContent(
 function normalizeAnthropicThinkingBlock(
   block: Record<string, unknown>,
   role: 'user' | 'assistant',
-  index: number
+  index: number,
+  messageIndex: number,
+  sourceModel: string | undefined,
+  providerMode: string
 ): StandardRequestInputContent | null {
   if (role !== 'assistant') {
     return null;
@@ -1403,14 +1974,19 @@ function normalizeAnthropicThinkingBlock(
   const blockType = asString(block.type);
   if (blockType === 'thinking') {
     const thinking = asString(block.thinking) || asString(block.text);
-    const signature = asString(block.signature);
-    if (!thinking && !signature) {
+    const rawSignature = asString(block.signature);
+    const envelope = rawSignature
+      ? decodeReasoningTransportEnvelope(rawSignature)
+      : undefined;
+    const signature = envelope?.data || rawSignature;
+    const sourceFormat = envelope?.format || ANTHROPIC_CLAUDE_REASONING_FORMAT;
+    if (!thinking && !rawSignature) {
       return null;
     }
 
     const detail: Record<string, unknown> = {
       type: 'reasoning.text',
-      format: 'anthropic-claude-v1',
+      format: sourceFormat,
       index
     };
     if (thinking) {
@@ -1422,8 +1998,26 @@ function normalizeAnthropicThinkingBlock(
 
     const reasoning: StandardRequestInputContent = {
       type: 'reasoning',
+      ...(envelope?.id ? { id: envelope.id } : {}),
+      source_format: sourceFormat,
+      ...(envelope?.origin ? { source_origin: envelope.origin } : {}),
       reasoning_details: [detail]
     };
+    const nativeItem = envelope?.nativeItem ||
+      (shouldCaptureAnthropicNativeBlock(envelope)
+        ? captureAnthropicNativeThinkingBlock({
+            block,
+            itemType: 'thinking',
+            messageIndex,
+            itemIndex: index,
+            sourceModel,
+            providerMode,
+            envelope
+          })
+        : undefined);
+    if (nativeItem) {
+      reasoning.native_item = nativeItem;
+    }
     if (thinking) {
       reasoning.text = thinking;
     }
@@ -1436,30 +2030,84 @@ function normalizeAnthropicThinkingBlock(
       return null;
     }
 
-    const envelope = decodeOpenAIResponsesReasoningEnvelope(data);
-    const encryptedContent = envelope?.encryptedContent || data;
+    const envelope = decodeReasoningTransportEnvelope(data);
+    const encryptedContent = envelope?.data || data;
+    const sourceFormat = envelope?.format || ANTHROPIC_CLAUDE_REASONING_FORMAT;
+    const nativeItem = envelope?.nativeItem ||
+      (shouldCaptureAnthropicNativeBlock(envelope)
+        ? captureAnthropicNativeThinkingBlock({
+            block,
+            itemType: 'redacted_thinking',
+            messageIndex,
+            itemIndex: index,
+            sourceModel,
+            providerMode,
+            envelope
+          })
+        : undefined);
     return {
       type: 'reasoning',
-      ...(envelope
-        ? {
-            id: envelope.id,
-            source_format: OPENAI_RESPONSES_REASONING_FORMAT
-          }
-        : {}),
+      ...(envelope?.id ? { id: envelope.id } : {}),
+      source_format: sourceFormat,
+      ...(envelope?.origin ? { source_origin: envelope.origin } : {}),
       encrypted_content: encryptedContent,
       reasoning_details: [
         {
           type: 'reasoning.encrypted',
           data: encryptedContent,
-          ...(envelope ? { id: envelope.id } : {}),
-          format: envelope ? OPENAI_RESPONSES_REASONING_FORMAT : 'anthropic-claude-v1',
+          ...(envelope?.id ? { id: envelope.id } : {}),
+          format: sourceFormat,
           index
         }
-      ]
+      ],
+      ...(nativeItem ? { native_item: nativeItem } : {})
     };
   }
 
   return null;
+}
+
+function shouldCaptureAnthropicNativeBlock(
+  envelope: ReturnType<typeof decodeReasoningTransportEnvelope>
+): boolean {
+  return !envelope || envelope.format === ANTHROPIC_CLAUDE_REASONING_FORMAT;
+}
+
+function captureAnthropicNativeThinkingBlock(options: {
+  block: Record<string, unknown>;
+  itemType: 'thinking' | 'redacted_thinking';
+  messageIndex: number;
+  itemIndex: number;
+  sourceModel: string | undefined;
+  providerMode: string;
+  envelope: ReturnType<typeof decodeReasoningTransportEnvelope>;
+}): ProviderNativeItem {
+  const sourceOrigin = options.envelope?.origin || {
+    provider: 'anthropic',
+    endpoint: 'unverified',
+    ...(options.sourceModel ? { model: options.sourceModel } : {})
+  };
+  const rawPayload = unwrapReasoningTransportCarriers(options.block);
+  const readableText = typeof rawPayload.thinking === 'string'
+    ? rawPayload.thinking
+    : undefined;
+  return {
+    type: 'provider_native_item',
+    item_type: options.itemType,
+    ...(asString(rawPayload.id) ? { native_id: asString(rawPayload.id) } : {}),
+    raw_payload: rawPayload,
+    provider_schema_version: 'anthropic-messages-2023-06-01',
+    item_origin: 'native',
+    source_format: options.envelope?.format || ANTHROPIC_CLAUDE_REASONING_FORMAT,
+    source_origin: sourceOrigin,
+    position: { turn: options.messageIndex, step: 0, item: options.itemIndex },
+    capture_state:
+      options.envelope?.carrierVersion === 2 && options.envelope.origin
+        ? 'complete'
+        : 'partial',
+    provider_mode: options.providerMode,
+    ...(readableText !== undefined ? { readable_text: readableText } : {})
+  };
 }
 
 function normalizeAnthropicToolResultContent(content: unknown): string {
@@ -1507,6 +2155,497 @@ function normalizeAnthropicToolResultContent(content: unknown): string {
   return '';
 }
 
+function collectNativeItemsFromInputContent(
+  content: StandardRequestInputContent[]
+): Pick<StandardRequestInputMessage, 'native_items'> | Record<string, never> {
+  const nativeItems = content.flatMap((item) => {
+    if (item.type === 'provider_native_item') {
+      return [item];
+    }
+    return 'native_item' in item && item.native_item ? [item.native_item] : [];
+  });
+  return nativeItems.length > 0 ? { native_items: [...new Set(nativeItems)] } : {};
+}
+
+function linkOpenAIResponsesNativeToolGroups(
+  messages: StandardRequestInputMessage[],
+  rawItemsByContent: OpenAIResponsesRawInputProjectionMap
+): void {
+  const nativeCallsById = new Map<string, ProviderNativeItem>();
+
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const message = messages[messageIndex]!;
+    attachDetachedOpenAIResponsesNativeItems(message);
+
+    if (message.role === 'assistant') {
+      const reasoningItems = collectOpenAIResponsesReasoningNativeItems(message);
+      const primaryReasoning = reasoningItems[0];
+      const linkedReasoningItems = primaryReasoning
+        ? reasoningItems.filter((item) =>
+            haveSameReasoningStateOrigin(item, primaryReasoning)
+          )
+        : [];
+
+      for (let reasoningIndex = 0; reasoningIndex < linkedReasoningItems.length; reasoningIndex += 1) {
+        const reasoning = linkedReasoningItems[reasoningIndex]!;
+        reasoning.native_id ||= `responses-reasoning-${reasoning.position.turn}-${reasoning.position.step}-${reasoning.position.item}-${reasoningIndex}`;
+      }
+
+      const existingCall = message.content
+        .map(readOpenAIResponsesNativeItemFromContent)
+        .find((item) =>
+          item?.source_format === OPENAI_RESPONSES_REASONING_FORMAT &&
+          (!primaryReasoning || haveSameReasoningStateOrigin(item, primaryReasoning)) &&
+          isOpenAIResponsesCallNativeItem(item)
+        );
+      const sharedGroupId = primaryReasoning
+        ? primaryReasoning.group_id || existingCall?.group_id ||
+          `responses-turn-${primaryReasoning.native_id}`
+        : undefined;
+
+      if (sharedGroupId) {
+        for (const reasoning of linkedReasoningItems) {
+          reasoning.group_id = sharedGroupId;
+        }
+      }
+
+      const reasoningDependencies = linkedReasoningItems
+        .map((item) => item.native_id)
+        .filter((id): id is string => Boolean(id));
+      const reasoningCaptureState = combineProviderNativeCaptureStates(
+        linkedReasoningItems.map((item) => item.capture_state)
+      );
+
+      for (let contentIndex = 0; contentIndex < message.content.length; contentIndex += 1) {
+        const content = message.content[contentIndex]!;
+        if (content.type !== 'tool_use' && content.type !== 'tool_search_call') {
+          continue;
+        }
+
+        const callId = content.type === 'tool_use' ? content.id : content.call_id;
+        let nativeItem = content.native_item;
+        if (nativeItem && nativeItem.source_format !== OPENAI_RESPONSES_REASONING_FORMAT) {
+          continue;
+        }
+
+        const canLinkReasoning = Boolean(
+          primaryReasoning &&
+          (!nativeItem || haveSameReasoningStateOrigin(nativeItem, primaryReasoning))
+        );
+        if (!nativeItem && !canLinkReasoning) {
+          continue;
+        }
+
+        const projection = rawItemsByContent.get(content);
+        const rawPayload = projection?.rawPayload ||
+          buildFallbackOpenAIResponsesCallPayload(content);
+        const itemType = asString(rawPayload.type) ||
+          (content.type === 'tool_use' ? 'function_call' : 'tool_search_call');
+        const groupId = canLinkReasoning
+          ? sharedGroupId!
+          : nativeItem?.group_id || callId;
+        const dependencies = [
+          ...(nativeItem?.depends_on || []),
+          ...(canLinkReasoning ? reasoningDependencies : [])
+        ];
+        const captureState = combineProviderNativeCaptureStates([
+          ...(nativeItem ? [nativeItem.capture_state] : []),
+          ...(canLinkReasoning ? [reasoningCaptureState] : [])
+        ]);
+
+        if (!nativeItem) {
+          nativeItem = {
+            type: 'provider_native_item',
+            item_type: itemType,
+            native_id: asString(rawPayload.id) ||
+              `responses-${itemType}-${callId}`,
+            raw_payload: rawPayload,
+            provider_schema_version: primaryReasoning!.provider_schema_version,
+            item_origin: 'native',
+            source_format: OPENAI_RESPONSES_REASONING_FORMAT,
+            source_origin: primaryReasoning!.source_origin,
+            position: projection?.position || {
+              turn: messageIndex,
+              step: 0,
+              item: contentIndex
+            },
+            group_id: groupId,
+            call_id: callId,
+            pair_id: callId,
+            ...(dependencies.length > 0
+              ? { depends_on: [...new Set(dependencies)] }
+              : {}),
+            capture_state: captureState,
+            ...(content.status ? { provider_status: content.status } : {})
+          };
+          content.native_item = nativeItem;
+        } else {
+          nativeItem.item_origin ||= 'native';
+          nativeItem.native_id ||= asString(nativeItem.raw_payload.id) ||
+            `responses-${nativeItem.item_type}-${callId}`;
+          nativeItem.group_id = groupId;
+          nativeItem.call_id = callId;
+          nativeItem.pair_id = callId;
+          nativeItem.capture_state = captureState;
+          nativeItem.depends_on = dependencies.length > 0
+            ? [...new Set(dependencies)]
+            : undefined;
+        }
+        nativeCallsById.set(callId, nativeItem);
+      }
+    } else {
+      for (let contentIndex = 0; contentIndex < message.content.length; contentIndex += 1) {
+        const content = message.content[contentIndex]!;
+        if (content.type !== 'tool_result' && content.type !== 'tool_search_output') {
+          continue;
+        }
+
+        const callId = content.type === 'tool_result'
+          ? content.tool_use_id
+          : content.call_id;
+        const nativeCall = nativeCallsById.get(callId);
+        if (!nativeCall) {
+          continue;
+        }
+
+        let nativeItem = content.native_item;
+        if (nativeItem && nativeItem.source_format !== OPENAI_RESPONSES_REASONING_FORMAT) {
+          continue;
+        }
+        if (
+          nativeItem &&
+          !haveSameReasoningStateOrigin(nativeItem, nativeCall)
+        ) {
+          continue;
+        }
+
+        const projection = rawItemsByContent.get(content);
+        const rawPayload = projection?.rawPayload ||
+          buildFallbackOpenAIResponsesResultPayload(content);
+        const itemType = asString(rawPayload.type) ||
+          (content.type === 'tool_result'
+            ? 'function_call_output'
+            : 'tool_search_output');
+        const callNativeId = nativeCall.native_id || callId;
+        const dependencies = [
+          ...(nativeItem?.depends_on || []),
+          callNativeId
+        ];
+        const captureState = combineProviderNativeCaptureStates([
+          nativeCall.capture_state,
+          ...(nativeItem ? [nativeItem.capture_state] : [])
+        ]);
+
+        if (!nativeItem) {
+          nativeItem = {
+            type: 'provider_native_item',
+            item_type: itemType,
+            native_id: asString(rawPayload.id) ||
+              `responses-${itemType}-${callId}`,
+            raw_payload: rawPayload,
+            provider_schema_version: nativeCall.provider_schema_version,
+            item_origin: 'native',
+            source_format: OPENAI_RESPONSES_REASONING_FORMAT,
+            source_origin: nativeCall.source_origin,
+            position: projection?.position || {
+              turn: messageIndex,
+              step: 0,
+              item: contentIndex
+            },
+            group_id: nativeCall.group_id || callId,
+            call_id: callId,
+            pair_id: callId,
+            depends_on: [...new Set(dependencies)],
+            capture_state: captureState,
+            ...(content.status ? { provider_status: content.status } : {})
+          };
+          content.native_item = nativeItem;
+        } else {
+          nativeItem.item_origin ||= 'native';
+          nativeItem.native_id ||= asString(nativeItem.raw_payload.id) ||
+            `responses-${nativeItem.item_type}-${callId}`;
+          nativeItem.group_id = nativeCall.group_id || callId;
+          nativeItem.call_id = callId;
+          nativeItem.pair_id = callId;
+          nativeItem.depends_on = [...new Set(dependencies)];
+          nativeItem.capture_state = captureState;
+        }
+      }
+    }
+
+    const nativeItems = message.content.flatMap((content) => {
+      const nativeItem = readOpenAIResponsesNativeItemFromContent(content);
+      return nativeItem ? [nativeItem] : [];
+    });
+    const mergedNativeItems = [...new Set([
+      ...(message.native_items || []),
+      ...nativeItems
+    ])];
+    message.native_items = mergedNativeItems.length > 0
+      ? mergedNativeItems
+      : undefined;
+  }
+}
+
+function attachDetachedOpenAIResponsesNativeItems(
+  message: StandardRequestInputMessage
+): void {
+  const detached = message.native_items || [];
+  const claimed = new Set(
+    message.content
+      .map(readOpenAIResponsesNativeItemFromContent)
+      .filter((item): item is ProviderNativeItem => Boolean(item))
+  );
+
+  for (const content of message.content) {
+    if (content.type === 'provider_native_item' || content.native_item) {
+      continue;
+    }
+    const matching = detached.find((nativeItem) =>
+      !claimed.has(nativeItem) &&
+      nativeItem.source_format === OPENAI_RESPONSES_REASONING_FORMAT &&
+      doesOpenAIResponsesNativeItemMatchContent(nativeItem, content)
+    );
+    if (matching) {
+      content.native_item = matching;
+      claimed.add(matching);
+    }
+  }
+}
+
+function collectOpenAIResponsesReasoningNativeItems(
+  message: StandardRequestInputMessage
+): ProviderNativeItem[] {
+  const nativeItems = [
+    ...(message.native_items || []),
+    ...message.content.flatMap((content) => {
+      const nativeItem = readOpenAIResponsesNativeItemFromContent(content);
+      return nativeItem ? [nativeItem] : [];
+    })
+  ];
+  return [...new Set(nativeItems)].filter((item) =>
+    item.source_format === OPENAI_RESPONSES_REASONING_FORMAT &&
+    item.item_type.toLowerCase() === 'reasoning'
+  );
+}
+
+function readOpenAIResponsesNativeItemFromContent(
+  content: StandardRequestInputContent
+): ProviderNativeItem | undefined {
+  if (content.type === 'provider_native_item') {
+    return content;
+  }
+  return content.native_item;
+}
+
+function doesOpenAIResponsesNativeItemMatchContent(
+  nativeItem: ProviderNativeItem,
+  content: Exclude<StandardRequestInputContent, ProviderNativeItem>
+): boolean {
+  const itemType = nativeItem.item_type.toLowerCase();
+  const callId = nativeItem.call_id || nativeItem.pair_id ||
+    asString(nativeItem.raw_payload.call_id) ||
+    asString(nativeItem.raw_payload.tool_use_id);
+  if (content.type === 'reasoning') {
+    return itemType === 'reasoning' &&
+      (!content.id || !nativeItem.native_id || content.id === nativeItem.native_id);
+  }
+  if (content.type === 'tool_use') {
+    return (itemType === 'function_call' || itemType === 'tool_call') &&
+      callId === content.id;
+  }
+  if (content.type === 'tool_search_call') {
+    return itemType === 'tool_search_call' && callId === content.call_id;
+  }
+  if (content.type === 'tool_result') {
+    return itemType === 'function_call_output' && callId === content.tool_use_id;
+  }
+  if (content.type === 'tool_search_output') {
+    return itemType === 'tool_search_output' && callId === content.call_id;
+  }
+  return false;
+}
+
+function isOpenAIResponsesCallNativeItem(item: ProviderNativeItem): boolean {
+  const type = item.item_type.toLowerCase();
+  return type === 'function_call' || type === 'tool_call' || type === 'tool_search_call';
+}
+
+function haveSameReasoningStateOrigin(
+  left: ProviderNativeItem,
+  right: ProviderNativeItem
+): boolean {
+  return left.source_format === right.source_format &&
+    left.source_origin.provider === right.source_origin.provider &&
+    left.source_origin.endpoint === right.source_origin.endpoint &&
+    left.source_origin.model === right.source_origin.model &&
+    left.source_origin.credentialScope === right.source_origin.credentialScope;
+}
+
+function combineProviderNativeCaptureStates(
+  states: ProviderNativeItem['capture_state'][]
+): ProviderNativeItem['capture_state'] {
+  if (states.some((state) => state === 'interrupted')) {
+    return 'interrupted';
+  }
+  return states.length > 0 && states.every((state) => state === 'complete')
+    ? 'complete'
+    : 'partial';
+}
+
+function buildFallbackOpenAIResponsesCallPayload(
+  content: Extract<StandardRequestInputContent, { type: 'tool_use' | 'tool_search_call' }>
+): Record<string, unknown> {
+  if (content.type === 'tool_search_call') {
+    return {
+      type: 'tool_search_call',
+      execution: 'client',
+      call_id: content.call_id,
+      arguments: content.arguments,
+      ...(content.status ? { status: content.status } : {})
+    };
+  }
+  return {
+    type: 'function_call',
+    ...(content.native_id ? { id: content.native_id } : {}),
+    call_id: content.id,
+    name: content.name,
+    arguments: serializeOpenAIResponsesFunctionArguments(content.input),
+    ...(content.status ? { status: content.status } : {}),
+    ...(content.caller ? { caller: content.caller } : {})
+  };
+}
+
+function buildFallbackOpenAIResponsesResultPayload(
+  content: Extract<StandardRequestInputContent, { type: 'tool_result' | 'tool_search_output' }>
+): Record<string, unknown> {
+  if (content.type === 'tool_search_output') {
+    return {
+      type: 'tool_search_output',
+      execution: 'client',
+      call_id: content.call_id,
+      tools: content.tools,
+      ...(content.status ? { status: content.status } : {})
+    };
+  }
+  return {
+    type: 'function_call_output',
+    ...(content.native_id ? { id: content.native_id } : {}),
+    call_id: content.tool_use_id,
+    output: content.content,
+    ...(content.status ? { status: content.status } : {}),
+    ...(content.caller ? { caller: content.caller } : {}),
+    ...(content.is_error !== undefined ? { is_error: content.is_error } : {})
+  };
+}
+
+function serializeOpenAIResponsesFunctionArguments(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  try {
+    return JSON.stringify(value ?? {}) || '{}';
+  } catch {
+    return '{}';
+  }
+}
+
+function linkAnthropicNativeToolGroups(messages: StandardRequestInputMessage[]): void {
+  const groupsByCallId = new Map<string, ProviderNativeItem>();
+  for (const message of messages) {
+    if (message.role === 'assistant') {
+      let pendingNative: ProviderNativeItem | undefined;
+      for (const item of message.content) {
+        if (
+          item.type === 'reasoning' &&
+          item.native_item?.source_format === ANTHROPIC_CLAUDE_REASONING_FORMAT
+        ) {
+          pendingNative = item.native_item;
+          continue;
+        }
+        if (item.type !== 'tool_use' || !pendingNative) {
+          continue;
+        }
+        const callId = item.id;
+        if (pendingNative.group_id && pendingNative.group_id !== callId) {
+          pendingNative = undefined;
+          continue;
+        }
+        pendingNative.group_id = callId;
+        pendingNative.call_id = callId;
+        pendingNative.native_id ||= `anthropic-thinking-${pendingNative.position.turn}-${pendingNative.position.item}`;
+        const nativeToolUse: ProviderNativeItem = {
+          type: 'provider_native_item',
+          item_type: 'tool_use',
+          native_id: callId,
+          raw_payload: {
+            type: 'tool_use',
+            id: callId,
+            name: item.name,
+            input: item.input
+          },
+          provider_schema_version: pendingNative.provider_schema_version,
+          item_origin: 'native',
+          source_format: pendingNative.source_format,
+          source_origin: pendingNative.source_origin,
+          position: {
+            ...pendingNative.position,
+            item: pendingNative.position.item + 1
+          },
+          group_id: callId,
+          call_id: callId,
+          pair_id: callId,
+          depends_on: [pendingNative.native_id],
+          capture_state: pendingNative.capture_state,
+          ...(pendingNative.provider_mode
+            ? { provider_mode: pendingNative.provider_mode }
+            : {})
+        };
+        item.native_item = nativeToolUse;
+        groupsByCallId.set(callId, nativeToolUse);
+        pendingNative = undefined;
+      }
+    } else {
+      for (const item of message.content) {
+        if (item.type !== 'tool_result') {
+          continue;
+        }
+        const call = groupsByCallId.get(item.tool_use_id);
+        if (!call) {
+          continue;
+        }
+        item.native_item = {
+          type: 'provider_native_item',
+          item_type: 'tool_result',
+          raw_payload: {
+            type: 'tool_result',
+            tool_use_id: item.tool_use_id,
+            content: item.content,
+            ...(item.is_error !== undefined ? { is_error: item.is_error } : {})
+          },
+          provider_schema_version: call.provider_schema_version,
+          item_origin: 'native',
+          source_format: call.source_format,
+          source_origin: call.source_origin,
+          position: {
+            turn: call.position.turn + 1,
+            step: call.position.step,
+            item: call.position.item + 1
+          },
+          group_id: item.tool_use_id,
+          call_id: item.tool_use_id,
+          pair_id: item.tool_use_id,
+          depends_on: [call.native_id || item.tool_use_id],
+          capture_state: call.capture_state,
+          ...(call.provider_mode ? { provider_mode: call.provider_mode } : {})
+        };
+      }
+    }
+    const native = collectNativeItemsFromInputContent(message.content);
+    message.native_items = 'native_items' in native ? native.native_items : undefined;
+  }
+}
+
 function extractAnthropicToolReferences(content: unknown): string[] {
   if (!Array.isArray(content)) {
     return [];
@@ -1538,11 +2677,13 @@ function extractGeminiSystemInstruction(systemInstruction: unknown): string | un
 
 interface GeminiToolCallState {
   toolUseIdsByName: Map<string, string[]>;
+  nativeToolGroupsById: Map<string, ProviderNativeItem>;
 }
 
 function createGeminiToolCallState(): GeminiToolCallState {
   return {
-    toolUseIdsByName: new Map()
+    toolUseIdsByName: new Map(),
+    nativeToolGroupsById: new Map()
   };
 }
 
@@ -1550,7 +2691,8 @@ function extractGeminiMessageContent(
   role: 'user' | 'assistant',
   parts: unknown[],
   state: GeminiToolCallState,
-  messageIndex: number
+  messageIndex: number,
+  sourceModel?: string
 ): StandardRequestInputContent[] {
   const normalized: StandardRequestInputContent[] = [];
 
@@ -1585,9 +2727,61 @@ function extractGeminiMessageContent(
         name,
         input: normalizeGeminiFunctionCallArguments(functionCall.args ?? functionCall.arguments)
       };
-      const thoughtSignature = readGeminiThoughtSignature(part, functionCall);
-      if (thoughtSignature) {
+      const rawThoughtSignature = readGeminiThoughtSignature(part, functionCall);
+      const envelope = rawThoughtSignature
+        ? decodeReasoningTransportEnvelope(rawThoughtSignature)
+        : undefined;
+      const thoughtSignature = envelope?.data || rawThoughtSignature;
+      const thoughtSignatureFormat =
+        envelope?.format || GEMINI_GENERATE_CONTENT_REASONING_FORMAT;
+      const nativeItem = captureGeminiGenerateContentPartNativeItem({
+        part,
+        messageIndex,
+        partIndex,
+        itemType: 'function_call',
+        callId: id,
+        envelope,
+        requireSignature: isGemini3ModelName(sourceModel),
+        sourceModel
+      });
+      if (
+        thoughtSignature &&
+        thoughtSignatureFormat !== GEMINI_GENERATE_CONTENT_REASONING_FORMAT
+      ) {
+        normalized.push({
+          type: 'reasoning',
+          ...(envelope?.id ? { id: envelope.id } : {}),
+          source_format: thoughtSignatureFormat,
+          ...(envelope?.origin ? { source_origin: envelope.origin } : {}),
+          encrypted_content: thoughtSignature,
+          reasoning_details: [
+            envelope?.kind === 'signature'
+              ? {
+                  type: 'reasoning.text',
+                  signature: thoughtSignature,
+                  ...(envelope?.id ? { id: envelope.id } : {}),
+                  format: thoughtSignatureFormat,
+                  index: partIndex
+                }
+              : {
+                  type: 'reasoning.encrypted',
+                  data: thoughtSignature,
+                  ...(envelope?.id ? { id: envelope.id } : {}),
+                  format: thoughtSignatureFormat,
+                  index: partIndex
+                }
+          ]
+        });
+      } else if (thoughtSignature) {
         toolUse.thought_signature = thoughtSignature;
+        toolUse.thought_signature_format = GEMINI_GENERATE_CONTENT_REASONING_FORMAT;
+        if (envelope?.origin) {
+          toolUse.thought_signature_origin = envelope.origin;
+        }
+      }
+      if (nativeItem) {
+        toolUse.native_item = nativeItem;
+        state.nativeToolGroupsById.set(id, nativeItem);
       }
       normalized.push(toolUse);
       trackGeminiToolUseId(state, name, id);
@@ -1618,6 +2812,24 @@ function extractGeminiMessageContent(
         tool_use_id: toolUseId,
         content: normalizeGeminiFunctionResponseContent(rawResponseContent)
       };
+      const nativeCall = state.nativeToolGroupsById.get(toolUseId);
+      if (nativeCall) {
+        toolResult.native_item = {
+          type: 'provider_native_item',
+          item_type: 'function_response',
+          raw_payload: part,
+          provider_schema_version: nativeCall.provider_schema_version,
+          item_origin: 'native',
+          source_format: nativeCall.source_format,
+          source_origin: nativeCall.source_origin,
+          position: { turn: messageIndex, step: 0, item: partIndex },
+          group_id: toolUseId,
+          call_id: toolUseId,
+          pair_id: toolUseId,
+          depends_on: [nativeCall.native_id || toolUseId],
+          capture_state: nativeCall.capture_state
+        };
+      }
       const isError =
         asBoolean(functionResponse.is_error) ??
         asBoolean(functionResponse.error) ??
@@ -1633,20 +2845,112 @@ function extractGeminiMessageContent(
 
     const thought = normalizeGeminiThoughtPart(part, role, partIndex);
     if (thought) {
+      const signature = readThoughtSignature(part);
+      const envelope = signature ? decodeReasoningTransportEnvelope(signature) : undefined;
+      const nativeItem = captureGeminiGenerateContentPartNativeItem({
+        part,
+        messageIndex,
+        partIndex,
+        itemType: 'thought',
+        envelope,
+        sourceModel
+      });
+      if (nativeItem && thought.type === 'reasoning') {
+        thought.native_item = nativeItem;
+      }
       normalized.push(thought);
       continue;
     }
 
     const text = extractTextFromPart(part);
-    if (text) {
+    const rawPartSignature = readThoughtSignature(part);
+    if (text || (typeof part.text === 'string' && rawPartSignature)) {
+      const envelope = rawPartSignature
+        ? decodeReasoningTransportEnvelope(rawPartSignature)
+        : undefined;
+      const nativeItem = captureGeminiGenerateContentPartNativeItem({
+        part,
+        messageIndex,
+        partIndex,
+        itemType: 'part',
+        envelope,
+        sourceModel
+      });
       normalized.push({
         type: 'input_text',
-        text
+        text: typeof part.text === 'string' ? part.text : text,
+        ...(nativeItem ? { native_item: nativeItem } : {})
       });
     }
   }
 
   return normalized;
+}
+
+function rememberOpenAIResponsesRawInputProjection(
+  rawItemsByContent: OpenAIResponsesRawInputProjectionMap | undefined,
+  content: StandardRequestInputContent,
+  rawPayload: Record<string, unknown>,
+  position: ProviderNativeItem['position']
+): void {
+  rawItemsByContent?.set(content, {
+    rawPayload: unwrapReasoningTransportCarriers(rawPayload),
+    position
+  });
+}
+
+function captureGeminiGenerateContentPartNativeItem(options: {
+  part: Record<string, unknown>;
+  messageIndex: number;
+  partIndex: number;
+  itemType: 'part' | 'thought' | 'function_call';
+  callId?: string;
+  envelope?: ReturnType<typeof decodeReasoningTransportEnvelope>;
+  requireSignature?: boolean;
+  sourceModel?: string;
+}): ProviderNativeItem | undefined {
+  if (options.envelope?.nativeItem) {
+    return options.envelope.nativeItem;
+  }
+  const rawSignature = readThoughtSignature(options.part) ||
+    (isObject(options.part.functionCall)
+      ? readThoughtSignature(options.part.functionCall)
+      : undefined);
+  if (!rawSignature && !options.requireSignature) {
+    return undefined;
+  }
+  const readableText = typeof options.part.text === 'string' ? options.part.text : undefined;
+  return {
+    type: 'provider_native_item',
+    item_type: options.itemType,
+    ...(asString(options.part.id) || options.callId
+      ? { native_id: asString(options.part.id) || options.callId }
+      : {}),
+    raw_payload: unwrapReasoningTransportCarriers(options.part),
+    provider_schema_version: 'gemini-generate-content-v1beta',
+    item_origin: 'native',
+    source_format: options.envelope?.format || GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+    source_origin: options.envelope?.origin || {
+      provider: 'gemini',
+      endpoint: 'unverified',
+      ...(options.sourceModel ? { model: options.sourceModel } : {})
+    },
+    position: { turn: options.messageIndex, step: 0, item: options.partIndex },
+    ...(options.callId ? {
+      group_id: options.callId,
+      call_id: options.callId,
+      pair_id: options.callId
+    } : {}),
+    capture_state:
+      options.envelope?.carrierVersion === 2 && options.envelope.origin
+        ? 'complete'
+        : 'partial',
+    ...(readableText !== undefined ? { readable_text: readableText } : {})
+  };
+}
+
+function isGemini3ModelName(model: string | undefined): boolean {
+  return /^gemini-3(?:[.-]|$)/i.test(model?.trim() || '');
 }
 
 function normalizeGeminiThoughtPart(
@@ -1663,28 +2967,45 @@ function normalizeGeminiThoughtPart(
   if (!text && !thoughtSignature) {
     return null;
   }
+  const envelope = thoughtSignature
+    ? decodeReasoningTransportEnvelope(thoughtSignature)
+    : undefined;
+  const encryptedContent = envelope?.data || thoughtSignature;
+  const sourceFormat = envelope?.format || GEMINI_GENERATE_CONTENT_REASONING_FORMAT;
 
   const reasoning: StandardRequestInputContent = {
     type: 'reasoning',
+    ...(envelope?.id ? { id: envelope.id } : {}),
+    source_format: sourceFormat,
+    ...(envelope?.origin ? { source_origin: envelope.origin } : {}),
     reasoning_details: [
       ...(text
         ? [
             {
               type: 'reasoning.text',
               text,
-              format: 'google-generate-content-v1',
+              format: sourceFormat,
               index
             }
           ]
         : []),
-      ...(thoughtSignature
+      ...(encryptedContent
         ? [
-            {
-              type: 'reasoning.encrypted',
-              data: thoughtSignature,
-              format: 'google-generate-content-v1',
-              index
-            }
+            envelope?.kind === 'signature'
+              ? {
+                  type: 'reasoning.text',
+                  signature: encryptedContent,
+                  ...(envelope?.id ? { id: envelope.id } : {}),
+                  format: sourceFormat,
+                  index
+                }
+              : {
+                  type: 'reasoning.encrypted',
+                  data: encryptedContent,
+                  ...(envelope?.id ? { id: envelope.id } : {}),
+                  format: sourceFormat,
+                  index
+                }
           ]
         : [])
     ]
@@ -1693,8 +3014,8 @@ function normalizeGeminiThoughtPart(
   if (text) {
     reasoning.text = text;
   }
-  if (thoughtSignature) {
-    reasoning.encrypted_content = thoughtSignature;
+  if (encryptedContent) {
+    reasoning.encrypted_content = encryptedContent;
   }
 
   return reasoning;

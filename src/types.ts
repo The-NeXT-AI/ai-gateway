@@ -55,8 +55,21 @@ export interface ProviderModelReasoningLevel {
   description?: string;
 }
 
+export type OpenAIResponsesReasoningHistoryPolicy =
+  | 'auto'
+  | 'encrypted'
+  | 'plaintext'
+  | 'strip';
+
+/** Internal name; the public/config value `encrypted` remains stable. */
+export type NativeHistoryPolicy = 'native' | 'plaintext' | 'strip';
+
+export type OpenAIResponsesReasoningSummaryPolicy = 'drop' | 'as_content';
+
 export interface ProviderModelMetadata {
   supportedReasoningLevels?: ProviderModelReasoningLevel[];
+  openaiResponsesReasoningHistoryPolicy?: OpenAIResponsesReasoningHistoryPolicy;
+  openaiResponsesReasoningSummaryPolicy?: OpenAIResponsesReasoningSummaryPolicy;
 }
 
 export type ProviderHealthStatus = 'healthy' | 'degraded' | 'unknown' | 'down';
@@ -109,6 +122,8 @@ export interface ProviderConfig {
   openaiChatStreamUsage?: 'include_usage' | 'disabled';
   openaiChatReasoningSplit?: 'auto' | 'enabled' | 'disabled';
   openaiChatThinkingOptions?: 'auto' | 'enabled' | 'disabled';
+  openaiResponsesReasoningHistoryPolicy?: OpenAIResponsesReasoningHistoryPolicy;
+  openaiResponsesReasoningSummaryPolicy?: OpenAIResponsesReasoningSummaryPolicy;
   modelMetadata?: Record<string, ProviderModelMetadata>;
   extraHeaders: ModelScopedHeadersConfig;
   extraBody: ModelScopedBodyConfig;
@@ -855,8 +870,64 @@ export interface StandardResponseMessage {
   id: string;
   type: 'message';
   role: 'assistant';
-  status: 'completed';
+  status: 'completed' | 'incomplete';
+  phase?: string;
+  native_item?: ProviderNativeItem;
   content: StandardResponseMessageContent[];
+}
+
+export interface ReasoningStateOrigin {
+  provider: string;
+  endpoint: string;
+  model?: string;
+  credentialScope?: string;
+}
+
+export type ProviderNativeCaptureState = 'complete' | 'partial' | 'interrupted';
+
+export type ProviderNativeGroupState =
+  | 'active_waiting_tool'
+  | 'active_waiting_model'
+  | 'historical_closed'
+  | 'orphaned';
+
+export type ProviderNativeReplayDecision =
+  | 'replay_native'
+  | 'emit_plaintext'
+  | 'strip_optional'
+  | 'drop_group'
+  | 'reject';
+
+export interface ProviderNativeItemPosition {
+  turn: number;
+  step: number;
+  item: number;
+}
+
+/**
+ * Lossless provider state captured at a protocol boundary. `group_state` is
+ * deliberately not serialized: the gateway derives it from call/result edges.
+ */
+export interface ProviderNativeItem {
+  type: 'provider_native_item';
+  item_type: string;
+  native_id?: string;
+  raw_payload: Record<string, unknown>;
+  provider_schema_version: string;
+  item_origin?: 'native' | 'converted' | 'synthetic';
+  source_format: string;
+  source_origin: ReasoningStateOrigin;
+  position: ProviderNativeItemPosition;
+  group_id?: string;
+  call_id?: string;
+  pair_id?: string;
+  depends_on?: string[];
+  capture_state: ProviderNativeCaptureState;
+  provider_status?: string;
+  provider_mode?: string;
+  readable_text?: string;
+  readable_summary?: string;
+  compaction_mode?: 'standalone' | 'server_side';
 }
 
 export interface StandardResponseFunctionCall {
@@ -867,7 +938,11 @@ export interface StandardResponseFunctionCall {
   namespace?: string;
   arguments: string;
   thought_signature?: string;
-  status: 'completed';
+  thought_signature_format?: string;
+  thought_signature_origin?: ReasoningStateOrigin;
+  status: 'completed' | 'incomplete';
+  caller?: Record<string, unknown>;
+  native_item?: ProviderNativeItem;
 }
 
 export interface StandardResponseReasoningSummary {
@@ -883,18 +958,21 @@ export interface StandardResponseReasoningContent {
 export interface StandardResponseReasoning {
   id: string;
   type: 'reasoning';
-  status: 'completed';
+  status: 'completed' | 'incomplete';
   summary: StandardResponseReasoningSummary[];
   content?: StandardResponseReasoningContent[];
   encrypted_content?: string;
   reasoning_details?: unknown[];
   source_format?: string;
+  source_origin?: ReasoningStateOrigin;
+  native_item?: ProviderNativeItem;
 }
 
 export type StandardResponseOutputItem =
   | StandardResponseMessage
   | StandardResponseFunctionCall
-  | StandardResponseReasoning;
+  | StandardResponseReasoning
+  | ProviderNativeItem;
 
 export interface StandardUsage {
   input_tokens?: number;
@@ -928,22 +1006,33 @@ export type StandardRequestInputContent =
   | {
       type: 'input_text';
       text: string;
+      native_item?: ProviderNativeItem;
     }
   | {
       type: 'tool_use';
       id: string;
+      native_id?: string;
       name: string;
       input: unknown;
+      status?: string;
+      caller?: Record<string, unknown>;
       thought_signature?: string;
+      thought_signature_format?: string;
+      thought_signature_origin?: ReasoningStateOrigin;
+      native_item?: ProviderNativeItem;
     }
   | {
       type: 'tool_result';
       tool_use_id: string;
+      native_id?: string;
       name?: string;
       content: string;
+      status?: string;
       is_error?: boolean;
       result_format?: 'function' | 'web_search';
       tool_references?: string[];
+      caller?: Record<string, unknown>;
+      native_item?: ProviderNativeItem;
     }
   | {
       type: 'tool_search_call';
@@ -951,6 +1040,7 @@ export type StandardRequestInputContent =
       execution: 'client';
       arguments: unknown;
       status?: string;
+      native_item?: ProviderNativeItem;
     }
   | {
       type: 'tool_search_output';
@@ -958,21 +1048,39 @@ export type StandardRequestInputContent =
       execution: 'client';
       tools: unknown[];
       status?: string;
+      native_item?: ProviderNativeItem;
     }
   | {
       type: 'reasoning';
       id?: string;
+      status?: string;
       text?: string;
       summary?: string;
       encrypted_content?: string;
       reasoning_details?: unknown[];
       source_format?: string;
-    };
+      source_origin?: ReasoningStateOrigin;
+      native_item?: ProviderNativeItem;
+    }
+  | ProviderNativeItem;
 
 export interface StandardRequestInputMessage {
   type: 'message';
+  id?: string;
   role: 'user' | 'assistant';
   content: StandardRequestInputContent[];
+  phase?: string;
+  status?: string;
+  native_items?: ProviderNativeItem[];
+}
+
+export interface StandardOpenAIResponsesOptions {
+  operation?: 'create' | 'compact';
+  previous_response_id?: string;
+  store?: boolean;
+  conversation?: unknown;
+  context_management?: unknown;
+  include?: unknown;
 }
 
 export interface GatewayRequestClientContext {
@@ -1038,7 +1146,10 @@ export interface StandardRequest {
   thinking?: unknown;
   output_config?: unknown;
   text?: unknown;
+  openai_responses?: StandardOpenAIResponsesOptions;
   gemini_interactions?: StandardGeminiInteractionsOptions;
+  /** Internal compatibility failure surfaced by target adapters as a 400. */
+  native_state_error?: string;
 }
 
 export interface SourceAdapterRequestInput {
@@ -1153,6 +1264,7 @@ export interface ProviderPluginConfig {
   enabled: boolean;
   provider?: Provider;
   providerName?: string;
+  credentialScope?: ProviderPluginValue;
   codexOauth?: ProviderPluginCodexOAuthConfig;
   deepseekThinking?: ProviderPluginDeepSeekThinkingConfig;
   auth?: ProviderPluginMutationConfig;
@@ -1170,6 +1282,7 @@ export interface GatewayPluginProviderHookConfig {
   enabled: boolean;
   provider?: Provider;
   providerName?: string;
+  credentialScope?: ProviderPluginValue;
   codexOauth?: ProviderPluginCodexOAuthConfig;
   deepseekThinking?: ProviderPluginDeepSeekThinkingConfig;
   auth?: ProviderPluginMutationConfig;
@@ -1197,10 +1310,16 @@ export interface ProviderPluginResponseInput extends ProviderPluginContext {
   standardRequest?: StandardRequest;
 }
 
+export interface ProviderPluginCredentialScopeInput extends ProviderPluginContext {
+  standardRequest?: StandardRequest;
+}
+
 export interface ProviderPlugin {
   key: string;
   provider?: Provider;
   providerName?: string;
+  /** Returns a stable, non-sensitive identifier for the effective upstream credential. */
+  resolveCredentialScope?(input: ProviderPluginCredentialScopeInput): string | undefined;
   authenticate?(input: ProviderPluginRequestInput): Result<UpstreamRequest> | Promise<Result<UpstreamRequest>>;
   transformRequest?(input: ProviderPluginRequestInput): Result<UpstreamRequest> | Promise<Result<UpstreamRequest>>;
   transformResponse?(input: ProviderPluginResponseInput): Result<unknown> | Promise<Result<unknown>>;

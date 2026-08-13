@@ -370,6 +370,7 @@ function shouldRedactConfigValue(key: string, value: unknown, path: string[]): b
     normalized === 'secret' ||
     normalized === 'sharedsecret' ||
     normalized === 'credential' ||
+    normalized === 'credentialscope' ||
     normalized === 'authorization' ||
     normalized === 'accesstoken' ||
     normalized === 'refreshtoken' ||

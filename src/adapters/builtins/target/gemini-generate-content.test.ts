@@ -1,7 +1,22 @@
 import { describe, expect, it } from 'vitest';
-import type { StandardRequest, StandardResponse } from '../../../types';
-import { formatAnthropicMessagesResponse, formatGeminiGenerateContentResponse } from '../source/formatters';
-import { parseAnthropicMessagesRequest, parseOpenAIResponsesRequest } from '../source/parsers';
+import type { ProviderNativeItem, StandardRequest, StandardResponse } from '../../../types';
+import {
+  decodeReasoningTransportEnvelope,
+  GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
+  OPENAI_RESPONSES_REASONING_FORMAT
+} from '../reasoning-envelope';
+import {
+  formatAnthropicMessagesResponse,
+  formatGeminiGenerateContentResponse,
+  formatOpenAIChatCompletionsResponse
+} from '../source/formatters';
+import {
+  parseAnthropicMessagesRequest,
+  parseGeminiGenerateContentRequest,
+  parseOpenAIChatCompletionsRequest,
+  parseOpenAIResponsesRequest
+} from '../source/parsers';
 import { geminiGenerateContentTargetAdapter } from './gemini-generate-content';
 
 describe('geminiGenerateContentTargetAdapter', () => {
@@ -232,6 +247,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
           content: [
             {
               type: 'reasoning',
+              source_format: GEMINI_INTERACTIONS_REASONING_FORMAT,
               summary: 'Need weather data.',
               encrypted_content: 'interaction-thinking-signature'
             },
@@ -927,7 +943,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
     });
   });
 
-  it('maps Anthropic thinking and tool calls into Gemini content parts', () => {
+  it('keeps Anthropic opaque reasoning out of Gemini content parts', () => {
     const parsed = parseAnthropicMessagesRequest({
       model: 'gemini-2.5-pro',
       max_tokens: 1024,
@@ -1016,11 +1032,6 @@ describe('geminiGenerateContentTargetAdapter', () => {
         role: 'model',
         parts: [
           {
-            text: 'Need to call the weather tool.',
-            thought: true
-          },
-          {
-            thoughtSignature: 'gemini-function-signature',
             functionCall: {
               id: 'toolu_1',
               name: 'get_weather',
@@ -1067,7 +1078,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
     ]);
   });
 
-  it('maps encrypted reasoning-only history into Gemini thought signatures', () => {
+  it('does not map foreign encrypted reasoning into Gemini thought signatures', () => {
     const openAIParsed = parseOpenAIResponsesRequest({
       model: 'gemini-2.5-pro',
       input: [
@@ -1112,7 +1123,6 @@ describe('geminiGenerateContentTargetAdapter', () => {
         role: 'model',
         parts: [
           {
-            thoughtSignature: 'openai-encrypted-thinking',
             functionCall: {
               id: 'call_lookup',
               name: 'lookup_value',
@@ -1177,7 +1187,6 @@ describe('geminiGenerateContentTargetAdapter', () => {
         role: 'model',
         parts: [
           {
-            thoughtSignature: 'anthropic-redacted-thinking',
             functionCall: {
               id: 'toolu_lookup',
               name: 'lookup_value',
@@ -1189,6 +1198,97 @@ describe('geminiGenerateContentTargetAdapter', () => {
         ]
       }
     ]);
+  });
+
+  it('keeps Responses encrypted reasoning out of Gemini requests', () => {
+    const standardRequest: StandardRequest = {
+      model: 'gemini-2.5-pro',
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'reasoning',
+              id: 'rs_original',
+              source_format: OPENAI_RESPONSES_REASONING_FORMAT,
+              encrypted_content: 'encrypted-original'
+            },
+            {
+              type: 'tool_use',
+              id: 'call_lookup',
+              name: 'lookup_value',
+              input: {
+                key: 'live'
+              }
+            }
+          ]
+        }
+      ]
+    };
+
+    const generateBuilt = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-pro:generateContent'
+      } as never,
+      standardRequest,
+      config: {
+        geminiApiKey: 'test-key',
+        geminiBaseUrl: 'https://provider.example',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(generateBuilt.ok).toBe(true);
+    if (!generateBuilt.ok) {
+      return;
+    }
+
+    const generateContents = (generateBuilt.value.body as Record<string, unknown>).contents as Array<{
+      parts: Array<Record<string, unknown>>;
+    }>;
+    const generateParts = generateContents[0]?.parts || [];
+    expect(generateParts).toEqual([{
+      functionCall: {
+        id: 'call_lookup',
+        name: 'lookup_value',
+        args: {
+          key: 'live'
+        }
+      }
+    }]);
+
+    const interactionsBuilt = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/interactions'
+      } as never,
+      standardRequest,
+      config: {
+        geminiApiKey: 'test-key',
+        geminiBaseUrl: 'https://provider.example',
+        geminiApiVersion: 'v1beta'
+      } as never,
+      targetProviderConfig: {
+        type: 'gemini_interactions'
+      } as never
+    });
+
+    expect(interactionsBuilt.ok).toBe(true);
+    if (!interactionsBuilt.ok) {
+      return;
+    }
+
+    const interactionInput = (interactionsBuilt.value.body as Record<string, unknown>).input as Array<
+      Record<string, unknown>
+    >;
+    expect(interactionInput).toHaveLength(1);
+    expect(interactionInput[0]).toMatchObject({
+      type: 'function_call',
+      id: 'call_lookup',
+      name: 'lookup_value'
+    });
   });
 
   it('formats standard reasoning as Gemini thought parts', () => {
@@ -1203,6 +1303,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
           id: 'rs_1',
           type: 'reasoning',
           status: 'completed',
+          source_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
           summary: [{ type: 'summary_text', text: 'Need a lookup.' }],
           content: [{ type: 'reasoning_text', text: 'Call lookup before answering.' }],
           encrypted_content: 'gemini-response-thinking-signature'
@@ -1260,6 +1361,298 @@ describe('geminiGenerateContentTargetAdapter', () => {
           }
         }
       ]
+    });
+  });
+
+  it('keeps multiple signed Gemini thought parts separate when formatting a response', () => {
+    const parsed = geminiGenerateContentTargetAdapter.toStandardResponse({
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [
+              {
+                text: 'First thought summary.',
+                thought: true,
+                thoughtSignature: 'gemini-thought-signature-1'
+              },
+              {
+                text: 'Second thought summary.',
+                thought: true,
+                thoughtSignature: 'gemini-thought-signature-2'
+              },
+              {
+                text: 'Visible answer.'
+              }
+            ]
+          },
+          finishReason: 'STOP'
+        }
+      ],
+      usageMetadata: {
+        promptTokenCount: 8,
+        candidatesTokenCount: 6,
+        totalTokenCount: 14
+      },
+      modelVersion: 'gemini-3.5-flash'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const reasoningItems = parsed.value.output.filter((item) => item.type === 'reasoning');
+    expect(reasoningItems).toHaveLength(2);
+    expect(reasoningItems[0]).toMatchObject({
+      type: 'reasoning',
+      content: [{ type: 'reasoning_text', text: 'First thought summary.' }],
+      encrypted_content: 'gemini-thought-signature-1',
+      reasoning_details: [
+        {
+          type: 'reasoning.text',
+          text: 'First thought summary.',
+          format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+          index: 0
+        },
+        {
+          type: 'reasoning.encrypted',
+          data: 'gemini-thought-signature-1',
+          format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+          index: 0
+        }
+      ]
+    });
+    expect(reasoningItems[1]).toMatchObject({
+      type: 'reasoning',
+      content: [{ type: 'reasoning_text', text: 'Second thought summary.' }],
+      encrypted_content: 'gemini-thought-signature-2',
+      reasoning_details: [
+        {
+          type: 'reasoning.text',
+          text: 'Second thought summary.',
+          format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+          index: 1
+        },
+        {
+          type: 'reasoning.encrypted',
+          data: 'gemini-thought-signature-2',
+          format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+          index: 1
+        }
+      ]
+    });
+
+    const formatted = formatGeminiGenerateContentResponse(parsed.value) as Record<string, any>;
+    expect(formatted.candidates[0].content.parts).toEqual([
+      {
+        text: 'First thought summary.',
+        thought: true,
+        thoughtSignature: 'gemini-thought-signature-1'
+      },
+      {
+        text: 'Second thought summary.',
+        thought: true,
+        thoughtSignature: 'gemini-thought-signature-2'
+      },
+      {
+        text: 'Visible answer.'
+      }
+    ]);
+
+    const chatResponse = formatOpenAIChatCompletionsResponse(parsed.value) as Record<
+      string,
+      any
+    >;
+    const chatRequest = parseOpenAIChatCompletionsRequest({
+      model: 'gemini-3.5-flash',
+      messages: [
+        chatResponse.choices[0].message,
+        {
+          role: 'user',
+          content: 'Continue.'
+        }
+      ]
+    });
+    expect(chatRequest.ok).toBe(true);
+    if (!chatRequest.ok) {
+      return;
+    }
+
+    const rebuilt = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-3.5-flash:generateContent'
+      } as never,
+      standardRequest: chatRequest.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+    expect(rebuilt.ok).toBe(true);
+    if (!rebuilt.ok) {
+      return;
+    }
+
+    const rebuiltContents = (rebuilt.value.body as Record<string, unknown>).contents as Array<{
+      parts: Array<Record<string, unknown>>;
+    }>;
+    expect(rebuiltContents[0]?.parts).toEqual([
+      {
+        text: 'First thought summary.',
+        thought: true,
+        thoughtSignature: 'gemini-thought-signature-1'
+      },
+      {
+        text: 'Second thought summary.',
+        thought: true,
+        thoughtSignature: 'gemini-thought-signature-2'
+      },
+      {
+        text: 'Visible answer.'
+      }
+    ]);
+  });
+
+  it('keeps multiple signed Gemini thought parts separate when rebuilding a request', () => {
+    const parsed = parseGeminiGenerateContentRequest(
+      {
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: 'Solve this.' }]
+          },
+          {
+            role: 'model',
+            parts: [
+              {
+                text: 'First thought summary.',
+                thought: true,
+                thoughtSignature: 'gemini-thought-signature-1'
+              },
+              {
+                text: 'Second thought summary.',
+                thought: true,
+                thoughtSignature: 'gemini-thought-signature-2'
+              },
+              {
+                text: 'Visible answer.'
+              }
+            ]
+          },
+          {
+            role: 'user',
+            parts: [{ text: 'Continue.' }]
+          }
+        ]
+      },
+      'gemini-3.5-flash'
+    );
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-3.5-flash:generateContent'
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).contents).toEqual([
+      {
+        role: 'user',
+        parts: [{ text: 'Solve this.' }]
+      },
+      {
+        role: 'model',
+        parts: [
+          {
+            text: 'First thought summary.',
+            thought: true,
+            thoughtSignature: 'gemini-thought-signature-1'
+          },
+          {
+            text: 'Second thought summary.',
+            thought: true,
+            thoughtSignature: 'gemini-thought-signature-2'
+          },
+          {
+            text: 'Visible answer.'
+          }
+        ]
+      },
+      {
+        role: 'user',
+        parts: [{ text: 'Continue.' }]
+      }
+    ]);
+  });
+
+  it('keeps Responses reasoning envelopes separate from Gemini function calls', () => {
+    const response: StandardResponse = {
+      id: 'resp_responses_reasoning',
+      object: 'response',
+      status: 'completed',
+      model: 'gpt-5.6-sol',
+      output_text: '',
+      output: [
+        {
+          id: 'rs_responses_reasoning_1',
+          type: 'reasoning',
+          status: 'completed',
+          summary: [],
+          source_format: 'openai-responses-v1',
+          encrypted_content: 'encrypted-responses-reasoning'
+        },
+        {
+          id: 'call_lookup',
+          type: 'function_call',
+          call_id: 'call_lookup',
+          name: 'lookup_value',
+          arguments: '{"key":"live"}',
+          status: 'completed'
+        }
+      ],
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        total_tokens: 15
+      },
+      finish_reason: 'tool_use'
+    };
+
+    const payload = formatGeminiGenerateContentResponse(response) as Record<string, any>;
+    const parts = payload.candidates[0].content.parts as Array<Record<string, unknown>>;
+
+    expect(parts[0]).toMatchObject({
+      thought: true,
+      thoughtSignature: expect.stringMatching(/^ccr-openai-responses-reasoning-v1:/)
+    });
+    expect(parts[0]?.thoughtSignature).not.toBe('encrypted-responses-reasoning');
+    expect(parts[1]).toEqual({
+      functionCall: {
+        id: 'call_lookup',
+        name: 'lookup_value',
+        args: {
+          key: 'live'
+        }
+      }
     });
   });
 
@@ -1385,17 +1778,19 @@ describe('geminiGenerateContentTargetAdapter', () => {
         call_id: 'toolu_sig',
         name: 'get_weather',
         thought_signature: 'gemini-function-signature',
+        thought_signature_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
         arguments: '{"city":"Shanghai"}'
       })
     ]);
 
     const anthropic = formatAnthropicMessagesResponse(parsed.value);
     expect(anthropic.stop_reason).toBe('tool_use');
-    expect(anthropic.content).toEqual([
+    const anthropicContent = anthropic.content as Array<Record<string, unknown>>;
+    expect(anthropicContent).toEqual([
       {
         type: 'thinking',
         thinking: 'Need to call the weather tool.',
-        signature: 'gemini-function-signature'
+        signature: expect.any(String)
       },
       {
         type: 'tool_use',
@@ -1406,6 +1801,14 @@ describe('geminiGenerateContentTargetAdapter', () => {
         }
       }
     ]);
+    const thinkingBlock = anthropicContent[0]!;
+    expect(
+      decodeReasoningTransportEnvelope(String(thinkingBlock.signature))
+    ).toMatchObject({
+      format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+      data: 'gemini-function-signature',
+      kind: 'signature'
+    });
   });
 
   it('replays cached Gemini thought signatures when Anthropic follow-up omits the extension field', () => {
@@ -1554,5 +1957,232 @@ describe('geminiGenerateContentTargetAdapter', () => {
         ]
       }
     ]);
+  });
+
+  it('preserves a signature that is present on an empty Gemini text Part', () => {
+    const rawParts = [
+      {
+        text: '',
+        thoughtSignature: 'empty-text-part-signature'
+      },
+      {
+        text: 'Visible answer.'
+      }
+    ];
+    const parsed = geminiGenerateContentTargetAdapter.toStandardResponse({
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: rawParts
+          },
+          finishReason: 'STOP'
+        }
+      ],
+      usageMetadata: {
+        promptTokenCount: 6,
+        candidatesTokenCount: 3,
+        totalTokenCount: 9
+      },
+      modelVersion: 'gemini-3.5-flash'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    expect(parsed.value.output[0]).toMatchObject({
+      type: 'message',
+      content: [{ type: 'output_text', text: '' }],
+      native_item: {
+        item_type: 'part',
+        raw_payload: rawParts[0],
+        capture_state: 'complete',
+        position: { item: 0 }
+      }
+    });
+    const formatted = formatGeminiGenerateContentResponse(parsed.value) as Record<string, any>;
+    expect(formatted.candidates[0].content.parts).toEqual(rawParts);
+  });
+
+  it('preserves text and native Part order when replaying Gemini history', () => {
+    const nativePart: ProviderNativeItem = {
+      type: 'provider_native_item',
+      item_type: 'thought',
+      native_id: 'gemini_native_thought',
+      raw_payload: {
+        text: 'native thought',
+        thought: true,
+        thoughtSignature: 'native-signature'
+      },
+      provider_schema_version: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+      item_origin: 'native',
+      source_format: GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+      source_origin: {
+        provider: 'gemini',
+        endpoint: 'gemini-endpoint',
+        model: 'gemini-3.5-flash',
+        credentialScope: 'gemini-account'
+      },
+      position: { turn: 0, step: 0, item: 1 },
+      capture_state: 'complete'
+    };
+    const projectedNativePart: ProviderNativeItem = {
+      ...nativePart,
+      item_type: 'function_call',
+      native_id: 'gemini_native_call',
+      raw_payload: {
+        thoughtSignature: 'call-signature',
+        functionCall: {
+          id: 'call_native',
+          name: 'lookup',
+          args: { query: 'weather' }
+        }
+      },
+      position: { turn: 0, step: 0, item: 3 }
+    };
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-3.5-flash:generateContent'
+      } as never,
+      standardRequest: {
+        model: 'gemini-3.5-flash',
+        input: [{
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'input_text', text: 'before native' },
+            nativePart,
+            { type: 'input_text', text: 'between native parts' },
+            {
+              type: 'tool_use',
+              id: 'call_native',
+              name: 'lookup',
+              input: { query: 'weather' },
+              native_item: projectedNativePart
+            },
+            { type: 'input_text', text: 'after native' }
+          ]
+        }]
+      },
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+    const contents = (built.value.body as Record<string, unknown>).contents as Array<{
+      parts: Array<Record<string, unknown>>;
+    }>;
+    expect(contents[0]?.parts).toEqual([
+      { text: 'before native' },
+      nativePart.raw_payload,
+      { text: 'between native parts' },
+      projectedNativePart.raw_payload,
+      { text: 'after native' }
+    ]);
+  });
+
+  it('keeps parallel Gemini calls and results in FC1, FC2, FR1, FR2 order', () => {
+    const parsed = parseGeminiGenerateContentRequest(
+      {
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: 'Look up both cities.' }]
+          },
+          {
+            role: 'model',
+            parts: [
+              {
+                thoughtSignature: 'signature-fc-1',
+                functionCall: {
+                  id: 'call_fc_1',
+                  name: 'get_weather',
+                  args: { city: 'Wuhu' }
+                }
+              },
+              {
+                thoughtSignature: 'signature-fc-2',
+                functionCall: {
+                  id: 'call_fc_2',
+                  name: 'get_weather',
+                  args: { city: 'Hefei' }
+                }
+              }
+            ]
+          },
+          {
+            role: 'user',
+            parts: [
+              {
+                functionResponse: {
+                  id: 'call_fc_1',
+                  name: 'get_weather',
+                  response: { content: '22 C' }
+                }
+              },
+              {
+                functionResponse: {
+                  id: 'call_fc_2',
+                  name: 'get_weather',
+                  response: { content: '24 C' }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      'gemini-3.5-flash'
+    );
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-3.5-flash:generateContent'
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const contents = (built.value.body as Record<string, unknown>).contents as Array<{
+      role: string;
+      parts: Array<Record<string, unknown>>;
+    }>;
+    expect(contents[1]?.parts.map((part) =>
+      (part.functionCall as Record<string, unknown> | undefined)?.id
+    )).toEqual(['call_fc_1', 'call_fc_2']);
+    expect(contents[2]?.parts.map((part) =>
+      (part.functionResponse as Record<string, unknown> | undefined)?.id
+    )).toEqual(['call_fc_1', 'call_fc_2']);
+    expect([
+      ...contents[1]!.parts.map((part) =>
+        `FC${(part.functionCall as Record<string, unknown>).id === 'call_fc_1' ? '1' : '2'}`
+      ),
+      ...contents[2]!.parts.map((part) =>
+        `FR${(part.functionResponse as Record<string, unknown>).id === 'call_fc_1' ? '1' : '2'}`
+      )
+    ]).toEqual(['FC1', 'FC2', 'FR1', 'FR2']);
   });
 });

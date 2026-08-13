@@ -13,21 +13,34 @@ import {
   formatAnthropicMessagesResponse,
   formatGeminiGenerateContentResponse
 } from '../adapters/builtins/source/formatters';
-import { encodeOpenAIResponsesReasoningEnvelope } from '../adapters/builtins/reasoning-envelope';
+import { prepareOpenAIResponsesClientResponse } from '../adapters/builtins/source/openai-responses';
+import {
+  ANTHROPIC_CLAUDE_REASONING_FORMAT,
+  appendGeminiThoughtSignatureToToolCallId,
+  encodeReasoningTransportEnvelope,
+  GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+  GEMINI_INTERACTIONS_REASONING_FORMAT,
+  OPENAI_RESPONSES_REASONING_FORMAT,
+  validateReasoningTransportCarrierSseStream,
+  validateReasoningTransportCarriersInSseFrames
+} from '../adapters/builtins/reasoning-envelope';
 import { splitNamespacedToolCallName } from '../adapters/builtins/target/tools';
 import { parseSseChunks } from '../sse';
 import { bindAbortSignalToReadable } from '../upstream/client';
 import type {
   GatewaySourceContext,
+  ProviderNativeItem,
+  ReasoningStateOrigin,
   StandardRequest,
   StandardResponse,
   StandardResponseFunctionCall,
   StandardResponseReasoning,
   StandardUsage
 } from '../types';
-import { asNumber, asString, extractTextFromPart, isObject } from '../utils';
+import { asBoolean, asNumber, asString, extractTextFromPart, isObject } from '../utils';
 
 interface OpenAIResponsesRelayState {
+  reasoningOrigin?: ReasoningStateOrigin;
   createdAt: number;
   nextSequenceNumber: number;
   started: boolean;
@@ -35,13 +48,7 @@ interface OpenAIResponsesRelayState {
   responseId: string;
   model: string;
   outputText: string;
-  reasoningItemId: string;
-  reasoningOutputIndex?: number;
-  reasoningText: string;
-  reasoningSummaryText: string;
-  reasoningEncryptedContent?: string;
-  reasoningItemStarted: boolean;
-  reasoningSummaryStarted: boolean;
+  reasoningItems: OpenAIResponsesReasoningRelayItem[];
   messageItemId: string;
   messageOutputIndex?: number;
   messageItemStarted: boolean;
@@ -51,6 +58,26 @@ interface OpenAIResponsesRelayState {
   nextOutputIndex: number;
   finishReason?: string;
   usage: Record<string, unknown>;
+}
+
+interface OpenAIResponsesReasoningRelayItem {
+  sourceKey?: string;
+  itemId: string;
+  outputIndex?: number;
+  text: string;
+  summaryText: string;
+  encryptedContent?: string;
+  itemStarted: boolean;
+  summaryStarted: boolean;
+  finalized: boolean;
+}
+
+interface OpenAIChatEncryptedReasoningDelta {
+  content: string;
+  format?: string;
+  id?: string;
+  index: number;
+  kind: 'signature' | 'encrypted';
 }
 
 interface PendingOpenAIResponsesToolCall {
@@ -67,6 +94,7 @@ interface PendingOpenAIResponsesToolCall {
 }
 
 interface GeminiRelayState {
+  reasoningOrigin?: ReasoningStateOrigin;
   model: string;
   outputText: string;
   finishReason?: string;
@@ -88,6 +116,7 @@ interface PendingGeminiToolCall {
 }
 
 interface AnthropicRelayState {
+  reasoningOrigin?: ReasoningStateOrigin;
   started: boolean;
   finished: boolean;
   messageId: string;
@@ -125,6 +154,7 @@ interface PendingAnthropicToolCall {
 }
 
 interface OpenAIChatRelayState {
+  reasoningOrigin?: ReasoningStateOrigin;
   started: boolean;
   finished: boolean;
   id: string;
@@ -144,6 +174,7 @@ interface OpenAIChatRelayState {
 }
 
 interface GeminiInteractionsRelayState {
+  reasoningOrigin?: ReasoningStateOrigin;
   started: boolean;
   finished: boolean;
   interactionId: string;
@@ -206,6 +237,13 @@ interface OpenAIReasoningAccumulator {
   summary: string;
   encryptedContent?: string;
   rawDetails: unknown[];
+}
+
+interface OpenAIResponsesEncryptedReasoning {
+  id: string;
+  encryptedContent: string;
+  rawItem: Record<string, unknown>;
+  outputIndex: number;
 }
 
 interface OpenAINonStreamCollectionState {
@@ -278,9 +316,20 @@ type OptimisticOpenAIChatRelay =
 export function relayConvertedStreamFromStandardResponse(
   reply: FastifyReply,
   source: GatewaySourceContext,
-  standardResponse: StandardResponse
+  standardResponse: StandardResponse,
+  bodyLimitBytes = 32 * 1024 * 1024
 ) {
   const frames = buildConvertedStreamFrames(source, standardResponse);
+  const carrierValidation = validateReasoningTransportCarriersInSseFrames(frames, bodyLimitBytes);
+  if (!carrierValidation.ok) {
+    return reply.code(carrierValidation.status).send({
+      error: {
+        type: carrierValidation.status === 413 ? 'request_too_large' : 'invalid_request_error',
+        code: carrierValidation.code,
+        message: carrierValidation.message
+      }
+    });
+  }
 
   reply.code(200);
   reply.header('content-type', 'text/event-stream; charset=utf-8');
@@ -296,7 +345,9 @@ export function relayConvertedStreamFromUpstreamResponse(
   source: GatewaySourceContext,
   upstreamResponse: Response,
   standardRequest?: StandardRequest,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  reasoningOrigin?: ReasoningStateOrigin,
+  bodyLimitBytes = 32 * 1024 * 1024
 ) {
   reply.code(200);
   reply.header('content-type', 'text/event-stream; charset=utf-8');
@@ -309,16 +360,23 @@ export function relayConvertedStreamFromUpstreamResponse(
   }
 
   let stream: Readable;
+  let convertedStream: Readable | undefined;
   if (source.adapterKey === 'anthropic_messages') {
-    stream = Readable.from(relayAnthropicMessagesFromOpenAIStream(upstreamResponse));
+    convertedStream = Readable.from(relayAnthropicMessagesFromOpenAIStream(upstreamResponse, reasoningOrigin));
   } else if (source.adapterKey === 'openai_responses') {
-    stream = Readable.from(relayOpenAIResponsesFromOpenAIStream(upstreamResponse, standardRequest?.tools));
+    convertedStream = Readable.from(
+      relayOpenAIResponsesFromOpenAIStream(upstreamResponse, standardRequest?.tools, reasoningOrigin)
+    );
   } else if (source.adapterKey === 'gemini_stream') {
-    stream = Readable.from(relayGeminiStreamFromOpenAIStream(upstreamResponse));
+    convertedStream = Readable.from(relayGeminiStreamFromOpenAIStream(upstreamResponse, reasoningOrigin));
   } else if (source.adapterKey === 'gemini_interactions') {
-    stream = Readable.from(relayGeminiInteractionsFromUpstreamStream(upstreamResponse));
+    convertedStream = Readable.from(relayGeminiInteractionsFromUpstreamStream(upstreamResponse, reasoningOrigin));
   } else if (source.adapterKey === 'openai_chat') {
-    stream = Readable.from(relayOpenAIChatFromUpstreamStream(upstreamResponse));
+    convertedStream = Readable.from(relayOpenAIChatFromUpstreamStream(upstreamResponse, reasoningOrigin));
+  }
+
+  if (convertedStream) {
+    stream = Readable.from(validateReasoningTransportCarrierSseStream(convertedStream, bodyLimitBytes));
   } else {
     stream = Readable.fromWeb(upstreamResponse.body as unknown as ReadableStream<Uint8Array>);
   }
@@ -348,11 +406,7 @@ export function createOptimisticOpenAIChatStreamRelay(
         responseId: `resp_${randomUUID()}`,
         model: 'unknown',
         outputText: '',
-        reasoningItemId: `rs_${randomUUID().replace(/-/g, '')}`,
-        reasoningText: '',
-        reasoningSummaryText: '',
-        reasoningItemStarted: false,
-        reasoningSummaryStarted: false,
+        reasoningItems: [],
         messageItemId: `msg_${randomUUID()}`,
         messageOutputIndex: undefined,
         messageItemStarted: false,
@@ -1724,6 +1778,7 @@ function buildOpenAIChatStreamFrames(standardResponse: StandardResponse): string
 }
 
 function buildOpenAIResponsesStreamFrames(standardResponse: StandardResponse): string[] {
+  standardResponse = prepareOpenAIResponsesClientResponse(standardResponse);
   const sseState = createOpenAIResponsesSseMetadataState();
   const frames: string[] = [];
   frames.push(
@@ -1752,6 +1807,10 @@ function buildOpenAIResponsesStreamFrames(standardResponse: StandardResponse): s
 
     if (item.type === 'reasoning') {
       frames.push(...buildOpenAIResponsesReasoningStreamFrames(item, outputIndex));
+      continue;
+    }
+
+    if (item.type === 'provider_native_item') {
       continue;
     }
 
@@ -2019,9 +2078,25 @@ function collectStandardResponseToolCallsForOpenAIChat(
       continue;
     }
 
+    let id = item.call_id || item.id;
+    if (
+      item.thought_signature &&
+      item.thought_signature_format === GEMINI_GENERATE_CONTENT_REASONING_FORMAT &&
+      item.thought_signature_origin
+    ) {
+      const encodedSignature = encodeReasoningTransportEnvelope(
+        item.thought_signature_format,
+        item.thought_signature,
+        undefined,
+        'signature',
+        item.thought_signature_origin
+      );
+      id = appendGeminiThoughtSignatureToToolCallId(id, encodedSignature);
+    }
+
     toolCalls.push({
       index,
-      id: item.call_id || item.id,
+      id,
       name: item.name,
       argumentsJson: item.arguments
     });
@@ -2225,6 +2300,10 @@ function buildGeminiInteractionsStreamFrames(standardResponse: StandardResponse)
       if (text) {
         frames.push(...emitGeminiInteractionsThoughtDelta(state, 'thought_summary', text));
       }
+      const signature = standardReasoningSignatureForGeminiInteractions(item);
+      if (signature) {
+        frames.push(...emitGeminiInteractionsStandaloneThoughtSignatures(state, [signature]));
+      }
       continue;
     }
 
@@ -2234,6 +2313,10 @@ function buildGeminiInteractionsStreamFrames(standardResponse: StandardResponse)
           frames.push(...emitGeminiInteractionsTextDelta(state, content.text));
         }
       }
+      continue;
+    }
+
+    if (item.type === 'provider_native_item') {
       continue;
     }
 
@@ -2315,6 +2398,7 @@ function emitGeminiInteractionsTextDelta(state: GeminiInteractionsRelayState, te
 
 function ensureGeminiInteractionsModelOutputStarted(state: GeminiInteractionsRelayState): string[] {
   const frames = ensureGeminiInteractionsRelayStarted(state);
+  frames.push(...stopGeminiInteractionsThoughtIfActive(state));
   if (state.modelOutputStarted) {
     return frames;
   }
@@ -2377,10 +2461,13 @@ function emitGeminiInteractionsThoughtDelta(
 
 function ensureGeminiInteractionsThoughtStarted(state: GeminiInteractionsRelayState): string[] {
   const frames = ensureGeminiInteractionsRelayStarted(state);
-  if (state.thoughtStarted) {
+  if (state.thoughtStarted && !state.thoughtStopped) {
     return frames;
   }
 
+  state.thoughtStarted = false;
+  state.thoughtStopped = false;
+  state.thoughtStepIndex = undefined;
   state.thoughtStepIndex = state.nextStepIndex++;
   state.thoughtStarted = true;
   frames.push(
@@ -2392,6 +2479,32 @@ function ensureGeminiInteractionsThoughtStarted(state: GeminiInteractionsRelaySt
       event_type: 'step.start'
     })
   );
+  return frames;
+}
+
+function stopGeminiInteractionsThoughtIfActive(
+  state: GeminiInteractionsRelayState
+): string[] {
+  if (!state.thoughtStarted || state.thoughtStopped) {
+    return [];
+  }
+
+  state.thoughtStopped = true;
+  return [encodeGeminiInteractionsStepStop(state.thoughtStepIndex)];
+}
+
+function emitGeminiInteractionsStandaloneThoughtSignatures(
+  state: GeminiInteractionsRelayState,
+  signatures: string[]
+): string[] {
+  const frames: string[] = [];
+  for (const signature of signatures) {
+    if (!signature) {
+      continue;
+    }
+    frames.push(...emitGeminiInteractionsThoughtDelta(state, 'thought_signature', signature));
+    frames.push(...stopGeminiInteractionsThoughtIfActive(state));
+  }
   return frames;
 }
 
@@ -2434,6 +2547,7 @@ function ensureGeminiInteractionsToolCallStarted(
   toolCall: PendingGeminiInteractionToolCall
 ): string[] {
   const frames = ensureGeminiInteractionsRelayStarted(state);
+  frames.push(...stopGeminiInteractionsThoughtIfActive(state));
   if (toolCall.started) {
     return frames;
   }
@@ -2484,10 +2598,7 @@ function finalizeGeminiInteractionsRelay(state: GeminiInteractionsRelayState): s
   }
 
   const frames = ensureGeminiInteractionsRelayStarted(state);
-  if (state.thoughtStarted && !state.thoughtStopped) {
-    frames.push(encodeGeminiInteractionsStepStop(state.thoughtStepIndex));
-    state.thoughtStopped = true;
-  }
+  frames.push(...stopGeminiInteractionsThoughtIfActive(state));
   if (state.modelOutputStarted && !state.modelOutputStopped) {
     frames.push(encodeGeminiInteractionsStepStop(state.modelOutputStepIndex));
     state.modelOutputStopped = true;
@@ -2553,8 +2664,54 @@ function collectStandardReasoningText(item: StandardResponseReasoning): string {
   return item.summary.map((summary) => summary.text).filter(Boolean).join('\n').trim();
 }
 
-async function* relayAnthropicMessagesFromOpenAIStream(upstreamResponse: Response): AsyncGenerator<string> {
+function standardReasoningSignatureForGeminiInteractions(
+  item: StandardResponseReasoning
+): string | undefined {
+  let signature: string | undefined;
+  let kind: 'signature' | 'encrypted' | undefined;
+  let format = item.source_format;
+  let id = item.id;
+  if (Array.isArray(item.reasoning_details)) {
+    for (const detail of item.reasoning_details) {
+      if (!isObject(detail)) {
+        continue;
+      }
+      format = asString(detail.format) || format;
+      id = asString(detail.id) || id;
+      const explicitSignature =
+        asString(detail.signature) ||
+        asString(detail.thoughtSignature) ||
+        asString(detail.thought_signature);
+      const encrypted =
+        asString(detail.data) ||
+        asString(detail.encrypted_content);
+      signature = explicitSignature || encrypted;
+      if (signature) {
+        kind = explicitSignature ? 'signature' : 'encrypted';
+        break;
+      }
+    }
+  }
+
+  if (!signature && item.encrypted_content) {
+    signature = item.encrypted_content;
+    kind = 'encrypted';
+  }
+  if (!signature || !format) {
+    return undefined;
+  }
+
+  return format === GEMINI_INTERACTIONS_REASONING_FORMAT && !item.source_origin
+    ? signature
+    : encodeReasoningTransportEnvelope(format, signature, id, kind, item.source_origin);
+}
+
+async function* relayAnthropicMessagesFromOpenAIStream(
+  upstreamResponse: Response,
+  reasoningOrigin?: ReasoningStateOrigin
+): AsyncGenerator<string> {
   const state: AnthropicRelayState = {
+    reasoningOrigin,
     started: false,
     finished: false,
     messageId: `msg_${randomUUID()}`,
@@ -2626,20 +2783,18 @@ async function* relayAnthropicMessagesFromOpenAIStream(upstreamResponse: Respons
 
 async function* relayOpenAIResponsesFromOpenAIStream(
   upstreamResponse: Response,
-  tools?: unknown[]
+  tools?: unknown[],
+  reasoningOrigin?: ReasoningStateOrigin
 ): AsyncGenerator<string> {
   const state: OpenAIResponsesRelayState = {
+    reasoningOrigin,
     ...createOpenAIResponsesSseMetadataState(),
     started: false,
     finished: false,
     responseId: `resp_${randomUUID()}`,
     model: 'unknown',
     outputText: '',
-    reasoningItemId: `rs_${randomUUID().replace(/-/g, '')}`,
-    reasoningText: '',
-    reasoningSummaryText: '',
-    reasoningItemStarted: false,
-    reasoningSummaryStarted: false,
+    reasoningItems: [],
     messageItemId: `msg_${randomUUID()}`,
     messageOutputIndex: undefined,
     messageItemStarted: false,
@@ -2695,8 +2850,12 @@ async function* relayOpenAIResponsesFromOpenAIStream(
   }
 }
 
-async function* relayGeminiStreamFromOpenAIStream(upstreamResponse: Response): AsyncGenerator<string> {
+async function* relayGeminiStreamFromOpenAIStream(
+  upstreamResponse: Response,
+  reasoningOrigin?: ReasoningStateOrigin
+): AsyncGenerator<string> {
   const state: GeminiRelayState = {
+    reasoningOrigin,
     model: 'unknown',
     outputText: '',
     usage: {},
@@ -2752,8 +2911,12 @@ async function* relayGeminiStreamFromOpenAIStream(upstreamResponse: Response): A
   }
 }
 
-async function* relayGeminiInteractionsFromUpstreamStream(upstreamResponse: Response): AsyncGenerator<string> {
+async function* relayGeminiInteractionsFromUpstreamStream(
+  upstreamResponse: Response,
+  reasoningOrigin?: ReasoningStateOrigin
+): AsyncGenerator<string> {
   const state = createGeminiInteractionsRelayState();
+  state.reasoningOrigin = reasoningOrigin;
 
   for await (const chunk of parseSseChunks(upstreamResponse)) {
     const data = chunk.data.trim();
@@ -2887,7 +3050,7 @@ function emitGeminiInteractionsFramesFromOpenAIResponsesEvent(
     return frames;
   }
 
-  if (eventType === 'response.completed') {
+  if (eventType === 'response.completed' || eventType === 'response.incomplete') {
     const response = isObject(payload.response) ? payload.response : undefined;
     const id = asString(response?.id);
     const model = asString(response?.model);
@@ -2897,8 +3060,21 @@ function emitGeminiInteractionsFramesFromOpenAIResponsesEvent(
     if (model) {
       state.model = model;
     }
+    state.status = asString(response?.status) || state.status;
     const outputText = asString(response?.output_text) || extractOpenAIResponsesOutputText(response?.output);
     const frames: string[] = [];
+    const reasoningSignatures = collectOpenAIResponsesEncryptedReasoning(response).map(
+      ({ id: reasoningId, encryptedContent, rawItem, outputIndex }) =>
+        encodeReasoningTransportEnvelope(
+          OPENAI_RESPONSES_REASONING_FORMAT,
+          encryptedContent,
+          reasoningId,
+          'encrypted',
+          state.reasoningOrigin,
+          buildOpenAIResponsesStreamingNativeOptions(rawItem, outputIndex)
+        )
+    );
+    frames.push(...emitGeminiInteractionsStandaloneThoughtSignatures(state, reasoningSignatures));
     if (outputText && !state.outputText) {
       frames.push(...emitGeminiInteractionsTextDelta(state, outputText));
     }
@@ -3029,6 +3205,23 @@ function emitGeminiInteractionsFramesFromAnthropicEvent(
     if (deltaType === 'thinking_delta') {
       return emitGeminiInteractionsThoughtDelta(state, 'thought_summary', asString(delta?.thinking) || '');
     }
+    if (deltaType === 'signature_delta') {
+      const signature = asString(delta?.signature);
+      return emitGeminiInteractionsStandaloneThoughtSignatures(
+        state,
+        signature
+          ? [
+              encodeReasoningTransportEnvelope(
+                ANTHROPIC_CLAUDE_REASONING_FORMAT,
+                signature,
+                undefined,
+                'signature',
+                state.reasoningOrigin
+              )
+            ]
+          : []
+      );
+    }
     if (deltaType === 'input_json_delta') {
       const index = asNumber(payload.index) ?? 0;
       const toolCall = state.pendingToolCalls.get(index);
@@ -3087,7 +3280,31 @@ function emitGeminiInteractionsFramesFromGeminiGeneratePayload(
       : isObject(part.function_call)
         ? part.function_call
         : undefined;
+    const thoughtSignature =
+      asString(part.thoughtSignature) ||
+      asString(part.thought_signature) ||
+      (functionCall
+        ? asString(functionCall.thoughtSignature) ||
+          asString(functionCall.thought_signature)
+        : undefined);
+    const encodedThoughtSignature = thoughtSignature
+      ? encodeReasoningTransportEnvelope(
+          GEMINI_GENERATE_CONTENT_REASONING_FORMAT,
+          thoughtSignature,
+          undefined,
+          'signature',
+          state.reasoningOrigin
+        )
+      : undefined;
     if (functionCall) {
+      if (encodedThoughtSignature) {
+        frames.push(
+          ...emitGeminiInteractionsStandaloneThoughtSignatures(
+            state,
+            [encodedThoughtSignature]
+          )
+        );
+      }
       const toolCall = mergeGeminiInteractionsToolCall(
         state,
         asString(functionCall.id),
@@ -3103,8 +3320,33 @@ function emitGeminiInteractionsFramesFromGeminiGeneratePayload(
     }
 
     const text = asString(part.text);
-    if (text) {
+    if (text && asBoolean(part.thought) === true) {
+      frames.push(...emitGeminiInteractionsThoughtDelta(state, 'thought_summary', text));
+      if (encodedThoughtSignature) {
+        frames.push(
+          ...emitGeminiInteractionsStandaloneThoughtSignatures(
+            state,
+            [encodedThoughtSignature]
+          )
+        );
+      }
+    } else if (text) {
+      if (encodedThoughtSignature) {
+        frames.push(
+          ...emitGeminiInteractionsStandaloneThoughtSignatures(
+            state,
+            [encodedThoughtSignature]
+          )
+        );
+      }
       frames.push(...emitGeminiInteractionsTextDelta(state, text));
+    } else if (encodedThoughtSignature) {
+      frames.push(
+        ...emitGeminiInteractionsStandaloneThoughtSignatures(
+          state,
+          [encodedThoughtSignature]
+        )
+      );
     }
   }
 
@@ -3125,8 +3367,12 @@ function emitGeminiInteractionsFramesFromGeminiGeneratePayload(
   return frames;
 }
 
-async function* relayOpenAIChatFromUpstreamStream(upstreamResponse: Response): AsyncGenerator<string> {
+async function* relayOpenAIChatFromUpstreamStream(
+  upstreamResponse: Response,
+  reasoningOrigin?: ReasoningStateOrigin
+): AsyncGenerator<string> {
   const state: OpenAIChatRelayState = {
+    reasoningOrigin,
     started: false,
     finished: false,
     id: `chatcmpl_${randomUUID()}`,
@@ -3244,11 +3490,67 @@ function emitOpenAIChatFramesFromAnthropicEvent(
       return frames;
     }
 
+    if (deltaType === 'signature_delta') {
+      const signature = asString(delta?.signature);
+      if (!signature) {
+        return [];
+      }
+
+      const frames = ensureOpenAIChatRelayStarted(state);
+      frames.push(
+        buildOpenAIChatRelayDeltaFrame(state, {
+          reasoning_details: [
+            {
+              type: 'reasoning.text',
+              signature: state.reasoningOrigin
+                ? encodeReasoningTransportEnvelope(
+                    ANTHROPIC_CLAUDE_REASONING_FORMAT,
+                    signature,
+                    undefined,
+                    'signature',
+                    state.reasoningOrigin
+                  )
+                : signature,
+              format: ANTHROPIC_CLAUDE_REASONING_FORMAT
+            }
+          ]
+        })
+      );
+      return frames;
+    }
+
     return [];
   }
 
   if (eventType === 'content_block_start') {
     const contentBlock = isObject(payload.content_block) ? payload.content_block : undefined;
+    if (asString(contentBlock?.type) === 'redacted_thinking') {
+      const data = asString(contentBlock?.data);
+      if (!data) {
+        return [];
+      }
+      const frames = ensureOpenAIChatRelayStarted(state);
+      frames.push(
+        buildOpenAIChatRelayDeltaFrame(state, {
+          reasoning_details: [
+            {
+              type: 'reasoning.encrypted',
+              data: state.reasoningOrigin
+                ? encodeReasoningTransportEnvelope(
+                    ANTHROPIC_CLAUDE_REASONING_FORMAT,
+                    data,
+                    undefined,
+                    'encrypted',
+                    state.reasoningOrigin
+                  )
+                : data,
+              format: ANTHROPIC_CLAUDE_REASONING_FORMAT
+            }
+          ]
+        })
+      );
+      return frames;
+    }
     if (asString(contentBlock?.type) !== 'tool_use') {
       return [];
     }
@@ -3353,7 +3655,7 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
     return frames;
   }
 
-  if (eventType === 'response.completed') {
+  if (eventType === 'response.completed' || eventType === 'response.incomplete') {
     const response = isObject(payload.response) ? payload.response : undefined;
     updateOpenAIChatRelayIdentityFromOpenAIResponses(state, response);
     updateOpenAIChatRelayUsageFromOpenAIResponses(state, response);
@@ -3366,6 +3668,30 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
         state.emittedTextDelta = true;
         frames.push(buildOpenAIChatRelayDeltaFrame(state, { content: outputText }));
       }
+    }
+
+    const reasoningItems = collectOpenAIResponsesEncryptedReasoning(response);
+    if (reasoningItems.length > 0) {
+      frames.push(
+        buildOpenAIChatRelayDeltaFrame(state, {
+          reasoning_details: reasoningItems.map(({ id, encryptedContent, rawItem, outputIndex }, index) => ({
+            type: 'reasoning.encrypted',
+            data: state.reasoningOrigin
+              ? encodeReasoningTransportEnvelope(
+                  OPENAI_RESPONSES_REASONING_FORMAT,
+                  encryptedContent,
+                  id,
+                  'encrypted',
+                  state.reasoningOrigin,
+                  buildOpenAIResponsesStreamingNativeOptions(rawItem, outputIndex)
+                )
+              : encryptedContent,
+            id,
+            format: OPENAI_RESPONSES_REASONING_FORMAT,
+            index
+          }))
+        })
+      );
     }
 
     frames.push(...finalizeOpenAIChatRelay(state));
@@ -3706,7 +4032,8 @@ function emitGeminiFramesFromOpenAIResponsesEvent(
       return [];
     }
 
-    const frames = flushPendingGeminiToolCalls(state);
+    const frames = emitGeminiResponsesReasoningFrames(state, response);
+    frames.push(...flushPendingGeminiToolCalls(state));
     const finalFrame = buildGeminiFinalFrame(state);
     if (finalFrame) {
       frames.push(finalFrame);
@@ -3716,6 +4043,44 @@ function emitGeminiFramesFromOpenAIResponsesEvent(
   }
 
   return [];
+}
+
+function emitGeminiResponsesReasoningFrames(
+  state: GeminiRelayState,
+  response: Record<string, unknown> | undefined
+): string[] {
+  return collectOpenAIResponsesEncryptedReasoning(response).map(({
+    id,
+    encryptedContent,
+    rawItem,
+    outputIndex
+  }) => {
+    state.emittedAnyDelta = true;
+    return encodeSseData({
+      candidates: [
+        {
+          index: 0,
+          content: {
+            role: 'model',
+            parts: [
+              {
+                thought: true,
+                thoughtSignature: encodeReasoningTransportEnvelope(
+                  OPENAI_RESPONSES_REASONING_FORMAT,
+                  encryptedContent,
+                  id,
+                  'encrypted',
+                  state.reasoningOrigin,
+                  buildOpenAIResponsesStreamingNativeOptions(rawItem, outputIndex)
+                )
+              }
+            ]
+          }
+        }
+      ],
+      modelVersion: state.model
+    });
+  });
 }
 
 function buildGeminiDeltaFrame(model: string, text: string): string {
@@ -4100,9 +4465,50 @@ function emitOpenAIResponsesFramesFromChatChunk(
   for (const textDelta of reasoningDeltas.textDeltas) {
     frames.push(...emitOpenAIResponsesReasoningTextDelta(state, textDelta));
   }
-  if (reasoningDeltas.encryptedContent && !state.reasoningEncryptedContent) {
-    state.reasoningEncryptedContent = reasoningDeltas.encryptedContent;
-    frames.push(...ensureOpenAIResponsesReasoningOutputStarted(state));
+  for (const encryptedDelta of reasoningDeltas.encryptedItems) {
+    if (!encryptedDelta.format) {
+      continue;
+    }
+
+    const sourceKey = `${encryptedDelta.index}:${encryptedDelta.id || ''}`;
+    let reasoningItem = state.reasoningItems.find(
+      (item) => item.sourceKey === sourceKey
+    );
+    if (!reasoningItem) {
+      const primaryReasoningItem = getPrimaryOpenAIResponsesReasoningItem(state);
+      if (
+        !primaryReasoningItem.sourceKey &&
+        !primaryReasoningItem.encryptedContent
+      ) {
+        reasoningItem = primaryReasoningItem;
+        reasoningItem.sourceKey = sourceKey;
+        if (encryptedDelta.id && !reasoningItem.itemStarted) {
+          reasoningItem.itemId = encryptedDelta.id;
+        }
+      } else {
+        reasoningItem = createOpenAIResponsesReasoningRelayItem(
+          encryptedDelta.id,
+          sourceKey
+        );
+        state.reasoningItems.push(reasoningItem);
+      }
+    }
+
+    if (!reasoningItem.encryptedContent) {
+      reasoningItem.encryptedContent =
+        encryptedDelta.format === OPENAI_RESPONSES_REASONING_FORMAT && !state.reasoningOrigin
+          ? encryptedDelta.content
+          : encodeReasoningTransportEnvelope(
+              encryptedDelta.format,
+              encryptedDelta.content,
+              encryptedDelta.id || reasoningItem.itemId,
+              encryptedDelta.kind,
+              state.reasoningOrigin
+            );
+    }
+    frames.push(
+      ...ensureOpenAIResponsesReasoningOutputStarted(state, reasoningItem)
+    );
   }
 
   if (deltaText) {
@@ -4134,15 +4540,16 @@ function emitOpenAIResponsesFramesFromChatChunk(
 function collectOpenAIChatReasoningDeltas(delta: Record<string, unknown> | undefined): {
   textDeltas: string[];
   summaryDeltas: string[];
-  encryptedContent?: string;
+  encryptedItems: OpenAIChatEncryptedReasoningDelta[];
 } {
   const collected: {
     textDeltas: string[];
     summaryDeltas: string[];
-    encryptedContent?: string;
+    encryptedItems: OpenAIChatEncryptedReasoningDelta[];
   } = {
     textDeltas: [],
-    summaryDeltas: []
+    summaryDeltas: [],
+    encryptedItems: []
   };
 
   if (!delta) {
@@ -4150,7 +4557,8 @@ function collectOpenAIChatReasoningDeltas(delta: Record<string, unknown> | undef
   }
 
   const reasoningDetails = Array.isArray(delta.reasoning_details) ? delta.reasoning_details : [];
-  for (const detail of reasoningDetails) {
+  for (let detailIndex = 0; detailIndex < reasoningDetails.length; detailIndex += 1) {
+    const detail = reasoningDetails[detailIndex];
     if (typeof detail === 'string') {
       if (detail) {
         appendReasoningDeltaIfDistinct(collected.textDeltas, detail);
@@ -4165,7 +4573,24 @@ function collectOpenAIChatReasoningDeltas(delta: Record<string, unknown> | undef
     const type = asString(detail.type);
     const summary = asString(detail.summary);
     const text = asString(detail.text) || asString(detail.reasoning) || asString(detail.thinking);
-    const encryptedContent = asString(detail.encrypted_content) || asString(detail.data);
+    const signature =
+      asString(detail.signature) ||
+      asString(detail.thoughtSignature) ||
+      asString(detail.thought_signature);
+    const encryptedContent =
+      signature ||
+      asString(detail.encrypted_content) ||
+      asString(detail.data);
+
+    if (encryptedContent) {
+      collected.encryptedItems.push({
+        content: encryptedContent,
+        format: asString(detail.format),
+        id: asString(detail.id),
+        index: asNumber(detail.index) ?? detailIndex,
+        kind: signature ? 'signature' : 'encrypted'
+      });
+    }
 
     if (type === 'reasoning.summary' || (summary && !text)) {
       if (summary || text) {
@@ -4178,9 +4603,6 @@ function collectOpenAIChatReasoningDeltas(delta: Record<string, unknown> | undef
       appendReasoningDeltaIfDistinct(collected.textDeltas, text);
     }
 
-    if (encryptedContent && !collected.encryptedContent) {
-      collected.encryptedContent = encryptedContent;
-    }
   }
 
   const reasoningText =
@@ -4208,21 +4630,48 @@ function appendReasoningDeltaIfDistinct(parts: string[], value: string): void {
   parts.push(value);
 }
 
-function ensureOpenAIResponsesReasoningOutputStarted(state: OpenAIResponsesRelayState): string[] {
+function createOpenAIResponsesReasoningRelayItem(
+  itemId = `rs_${randomUUID().replace(/-/g, '')}`,
+  sourceKey?: string
+): OpenAIResponsesReasoningRelayItem {
+  return {
+    ...(sourceKey ? { sourceKey } : {}),
+    itemId,
+    text: '',
+    summaryText: '',
+    itemStarted: false,
+    summaryStarted: false,
+    finalized: false
+  };
+}
+
+function getPrimaryOpenAIResponsesReasoningItem(
+  state: OpenAIResponsesRelayState
+): OpenAIResponsesReasoningRelayItem {
+  if (state.reasoningItems.length === 0) {
+    state.reasoningItems.push(createOpenAIResponsesReasoningRelayItem());
+  }
+  return state.reasoningItems[0];
+}
+
+function ensureOpenAIResponsesReasoningOutputStarted(
+  state: OpenAIResponsesRelayState,
+  reasoningItem = getPrimaryOpenAIResponsesReasoningItem(state)
+): string[] {
   const frames = ensureOpenAIResponsesRelayStarted(state);
-  if (state.reasoningItemStarted) {
+  if (reasoningItem.itemStarted) {
     return frames;
   }
 
   const outputIndex = allocateOpenAIResponsesOutputIndex(state, 0);
-  state.reasoningOutputIndex = outputIndex;
-  state.reasoningItemStarted = true;
+  reasoningItem.outputIndex = outputIndex;
+  reasoningItem.itemStarted = true;
   frames.push(
     encodeSseData({
       type: 'response.output_item.added',
       output_index: outputIndex,
       item: {
-        id: state.reasoningItemId,
+        id: reasoningItem.itemId,
         type: 'reasoning',
         summary: [],
         content: [],
@@ -4242,14 +4691,15 @@ function emitOpenAIResponsesReasoningTextDelta(
     return [];
   }
 
-  const frames = ensureOpenAIResponsesReasoningOutputStarted(state);
-  state.reasoningText += delta;
-  if (state.reasoningOutputIndex !== undefined) {
+  const reasoningItem = getPrimaryOpenAIResponsesReasoningItem(state);
+  const frames = ensureOpenAIResponsesReasoningOutputStarted(state, reasoningItem);
+  reasoningItem.text += delta;
+  if (reasoningItem.outputIndex !== undefined) {
     frames.push(
       encodeSseData({
         type: 'response.reasoning_text.delta',
-        item_id: state.reasoningItemId,
-        output_index: state.reasoningOutputIndex,
+        item_id: reasoningItem.itemId,
+        output_index: reasoningItem.outputIndex,
         content_index: 0,
         delta
       })
@@ -4267,18 +4717,19 @@ function emitOpenAIResponsesReasoningSummaryDelta(
     return [];
   }
 
-  const frames = ensureOpenAIResponsesReasoningOutputStarted(state);
-  if (state.reasoningOutputIndex === undefined) {
+  const reasoningItem = getPrimaryOpenAIResponsesReasoningItem(state);
+  const frames = ensureOpenAIResponsesReasoningOutputStarted(state, reasoningItem);
+  if (reasoningItem.outputIndex === undefined) {
     return frames;
   }
 
-  if (!state.reasoningSummaryStarted) {
-    state.reasoningSummaryStarted = true;
+  if (!reasoningItem.summaryStarted) {
+    reasoningItem.summaryStarted = true;
     frames.push(
       encodeSseData({
         type: 'response.reasoning_summary_part.added',
-        item_id: state.reasoningItemId,
-        output_index: state.reasoningOutputIndex,
+        item_id: reasoningItem.itemId,
+        output_index: reasoningItem.outputIndex,
         summary_index: 0,
         part: {
           type: 'summary_text',
@@ -4288,12 +4739,12 @@ function emitOpenAIResponsesReasoningSummaryDelta(
     );
   }
 
-  state.reasoningSummaryText += delta;
+  reasoningItem.summaryText += delta;
   frames.push(
     encodeSseData({
       type: 'response.reasoning_summary_text.delta',
-      item_id: state.reasoningItemId,
-      output_index: state.reasoningOutputIndex,
+      item_id: reasoningItem.itemId,
+      output_index: reasoningItem.outputIndex,
       summary_index: 0,
       delta
     })
@@ -4566,7 +5017,7 @@ function finalizeOpenAIResponsesRelay(state: OpenAIResponsesRelayState): string[
   }
 
   const frames = ensureOpenAIResponsesRelayStarted(state);
-  frames.push(...finalizeOpenAIResponsesReasoningOutput(state));
+  frames.push(...finalizeOpenAIResponsesReasoningOutputs(state));
   if (state.messageItemStarted && state.messageOutputIndex !== undefined) {
     if (state.outputText) {
       frames.push(
@@ -4626,44 +5077,62 @@ function finalizeOpenAIResponsesRelay(state: OpenAIResponsesRelayState): string[
   return frames;
 }
 
-function finalizeOpenAIResponsesReasoningOutput(state: OpenAIResponsesRelayState): string[] {
-  if (!state.reasoningItemStarted || state.reasoningOutputIndex === undefined) {
+function finalizeOpenAIResponsesReasoningOutputs(
+  state: OpenAIResponsesRelayState
+): string[] {
+  const frames: string[] = [];
+  for (const reasoningItem of state.reasoningItems) {
+    frames.push(
+      ...finalizeOpenAIResponsesReasoningOutputItem(reasoningItem)
+    );
+  }
+  return frames;
+}
+
+function finalizeOpenAIResponsesReasoningOutputItem(
+  reasoningItem: OpenAIResponsesReasoningRelayItem
+): string[] {
+  if (
+    !reasoningItem.itemStarted ||
+    reasoningItem.outputIndex === undefined ||
+    reasoningItem.finalized
+  ) {
     return [];
   }
 
   const frames: string[] = [];
-  if (state.reasoningSummaryStarted) {
+  if (reasoningItem.summaryStarted) {
     frames.push(
       encodeSseData({
         type: 'response.reasoning_summary_text.done',
-        item_id: state.reasoningItemId,
-        output_index: state.reasoningOutputIndex,
+        item_id: reasoningItem.itemId,
+        output_index: reasoningItem.outputIndex,
         summary_index: 0,
-        text: state.reasoningSummaryText
+        text: reasoningItem.summaryText
       })
     );
     frames.push(
       encodeSseData({
         type: 'response.reasoning_summary_part.done',
-        item_id: state.reasoningItemId,
-        output_index: state.reasoningOutputIndex,
+        item_id: reasoningItem.itemId,
+        output_index: reasoningItem.outputIndex,
         summary_index: 0,
         part: {
           type: 'summary_text',
-          text: state.reasoningSummaryText
+          text: reasoningItem.summaryText
         }
       })
     );
   }
 
-  if (state.reasoningText) {
+  if (reasoningItem.text) {
     frames.push(
       encodeSseData({
         type: 'response.reasoning_text.done',
-        item_id: state.reasoningItemId,
-        output_index: state.reasoningOutputIndex,
+        item_id: reasoningItem.itemId,
+        output_index: reasoningItem.outputIndex,
         content_index: 0,
-        text: state.reasoningText
+        text: reasoningItem.text
       })
     );
   }
@@ -4671,20 +5140,24 @@ function finalizeOpenAIResponsesReasoningOutput(state: OpenAIResponsesRelayState
   frames.push(
     encodeSseData({
       type: 'response.output_item.done',
-      output_index: state.reasoningOutputIndex,
-      item: buildOpenAIResponsesReasoningItemFromState(state)
+      output_index: reasoningItem.outputIndex,
+      item: buildOpenAIResponsesReasoningItemFromState(reasoningItem)
     })
   );
+  reasoningItem.finalized = true;
 
   return frames;
 }
 
 function buildOpenAIResponsesCompletedPayload(state: OpenAIResponsesRelayState): Record<string, unknown> {
   const outputItems: Array<{ outputIndex: number; item: Record<string, unknown> }> = [];
-  if (state.reasoningItemStarted && state.reasoningOutputIndex !== undefined) {
+  for (const reasoningItem of state.reasoningItems) {
+    if (!reasoningItem.itemStarted || reasoningItem.outputIndex === undefined) {
+      continue;
+    }
     outputItems.push({
-      outputIndex: state.reasoningOutputIndex,
-      item: buildOpenAIResponsesReasoningItemFromState(state)
+      outputIndex: reasoningItem.outputIndex,
+      item: buildOpenAIResponsesReasoningItemFromState(reasoningItem)
     });
   }
 
@@ -4732,30 +5205,34 @@ function buildOpenAIResponsesCompletedPayload(state: OpenAIResponsesRelayState):
   return response;
 }
 
-function buildOpenAIResponsesReasoningItemFromState(state: OpenAIResponsesRelayState): Record<string, unknown> {
+function buildOpenAIResponsesReasoningItemFromState(
+  reasoningItem: OpenAIResponsesReasoningRelayItem
+): Record<string, unknown> {
   return {
-    id: state.reasoningItemId,
+    id: reasoningItem.itemId,
     type: 'reasoning',
     status: 'completed',
-    summary: state.reasoningSummaryText
+    summary: reasoningItem.summaryText
       ? [
           {
             type: 'summary_text',
-            text: state.reasoningSummaryText
+            text: reasoningItem.summaryText
           }
         ]
       : [],
-    ...(state.reasoningText
+    ...(reasoningItem.text
       ? {
           content: [
             {
               type: 'reasoning_text',
-              text: state.reasoningText
+              text: reasoningItem.text
             }
           ]
         }
       : {}),
-    ...(state.reasoningEncryptedContent ? { encrypted_content: state.reasoningEncryptedContent } : {})
+    ...(reasoningItem.encryptedContent
+      ? { encrypted_content: reasoningItem.encryptedContent }
+      : {})
   };
 }
 
@@ -4943,41 +5420,72 @@ function emitAnthropicResponsesReasoningBlocks(
   state: AnthropicRelayState,
   response: Record<string, unknown> | undefined
 ): string[] {
+  const reasoningItems = collectOpenAIResponsesEncryptedReasoning(response);
+  if (reasoningItems.length === 0) {
+    return [];
+  }
+
+  const frames = ensureAnthropicRelayStarted(state);
+  frames.push(...closeActiveAnthropicTextBlock(state));
+  for (const { id, encryptedContent, rawItem, outputIndex } of reasoningItems) {
+    const blockIndex = state.nextBlockIndex;
+    state.nextBlockIndex += 1;
+    frames.push(
+      ...buildAnthropicStreamContentBlockFrames(blockIndex, {
+        type: 'redacted_thinking',
+        data: encodeReasoningTransportEnvelope(
+          OPENAI_RESPONSES_REASONING_FORMAT,
+          encryptedContent,
+          id,
+          'encrypted',
+          state.reasoningOrigin,
+          buildOpenAIResponsesStreamingNativeOptions(rawItem, outputIndex)
+        )
+      })
+    );
+  }
+  return frames;
+}
+
+function collectOpenAIResponsesEncryptedReasoning(
+  response: Record<string, unknown> | undefined
+): OpenAIResponsesEncryptedReasoning[] {
   if (!response || !Array.isArray(response.output)) {
     return [];
   }
 
-  const envelopes: string[] = [];
-  for (const outputItem of response.output) {
+  const reasoningItems: OpenAIResponsesEncryptedReasoning[] = [];
+  for (let outputIndex = 0; outputIndex < response.output.length; outputIndex += 1) {
+    const outputItem = response.output[outputIndex];
     if (!isObject(outputItem) || asString(outputItem.type) !== 'reasoning') {
       continue;
     }
 
     const id = asString(outputItem.id);
     const encryptedContent = asString(outputItem.encrypted_content);
-    if (!id || !encryptedContent) {
-      continue;
+    if (id && encryptedContent) {
+      reasoningItems.push({ id, encryptedContent, rawItem: outputItem, outputIndex });
     }
-    envelopes.push(encodeOpenAIResponsesReasoningEnvelope(id, encryptedContent));
   }
+  return reasoningItems;
+}
 
-  if (envelopes.length === 0) {
-    return [];
-  }
-
-  const frames = ensureAnthropicRelayStarted(state);
-  frames.push(...closeActiveAnthropicTextBlock(state));
-  for (const data of envelopes) {
-    const blockIndex = state.nextBlockIndex;
-    state.nextBlockIndex += 1;
-    frames.push(
-      ...buildAnthropicStreamContentBlockFrames(blockIndex, {
-        type: 'redacted_thinking',
-        data
-      })
-    );
-  }
-  return frames;
+function buildOpenAIResponsesStreamingNativeOptions(
+  rawItem: Record<string, unknown>,
+  outputIndex: number
+): { nativeItem: Partial<ProviderNativeItem> } {
+  return {
+    nativeItem: {
+      item_type: 'reasoning',
+      native_id: asString(rawItem.id),
+      raw_payload: rawItem,
+      provider_schema_version: OPENAI_RESPONSES_REASONING_FORMAT,
+      item_origin: 'native',
+      position: { turn: 0, step: 0, item: outputIndex },
+      capture_state: 'complete',
+      ...(asString(rawItem.status) ? { provider_status: asString(rawItem.status) } : {})
+    }
+  };
 }
 
 function updateAnthropicRelayIdentity(state: AnthropicRelayState, response: Record<string, unknown> | undefined) {
@@ -5940,11 +6448,18 @@ function emitOpenAIResponsesFramesFromGeminiInteractionEvent(
 
     if (deltaType === 'thought_signature') {
       const signature = asString(delta?.signature);
-      if (!signature || state.reasoningEncryptedContent) {
+      const reasoningItem = getPrimaryOpenAIResponsesReasoningItem(state);
+      if (!signature || reasoningItem.encryptedContent) {
         return [];
       }
-      state.reasoningEncryptedContent = signature;
-      return ensureOpenAIResponsesReasoningOutputStarted(state);
+      reasoningItem.encryptedContent = encodeReasoningTransportEnvelope(
+        GEMINI_INTERACTIONS_REASONING_FORMAT,
+        signature,
+        reasoningItem.itemId,
+        'signature',
+        state.reasoningOrigin
+      );
+      return ensureOpenAIResponsesReasoningOutputStarted(state, reasoningItem);
     }
 
     if (deltaType === 'arguments_delta') {
@@ -6053,6 +6568,30 @@ function emitOpenAIChatFramesFromGeminiInteractionEvent(
     if (deltaType === 'thought_summary') {
       const text = extractGeminiInteractionDeltaText(delta);
       return text ? [buildOpenAIChatRelayDeltaFrame(state, { reasoning_content: text })] : [];
+    }
+    if (deltaType === 'thought_signature') {
+      const signature = asString(delta?.signature);
+      return signature
+        ? [
+            buildOpenAIChatRelayDeltaFrame(state, {
+              reasoning_details: [
+                {
+                  type: 'reasoning.encrypted',
+                  data: state.reasoningOrigin
+                    ? encodeReasoningTransportEnvelope(
+                        GEMINI_INTERACTIONS_REASONING_FORMAT,
+                        signature,
+                        undefined,
+                        'signature',
+                        state.reasoningOrigin
+                      )
+                    : signature,
+                  format: GEMINI_INTERACTIONS_REASONING_FORMAT
+                }
+              ]
+            })
+          ]
+        : [];
     }
     if (deltaType === 'arguments_delta') {
       const args = asString(delta?.arguments) || '';
@@ -6176,6 +6715,31 @@ function emitAnthropicFramesFromGeminiInteractionEvent(
       return frames;
     }
 
+    if (deltaType === 'thought_signature') {
+      const signature = asString(delta?.signature);
+      if (!signature) {
+        return [];
+      }
+      const frames = ensureAnthropicThinkingBlockStarted(state);
+      frames.push(
+        encodeSseEvent('content_block_delta', {
+          type: 'content_block_delta',
+          index: state.activeBlockIndex,
+          delta: {
+            type: 'signature_delta',
+            signature: encodeReasoningTransportEnvelope(
+              GEMINI_INTERACTIONS_REASONING_FORMAT,
+              signature,
+              undefined,
+              'signature',
+              state.reasoningOrigin
+            )
+          }
+        })
+      );
+      return frames;
+    }
+
     if (deltaType === 'arguments_delta') {
       const index = asNumber(payload.index) ?? 0;
       const toolCall = state.pendingToolCalls.get(index);
@@ -6261,6 +6825,57 @@ function emitGeminiFramesFromGeminiInteractionEvent(
               content: {
                 role: 'model',
                 parts: [{ text }]
+              }
+            }
+          ],
+          modelVersion: state.model
+        })
+      ];
+    }
+    if (deltaType === 'thought_summary') {
+      const text = extractGeminiInteractionDeltaText(delta);
+      if (!text) {
+        return [];
+      }
+      state.emittedAnyDelta = true;
+      return [
+        encodeSseData({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ text, thought: true }]
+              }
+            }
+          ],
+          modelVersion: state.model
+        })
+      ];
+    }
+    if (deltaType === 'thought_signature') {
+      const thoughtSignature = asString(delta?.signature);
+      if (!thoughtSignature) {
+        return [];
+      }
+      state.emittedAnyDelta = true;
+      return [
+        encodeSseData({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [
+                  {
+                    thought: true,
+                    thoughtSignature: encodeReasoningTransportEnvelope(
+                      GEMINI_INTERACTIONS_REASONING_FORMAT,
+                      thoughtSignature,
+                      undefined,
+                      'signature',
+                      state.reasoningOrigin
+                    )
+                  }
+                ]
               }
             }
           ],

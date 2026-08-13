@@ -68,6 +68,7 @@ describe('manager config routes', () => {
         {
           key: 'openai-main-codex-oauth',
           providerName: 'openai-main',
+          credentialScope: 'file-account-scope',
           codexOauth: {
             accessToken: {
               from: 'request.headers.x-codex-access-token'
@@ -112,6 +113,7 @@ describe('manager config routes', () => {
         from: 'request.headers.x-codex-access-token'
       });
       expect(redactedBody.fileConfig.providerPlugins[0].codexOauth.refreshToken).toBe('[REDACTED]');
+      expect(redactedBody.fileConfig.providerPlugins[0].credentialScope).toBe('[REDACTED]');
       expect(redactedBody.fileConfig.billingWebhook.headers.authorization).toBe('[REDACTED]');
       expect(redactedBody.effectiveConfig.openaiApiKey).toBe('[REDACTED]');
       expect(redactedBody.effectiveConfig.providers[0].apikey).toBe('[REDACTED]');
@@ -125,6 +127,7 @@ describe('manager config routes', () => {
       expect(revealedBody.secretsRedacted).toBe(false);
       expect(revealedBody.fileConfig.Providers[0].apikey).toBe('file-provider-key');
       expect(revealedBody.fileConfig.providerPlugins[0].codexOauth.refreshToken).toBe('file-refresh-token');
+      expect(revealedBody.fileConfig.providerPlugins[0].credentialScope).toBe('file-account-scope');
       expect(revealedBody.effectiveConfig.openaiApiKey).toBe('runtime-openai-key');
       expect(revealedBody.effectiveConfig.providers[0].apikey).toBe('runtime-provider-key');
     } finally {
@@ -209,6 +212,7 @@ describe('manager config routes', () => {
         {
           key: 'openai-main-oauth',
           providerName: 'openai-main',
+          credentialScope: 'old-account-scope',
           codexOauth: {
             accessToken: {
               from: 'request.headers.x-codex-access-token'
@@ -259,6 +263,7 @@ describe('manager config routes', () => {
             {
               key: 'openai-main-oauth',
               providerName: 'openai-main',
+              credentialScope: '[REDACTED]',
               codexOauth: {
                 accessToken: {
                   from: 'request.headers.x-codex-access-token'
@@ -283,6 +288,7 @@ describe('manager config routes', () => {
       expect(fileContent.Providers[1].name).toBe('openai-main');
       expect(fileContent.Providers[1].apikey).toBe('old-main-key');
       expect(fileContent.providerPlugins[0].codexOauth.refreshToken).toBe('old-refresh-token');
+      expect(fileContent.providerPlugins[0].credentialScope).toBe('old-account-scope');
       expect(fileContent.billingWebhook.headers.authorization).toBe('Bearer old-billing-secret');
       expect(runtimeConfig.providers.find((provider) => provider.name === 'openai-main')?.apikey).toBe('old-main-key');
       expect(runtimeConfig.providers.find((provider) => provider.name === 'openai-backup')?.apikey).toBe('old-backup-key');

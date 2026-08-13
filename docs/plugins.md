@@ -99,6 +99,7 @@ with its own `provider` or `providerName`.
 
 Supported declarative fields:
 
+- `credentialScope`
 - `auth.headers`
 - `auth.query`
 - `auth.bodySet`
@@ -125,6 +126,13 @@ Supported value references include:
 - `{{ target.provider }}`
 - `{{ target.providerName }}`
 - `{{ model }}`
+
+`credentialScope` identifies the stable upstream account used for opaque reasoning
+state. It may use the same value references as other declarative fields. The resolved
+value is hashed before it is added to a reasoning transport carrier; the original
+account identifier or credential is never written to the carrier. Codex OAuth derives
+this scope automatically from `accountId`, a JWT account claim, or, as a final stable
+fallback, its refresh token.
 
 Strict mode can be enabled on a hook:
 
@@ -185,6 +193,9 @@ interface GatewayPluginModuleResult {
 ```
 
 `providerPlugins` is accepted as an alias for `providerHooks` for code modules.
+Authentication hooks that manage rotating credentials should implement
+`resolveCredentialScope()` and return a stable, non-sensitive account identifier. If
+an authentication hook cannot resolve a scope, opaque reasoning state is not replayed.
 
 ## Target Adapters
 

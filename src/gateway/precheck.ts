@@ -1058,6 +1058,10 @@ function countContentCharacters(item: StandardRequestInputContent): number {
     return countUnknownCharacters(item.tools);
   }
 
+  if (item.type === 'provider_native_item') {
+    return countUnknownCharacters(item.raw_payload);
+  }
+
   return item.name.length + countUnknownCharacters(item.input);
 }
 

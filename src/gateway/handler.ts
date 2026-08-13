@@ -7143,18 +7143,19 @@ export function overrideUpstreamBaseUrl(
   // run before the default-base rewrite: when the default base is a parent of
   // the override base (e.g. https://host vs https://host/anthropic), the
   // rewrite below would also match provider-specific URLs and double them.
-  if (urlMatchesBase(url, overriddenBaseUrl)) {
+  const normalizedOverrideBase = trimRightSlash(overriddenBaseUrl);
+  if (urlMatchesBase(url, normalizedOverrideBase)) {
     return url;
   }
 
   const normalizedDefaultBase = trimRightSlash(defaultBaseUrl);
   if (url === normalizedDefaultBase || url.startsWith(`${normalizedDefaultBase}/`)) {
-    return `${overriddenBaseUrl}${url.slice(normalizedDefaultBase.length)}`;
+    return `${normalizedOverrideBase}${url.slice(normalizedDefaultBase.length)}`;
   }
 
   try {
     const parsedUrl = new URL(url);
-    const parsedOverrideBase = new URL(overriddenBaseUrl);
+    const parsedOverrideBase = new URL(normalizedOverrideBase);
     const overridePath = trimRightSlash(parsedOverrideBase.pathname);
     parsedOverrideBase.pathname = `${overridePath}${parsedUrl.pathname}`;
     parsedOverrideBase.search = parsedUrl.search;

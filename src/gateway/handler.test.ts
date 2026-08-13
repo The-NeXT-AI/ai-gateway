@@ -1514,6 +1514,17 @@ describe('overrideUpstreamBaseUrl', () => {
     ).toBe('https://api.vendor.test/anthropic/v1/messages');
   });
 
+  it('removes the override base trailing slash when rewriting passthrough URLs', () => {
+    expect(
+      overrideUpstreamBaseUrl(
+        'https://api.vendor.test/v1/messages',
+        'https://api.vendor.test/anthropic/',
+        'anthropic',
+        { anthropicBaseUrl: 'https://api.vendor.test' } as never
+      )
+    ).toBe('https://api.vendor.test/anthropic/v1/messages');
+  });
+
   it('rewrites passthrough URLs for sibling-path bases', () => {
     expect(
       overrideUpstreamBaseUrl(

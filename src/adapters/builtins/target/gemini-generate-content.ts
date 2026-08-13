@@ -931,10 +931,27 @@ function sanitizeGeminiSchema(value: unknown): unknown {
 
     if (geminiSchemaArrayKeys.has(key)) {
       if (Array.isArray(rawValue)) {
-        output[key] = rawValue;
+        // Gemini only accepts string values in `enum` and `required` arrays.
+        // Anthropic/MCP tool schemas may contain non-string enum values (e.g.
+        // `enum: [true]`), which would be rejected by the upstream API.
+        if (key === 'enum' || key === 'required') {
+          const strings = rawValue.filter((item): item is string => typeof item === 'string');
+          if (strings.length > 0) {
+            output[key] = strings;
+          }
+        } else {
+          output[key] = rawValue;
+        }
       }
       continue;
     }
+  }
+
+  // Gemini requires array schemas to declare an `items` field. Anthropic/MCP
+  // tool schemas may omit it (meaning "any element type"), which the upstream
+  // API rejects as a missing field.
+  if (output.type === 'array' && !output.items) {
+    output.items = {};
   }
 
   return output;

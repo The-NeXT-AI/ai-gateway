@@ -637,6 +637,171 @@ describe('geminiGenerateContentTargetAdapter', () => {
     expect(built.value.url).toBe('https://mock.local/v1beta/models/gemini-2.5-pro:generateContent?key=sk-test');
   });
 
+  it('filters non-string enum values from tool schemas', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gemini-2.5-pro',
+      input: 'Run tool',
+      tools: [
+        {
+          name: 'enum_tool',
+          type: 'function',
+          parameters: {
+            type: 'object',
+            properties: {
+              flag: {
+                type: 'boolean',
+                description: 'Set to true to clear.',
+                enum: [true]
+              },
+              mode: {
+                type: 'string',
+                enum: ['fast', 'safe', 42]
+              },
+              tags: {
+                type: 'array',
+                items: {
+                  type: 'string'
+                }
+              }
+            }
+          }
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-pro:generateContent'
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.tools).toEqual([
+      {
+        functionDeclarations: [
+          {
+            name: 'enum_tool',
+            parameters: {
+              type: 'object',
+              properties: {
+                flag: {
+                  type: 'boolean',
+                  description: 'Set to true to clear.'
+                },
+                mode: {
+                  type: 'string',
+                  enum: ['fast', 'safe']
+                },
+                tags: {
+                  type: 'array',
+                  items: {
+                    type: 'string'
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]);
+  });
+
+  it('adds a default items field to array tool parameters without one', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gemini-2.5-pro',
+      input: 'Run tool',
+      tools: [
+        {
+          name: 'array_tool',
+          type: 'function',
+          parameters: {
+            type: 'object',
+            properties: {
+              ids: {
+                type: 'array',
+                description: 'List of ids.'
+              },
+              nested: {
+                type: 'array',
+                items: {
+                  type: 'array'
+                }
+              }
+            }
+          }
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-pro:generateContent'
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.tools).toEqual([
+      {
+        functionDeclarations: [
+          {
+            name: 'array_tool',
+            parameters: {
+              type: 'object',
+              properties: {
+                ids: {
+                  type: 'array',
+                  description: 'List of ids.',
+                  items: {}
+                },
+                nested: {
+                  type: 'array',
+                  items: {
+                    type: 'array',
+                    items: {}
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]);
+  });
+
   it('maps request-level thinking controls into Gemini thinkingConfig', () => {
     const anthropicParsed = parseAnthropicMessagesRequest({
       model: 'gemini-2.5-pro',

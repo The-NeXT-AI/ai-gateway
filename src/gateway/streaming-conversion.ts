@@ -5659,6 +5659,9 @@ function updateAnthropicRelayUsageFromGeminiInteraction(
   state.inputTokens = asNumber(usage.total_input_tokens);
   state.outputTokens = asNumber(usage.total_output_tokens) ?? state.outputTokens;
   state.cacheReadInputTokens = asNumber(usage.total_cached_tokens);
+  // Gemini's `total_input_tokens` already includes `total_cached_tokens`, the same
+  // convention as OpenAI's `prompt_tokens`.
+  state.inputIncludesCacheTokens = true;
 }
 
 function updateGeminiRelayUsageFromGeminiInteraction(

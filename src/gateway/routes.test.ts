@@ -5219,6 +5219,55 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('excludes the cached prefix from input_tokens on a Gemini Interactions stream', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: interaction.created\ndata: {"interaction":{"id":"int_anthropic_cached_1","status":"in_progress","object":"interaction","model":"gemma-4-31b-it"},"event_type":"interaction.created"}\n\n',
+        'event: step.start\ndata: {"index":0,"step":{"type":"message"},"event_type":"step.start"}\n\n',
+        'event: step.delta\ndata: {"index":0,"delta":{"content":{"text":"pong","type":"text"},"type":"message"},"event_type":"step.delta"}\n\n',
+        'event: step.stop\ndata: {"index":0,"event_type":"step.stop"}\n\n',
+        'event: interaction.completed\ndata: {"interaction":{"id":"int_anthropic_cached_1","status":"completed","usage":{"total_tokens":34,"total_input_tokens":5,"total_cached_tokens":2,"total_output_tokens":1,"total_thought_tokens":0},"object":"interaction","model":"gemma-4-31b-it"},"event_type":"interaction.completed"}\n\n',
+        'event: done\ndata: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_interactions', ['gemma-4-31b-it'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'gemma-4-31b-it',
+          max_tokens: 32,
+          stream: true,
+          messages: [{ role: 'user', content: '请只回复 pong' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      // Gemini reports 5 inclusive of the 2 cached; an Anthropic client sums the two
+      // fields, so egress has to hand back 3 + 2 rather than 5 + 2.
+      expect(response.body).toContain('"input_tokens":3');
+      expect(response.body).toContain('"cache_read_input_tokens":2');
+      expect(response.body).not.toContain('"input_tokens":5');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('relays Gemini Interactions stream errors as Anthropic error events', async () => {
     const fetchMock = vi.fn(async () => {
       return createSseResponse([

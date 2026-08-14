@@ -3358,6 +3358,62 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('excludes the cached prefix from input_tokens on a Responses stream', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: response.created\n' +
+          'data: {"type":"response.created","response":{"id":"resp_cached_usage","object":"response","status":"in_progress","model":"gpt-5.6-sol"}}\n\n',
+        'event: response.output_text.delta\n' +
+          'data: {"type":"response.output_text.delta","delta":"hello"}\n\n',
+        'event: response.completed\n' +
+          'data: {"type":"response.completed","response":{"id":"resp_cached_usage","object":"response","status":"completed","model":"gpt-5.6-sol","output_text":"hello","output":[{"id":"msg_cached_usage","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":12,"output_tokens":16,"total_tokens":28,"input_tokens_details":{"cached_tokens":3}}}}\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6-sol'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'gpt-5.6-sol',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const messageDeltaLine = response.body
+        .split('\n')
+        .find((line) => line.startsWith('data: ') && line.includes('"type":"message_delta"'));
+      expect(messageDeltaLine).toBeDefined();
+      const messageDelta = JSON.parse(String(messageDeltaLine).slice('data: '.length));
+      // Responses names its inclusive counter `input_tokens`, the same name Anthropic
+      // uses for the exclusive one, so 12 already contains the 3 cached tokens.
+      expect(messageDelta.usage).toMatchObject({
+        input_tokens: 9,
+        output_tokens: 16,
+        cache_read_input_tokens: 3
+      });
+      expect(response.body).not.toContain('"input_tokens":12');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('streams chat/completions usage-only final chunk as Anthropic message_delta usage', async () => {
     const fetchMock = vi.fn(async () => {
       return createSseResponse([

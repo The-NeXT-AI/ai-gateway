@@ -116,6 +116,13 @@ interface AnthropicRelayState {
 
 type AnthropicContentBlockType = 'text' | 'thinking';
 
+/**
+ * Which protocol produced a usage object, and therefore whether its input counter
+ * already includes the cached prefix. `anthropic` excludes it, `openai` includes it on
+ * both Chat Completions and Responses.
+ */
+type AnthropicRelayUsageConvention = 'anthropic' | 'openai';
+
 interface PendingAnthropicToolCall {
   index: number;
   blockIndex: number;
@@ -492,7 +499,8 @@ export async function* relayOptimisticAnthropicMessagesStreamTurn(
       }
       updateAnthropicRelayUsage(
         relay.state,
-        isObject(message?.usage) ? message.usage : undefined
+        isObject(message?.usage) ? message.usage : undefined,
+        'anthropic'
       );
       yield* ensureAnthropicRelayStarted(relay.state);
       continue;
@@ -609,7 +617,8 @@ export async function* relayOptimisticAnthropicMessagesStreamTurn(
     if (eventType === 'message_delta') {
       updateAnthropicRelayUsage(
         relay.state,
-        isObject(payload.usage) ? payload.usage : undefined
+        isObject(payload.usage) ? payload.usage : undefined,
+        'anthropic'
       );
       continue;
     }
@@ -4882,7 +4891,7 @@ function emitAnthropicFramesFromOpenAIChatChunk(
 
   const firstChoice = Array.isArray(payload.choices) && isObject(payload.choices[0]) ? payload.choices[0] : undefined;
   const usage = openAIChatChunkUsage(payload, firstChoice);
-  updateAnthropicRelayUsage(state, usage);
+  updateAnthropicRelayUsage(state, usage, 'openai');
 
   const delta = isObject(firstChoice?.delta) ? firstChoice.delta : undefined;
   const deltaText = asString(delta?.content) || '';
@@ -4921,7 +4930,7 @@ function emitAnthropicFramesFromOpenAIResponsesEvent(
   if (eventType === 'response.created') {
     const response = isObject(payload.response) ? payload.response : undefined;
     updateAnthropicRelayIdentity(state, response);
-    updateAnthropicRelayUsage(state, isObject(response?.usage) ? response.usage : undefined);
+    updateAnthropicRelayUsage(state, isObject(response?.usage) ? response.usage : undefined, 'openai');
     return ensureAnthropicRelayStarted(state);
   }
 
@@ -4937,7 +4946,7 @@ function emitAnthropicFramesFromOpenAIResponsesEvent(
   if (eventType === 'response.completed' || eventType === 'response.incomplete') {
     const response = isObject(payload.response) ? payload.response : undefined;
     updateAnthropicRelayIdentity(state, response);
-    updateAnthropicRelayUsage(state, isObject(response?.usage) ? response.usage : undefined);
+    updateAnthropicRelayUsage(state, isObject(response?.usage) ? response.usage : undefined, 'openai');
     const reasoningFrames = emitAnthropicResponsesReasoningBlocks(state, response);
     collectOpenAIResponsesToolCalls(state, response);
 
@@ -5409,7 +5418,8 @@ function buildAnthropicMessageDeltaUsage(state: AnthropicRelayState): Record<str
 
 function updateAnthropicRelayUsage(
   state: AnthropicRelayState,
-  usage: Record<string, unknown> | undefined
+  usage: Record<string, unknown> | undefined,
+  convention: AnthropicRelayUsageConvention
 ) {
   if (!usage) {
     return;
@@ -5424,9 +5434,12 @@ function updateAnthropicRelayUsage(
   const inputTokens = asNumber(usage.input_tokens) ?? asNumber(usage.prompt_tokens);
   if (inputTokens !== undefined) {
     state.inputTokens = inputTokens;
-    // `prompt_tokens` is the OpenAI-style counter, which already includes the cached
-    // prefix; Anthropic's `input_tokens` excludes it.
-    state.inputIncludesCacheTokens = asNumber(usage.input_tokens) === undefined;
+    // OpenAI's counters already include the cached prefix, on both Chat Completions
+    // (`prompt_tokens`) and Responses (`input_tokens`); Anthropic's `input_tokens`
+    // excludes it. The field name alone cannot tell the two conventions apart, because
+    // Responses reuses Anthropic's name for the inclusive counter, so the caller states
+    // which upstream protocol produced this usage object.
+    state.inputIncludesCacheTokens = convention === 'openai';
   }
 
   const outputTokens = asNumber(usage.output_tokens) ?? asNumber(usage.completion_tokens);

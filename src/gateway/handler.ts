@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { BillingResult } from '../billing';
@@ -3428,7 +3428,12 @@ function registerVirtualMultimodalReference(
   }
 
   const reference: VirtualMultimodalReference = {
-    id: `mm_${randomUUID().replace(/-/g, '').slice(0, 10)}`,
+    // Content-addressed, not random: the placeholder text this id lands in becomes part of
+    // the prompt sent upstream. A fresh id per request changes those bytes mid-context, so
+    // prefix caching breaks at the first attachment and every later turn is recomputed --
+    // on a long conversation that is the bulk of the input tokens. Hashing the value keeps
+    // the placeholder byte-identical across turns while staying unique per attachment.
+    id: `mm_${createHash('sha256').update(value).digest('hex').slice(0, 32)}`,
     kind: input.kind,
     sourceType: isVirtualUrl(value) ? 'url' : 'base64',
     value

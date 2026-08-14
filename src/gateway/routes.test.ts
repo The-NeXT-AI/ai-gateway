@@ -10771,7 +10771,7 @@ export function createGatewayPlugin() {
         'Multimodal inputs available to tools. Use the media_ref value when calling tools:'
       );
       expect(upstreamBody.messages[0]?.content).toMatch(
-        /- image: \[media_ref:mm_[a-f0-9]{10}\] \(url\)/
+        /- image: \[media_ref:mm_[a-f0-9]{32}\] \(url\)/
       );
     } finally {
       await app.close();

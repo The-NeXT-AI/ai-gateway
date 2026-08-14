@@ -1,4 +1,5 @@
 import type { StandardResponse, StandardResponseReasoning } from '../../../types';
+import { anthropicInputTokens } from '../../../shared/usage';
 import {
   mapFinishReasonToAnthropic,
   mapFinishReasonToGemini,
@@ -69,7 +70,7 @@ export function formatOpenAIChatCompletionsResponse(response: StandardResponse):
 
 export function formatAnthropicMessagesResponse(response: StandardResponse): Record<string, unknown> {
   const usage: Record<string, unknown> = {
-    input_tokens: response.usage.input_tokens,
+    input_tokens: anthropicInputTokens(response.usage) ?? response.usage.input_tokens,
     output_tokens: response.usage.output_tokens
   };
 

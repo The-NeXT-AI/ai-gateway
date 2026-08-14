@@ -3346,11 +3346,69 @@ describe('gateway routes protocol conversion', () => {
         .find((line) => line.startsWith('data: ') && line.includes('"type":"message_delta"'));
       expect(messageDeltaLine).toBeDefined();
       const messageDelta = JSON.parse(String(messageDeltaLine).slice('data: '.length));
+      // Upstream reported prompt_tokens=12 which already includes cached_tokens=3.
+      // Anthropic's input_tokens excludes the cached prefix, so 9 + 3 must equal 12.
       expect(messageDelta.usage).toMatchObject({
-        input_tokens: 12,
+        input_tokens: 9,
         output_tokens: 16,
         cache_read_input_tokens: 3
       });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('excludes the cached prefix from input_tokens on a Responses stream', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: response.created\n' +
+          'data: {"type":"response.created","response":{"id":"resp_cached_usage","object":"response","status":"in_progress","model":"gpt-5.6-sol"}}\n\n',
+        'event: response.output_text.delta\n' +
+          'data: {"type":"response.output_text.delta","delta":"hello"}\n\n',
+        'event: response.completed\n' +
+          'data: {"type":"response.completed","response":{"id":"resp_cached_usage","object":"response","status":"completed","model":"gpt-5.6-sol","output_text":"hello","output":[{"id":"msg_cached_usage","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":12,"output_tokens":16,"total_tokens":28,"input_tokens_details":{"cached_tokens":3}}}}\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6-sol'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'gpt-5.6-sol',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const messageDeltaLine = response.body
+        .split('\n')
+        .find((line) => line.startsWith('data: ') && line.includes('"type":"message_delta"'));
+      expect(messageDeltaLine).toBeDefined();
+      const messageDelta = JSON.parse(String(messageDeltaLine).slice('data: '.length));
+      // Responses names its inclusive counter `input_tokens`, the same name Anthropic
+      // uses for the exclusive one, so 12 already contains the 3 cached tokens.
+      expect(messageDelta.usage).toMatchObject({
+        input_tokens: 9,
+        output_tokens: 16,
+        cache_read_input_tokens: 3
+      });
+      expect(response.body).not.toContain('"input_tokens":12');
     } finally {
       await app.close();
     }
@@ -3401,8 +3459,9 @@ describe('gateway routes protocol conversion', () => {
         stop_reason: 'end_turn',
         stop_sequence: null
       });
+      // prompt_tokens=4 includes cached_tokens=2, so the exclusive count is 2.
       expect(messageDelta.usage).toMatchObject({
-        input_tokens: 4,
+        input_tokens: 2,
         output_tokens: 1,
         cache_read_input_tokens: 2
       });
@@ -5211,6 +5270,55 @@ describe('gateway routes protocol conversion', () => {
       expect(response.body).toContain('"type":"thinking_delta","thinking":"* User request: pong"');
       expect(response.body).toContain('"input_tokens":5');
       expect(response.body).toContain('"output_tokens":0');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('excludes the cached prefix from input_tokens on a Gemini Interactions stream', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: interaction.created\ndata: {"interaction":{"id":"int_anthropic_cached_1","status":"in_progress","object":"interaction","model":"gemma-4-31b-it"},"event_type":"interaction.created"}\n\n',
+        'event: step.start\ndata: {"index":0,"step":{"type":"message"},"event_type":"step.start"}\n\n',
+        'event: step.delta\ndata: {"index":0,"delta":{"content":{"text":"pong","type":"text"},"type":"message"},"event_type":"step.delta"}\n\n',
+        'event: step.stop\ndata: {"index":0,"event_type":"step.stop"}\n\n',
+        'event: interaction.completed\ndata: {"interaction":{"id":"int_anthropic_cached_1","status":"completed","usage":{"total_tokens":34,"total_input_tokens":5,"total_cached_tokens":2,"total_output_tokens":1,"total_thought_tokens":0},"object":"interaction","model":"gemma-4-31b-it"},"event_type":"interaction.completed"}\n\n',
+        'event: done\ndata: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_interactions', ['gemma-4-31b-it'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'gemma-4-31b-it',
+          max_tokens: 32,
+          stream: true,
+          messages: [{ role: 'user', content: '请只回复 pong' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      // Gemini reports 5 inclusive of the 2 cached; an Anthropic client sums the two
+      // fields, so egress has to hand back 3 + 2 rather than 5 + 2.
+      expect(response.body).toContain('"input_tokens":3');
+      expect(response.body).toContain('"cache_read_input_tokens":2');
+      expect(response.body).not.toContain('"input_tokens":5');
     } finally {
       await app.close();
     }

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import type { FastifyReply } from 'fastify';
+import { anthropicInputTokens, toAnthropicInputTokens } from '../shared/usage';
 import {
   mapFinishReasonToAnthropic,
   mapFinishReasonToGemini,
@@ -93,6 +94,8 @@ interface AnthropicRelayState {
   messageId: string;
   model: string;
   inputTokens?: number;
+  /** See `StandardUsage.input_includes_cache_tokens`. */
+  inputIncludesCacheTokens?: boolean;
   outputTokens: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
@@ -112,6 +115,13 @@ interface AnthropicRelayState {
 }
 
 type AnthropicContentBlockType = 'text' | 'thinking';
+
+/**
+ * Which protocol produced a usage object, and therefore whether its input counter
+ * already includes the cached prefix. `anthropic` excludes it, `openai` includes it on
+ * both Chat Completions and Responses.
+ */
+type AnthropicRelayUsageConvention = 'anthropic' | 'openai';
 
 interface PendingAnthropicToolCall {
   index: number;
@@ -489,7 +499,8 @@ export async function* relayOptimisticAnthropicMessagesStreamTurn(
       }
       updateAnthropicRelayUsage(
         relay.state,
-        isObject(message?.usage) ? message.usage : undefined
+        isObject(message?.usage) ? message.usage : undefined,
+        'anthropic'
       );
       yield* ensureAnthropicRelayStarted(relay.state);
       continue;
@@ -606,7 +617,8 @@ export async function* relayOptimisticAnthropicMessagesStreamTurn(
     if (eventType === 'message_delta') {
       updateAnthropicRelayUsage(
         relay.state,
-        isObject(payload.usage) ? payload.usage : undefined
+        isObject(payload.usage) ? payload.usage : undefined,
+        'anthropic'
       );
       continue;
     }
@@ -792,6 +804,7 @@ function applyStandardUsageToAnthropicRelayState(
   usage: StandardUsage
 ): void {
   state.inputTokens = usage.input_tokens;
+  state.inputIncludesCacheTokens = usage.input_includes_cache_tokens;
   state.outputTokens = usage.output_tokens ?? state.outputTokens;
   state.cacheReadInputTokens = usage.cache_read_tokens;
   state.cacheCreationInputTokens = usage.cache_write_tokens;
@@ -1551,7 +1564,7 @@ function buildOpenAIChatUsage(usage: StandardResponse['usage']): Record<string, 
 
 function buildAnthropicMessageStartUsage(usage: StandardResponse['usage']): Record<string, unknown> {
   const payload: Record<string, unknown> = {
-    input_tokens: usage.input_tokens ?? 0,
+    input_tokens: anthropicInputTokens(usage) ?? 0,
     output_tokens: 0
   };
   addStandardCacheUsageToAnthropicUsage(payload, usage);
@@ -1564,7 +1577,7 @@ function buildAnthropicMessageDeltaUsageFromStandard(usage: StandardResponse['us
     output_tokens: usage.output_tokens ?? 0
   };
   if (usage.input_tokens !== undefined) {
-    payload.input_tokens = usage.input_tokens;
+    payload.input_tokens = anthropicInputTokens(usage);
   }
   addStandardCacheUsageToAnthropicUsage(payload, usage);
   addServerToolUseToAnthropicUsage(payload, usage.server_tool_use);
@@ -1581,6 +1594,15 @@ function addStandardCacheUsageToAnthropicUsage(
   if (usage.cache_write_tokens !== undefined) {
     payload.cache_creation_input_tokens = usage.cache_write_tokens;
   }
+}
+
+function relayAnthropicInputTokens(state: AnthropicRelayState): number | undefined {
+  return toAnthropicInputTokens(
+    state.inputTokens,
+    state.cacheReadInputTokens,
+    state.cacheCreationInputTokens,
+    state.inputIncludesCacheTokens
+  );
 }
 
 function addServerToolUseToAnthropicUsage(
@@ -4869,7 +4891,7 @@ function emitAnthropicFramesFromOpenAIChatChunk(
 
   const firstChoice = Array.isArray(payload.choices) && isObject(payload.choices[0]) ? payload.choices[0] : undefined;
   const usage = openAIChatChunkUsage(payload, firstChoice);
-  updateAnthropicRelayUsage(state, usage);
+  updateAnthropicRelayUsage(state, usage, 'openai');
 
   const delta = isObject(firstChoice?.delta) ? firstChoice.delta : undefined;
   const deltaText = asString(delta?.content) || '';
@@ -4908,7 +4930,7 @@ function emitAnthropicFramesFromOpenAIResponsesEvent(
   if (eventType === 'response.created') {
     const response = isObject(payload.response) ? payload.response : undefined;
     updateAnthropicRelayIdentity(state, response);
-    updateAnthropicRelayUsage(state, isObject(response?.usage) ? response.usage : undefined);
+    updateAnthropicRelayUsage(state, isObject(response?.usage) ? response.usage : undefined, 'openai');
     return ensureAnthropicRelayStarted(state);
   }
 
@@ -4924,7 +4946,7 @@ function emitAnthropicFramesFromOpenAIResponsesEvent(
   if (eventType === 'response.completed' || eventType === 'response.incomplete') {
     const response = isObject(payload.response) ? payload.response : undefined;
     updateAnthropicRelayIdentity(state, response);
-    updateAnthropicRelayUsage(state, isObject(response?.usage) ? response.usage : undefined);
+    updateAnthropicRelayUsage(state, isObject(response?.usage) ? response.usage : undefined, 'openai');
     const reasoningFrames = emitAnthropicResponsesReasoningBlocks(state, response);
     collectOpenAIResponsesToolCalls(state, response);
 
@@ -5350,7 +5372,7 @@ function finalizeAnthropicRelay(state: AnthropicRelayState): string[] {
 
 function buildAnthropicMessageStartFrame(state: AnthropicRelayState): string {
   const usage: Record<string, unknown> = {
-    input_tokens: state.inputTokens ?? 0,
+    input_tokens: relayAnthropicInputTokens(state) ?? 0,
     output_tokens: 0
   };
   if (state.cacheCreationInputTokens !== undefined) {
@@ -5381,7 +5403,7 @@ function buildAnthropicMessageDeltaUsage(state: AnthropicRelayState): Record<str
     output_tokens: state.outputTokens
   };
   if (state.inputTokens !== undefined) {
-    usage.input_tokens = state.inputTokens;
+    usage.input_tokens = relayAnthropicInputTokens(state);
   }
   if (state.cacheCreationInputTokens !== undefined) {
     usage.cache_creation_input_tokens = state.cacheCreationInputTokens;
@@ -5396,7 +5418,8 @@ function buildAnthropicMessageDeltaUsage(state: AnthropicRelayState): Record<str
 
 function updateAnthropicRelayUsage(
   state: AnthropicRelayState,
-  usage: Record<string, unknown> | undefined
+  usage: Record<string, unknown> | undefined,
+  convention: AnthropicRelayUsageConvention
 ) {
   if (!usage) {
     return;
@@ -5411,6 +5434,12 @@ function updateAnthropicRelayUsage(
   const inputTokens = asNumber(usage.input_tokens) ?? asNumber(usage.prompt_tokens);
   if (inputTokens !== undefined) {
     state.inputTokens = inputTokens;
+    // OpenAI's counters already include the cached prefix, on both Chat Completions
+    // (`prompt_tokens`) and Responses (`input_tokens`); Anthropic's `input_tokens`
+    // excludes it. The field name alone cannot tell the two conventions apart, because
+    // Responses reuses Anthropic's name for the inclusive counter, so the caller states
+    // which upstream protocol produced this usage object.
+    state.inputIncludesCacheTokens = convention === 'openai';
   }
 
   const outputTokens = asNumber(usage.output_tokens) ?? asNumber(usage.completion_tokens);
@@ -5643,6 +5672,9 @@ function updateAnthropicRelayUsageFromGeminiInteraction(
   state.inputTokens = asNumber(usage.total_input_tokens);
   state.outputTokens = asNumber(usage.total_output_tokens) ?? state.outputTokens;
   state.cacheReadInputTokens = asNumber(usage.total_cached_tokens);
+  // Gemini's `total_input_tokens` already includes `total_cached_tokens`, the same
+  // convention as OpenAI's `prompt_tokens`.
+  state.inputIncludesCacheTokens = true;
 }
 
 function updateGeminiRelayUsageFromGeminiInteraction(

@@ -360,7 +360,9 @@ docker compose up --build
 - `MCP_GATEWAY_OAUTH_REFRESH_TOKEN_TTL_SEC`：refresh token 有效期秒数（默认 `2592000`）
 - `DEFAULT_TARGET_PROVIDER`：默认目标 provider（`openai|anthropic|gemini`）
 - `DEFAULT_TARGET_PROVIDERS`：默认目标 provider 列表（逗号分隔，如 `openai,anthropic,gemini`）
-- `UPSTREAM_TIMEOUT_MS`：兼容旧配置字段；当前不再对模型上游请求设置网关侧固定超时
+- `UPSTREAM_TIMEOUT_MS`：模型上游请求超时毫秒；未配置或设为 `0` 时禁用网关侧固定超时，负数或无效值会被忽略并回退到配置文件值/默认值 `0`
+- `CCR_UPSTREAM_PROXY_URL`：模型上游请求代理地址；优先级高于标准 proxy 环境变量，仍会遵循 `no_proxy` / `NO_PROXY`
+- `http_proxy` / `HTTP_PROXY`、`https_proxy` / `HTTPS_PROXY`、`all_proxy` / `ALL_PROXY`、`no_proxy` / `NO_PROXY`：模型上游请求的标准代理配置；小写变量优先于大写变量，`all_proxy` 作为 HTTP/HTTPS 代理回退值
 - `GATEWAY_TRUSTED_PROXY_CIDRS`：可信反向代理来源网段（逗号分隔）；用于解析 usage/billing 上报事件中的 `clientIp`
 - `GATEWAY_TRUSTED_PROXY_HEADER`：唯一可信的客户端 IP 转发头，默认 `x-forwarded-for`
 

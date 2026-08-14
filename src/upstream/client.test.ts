@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const undiciMock = vi.hoisted(() => ({
   dispatch: vi.fn(() => true),
+  proxyAgentInputs: [] as unknown[],
+  proxyDispatch: vi.fn(() => true),
   getGlobalDispatcher: vi.fn()
 }));
 
@@ -9,6 +11,34 @@ vi.mock('undici', () => ({
   Dispatcher: class MockDispatcher {
     dispatch(): boolean {
       throw new Error('dispatch not implemented');
+    }
+
+    close(callback?: () => void): Promise<void> | void {
+      if (callback) {
+        callback();
+        return;
+      }
+
+      return Promise.resolve();
+    }
+
+    destroy(errorOrCallback?: Error | null | (() => void), callback?: () => void): Promise<void> | void {
+      const done = typeof errorOrCallback === 'function' ? errorOrCallback : callback;
+      if (done) {
+        done();
+        return;
+      }
+
+      return Promise.resolve();
+    }
+  },
+  ProxyAgent: class MockProxyAgent {
+    constructor(input?: unknown) {
+      undiciMock.proxyAgentInputs.push(input);
+    }
+
+    dispatch(options: Record<string, unknown>, handler: unknown): boolean {
+      return undiciMock.proxyDispatch(options, handler);
     }
 
     close(callback?: () => void): Promise<void> | void {
@@ -46,10 +76,31 @@ type TestDispatcher = {
   dispatch(options: Record<string, unknown>, handler: unknown): boolean;
 };
 
+const proxyEnvNames = [
+  'CCR_UPSTREAM_PROXY_URL',
+  'http_proxy',
+  'HTTP_PROXY',
+  'https_proxy',
+  'HTTPS_PROXY',
+  'all_proxy',
+  'ALL_PROXY',
+  'no_proxy',
+  'NO_PROXY'
+];
+const originalProxyEnv = new Map(proxyEnvNames.map((name) => [name, process.env[name]]));
+
 describe('callUpstream', () => {
-  afterEach(() => {
+  beforeEach(() => {
+    clearProxyEnv();
     undiciMock.dispatch.mockClear();
+    undiciMock.proxyAgentInputs.length = 0;
+    undiciMock.proxyDispatch.mockClear();
     undiciMock.getGlobalDispatcher.mockReset();
+    undiciMock.getGlobalDispatcher.mockReturnValue({ dispatch: undiciMock.dispatch });
+  });
+
+  afterEach(() => {
+    restoreProxyEnv();
   });
 
   it('aborts model upstream requests based on timeoutMs', async () => {
@@ -177,6 +228,202 @@ describe('callUpstream', () => {
       expect(response.status).toBe(200);
       expect(dispatchResult).toBe(true);
       expect(undiciMock.getGlobalDispatcher).toHaveBeenCalledTimes(1);
+      expect(undiciMock.dispatch).toHaveBeenCalledWith(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST',
+          bodyTimeout: 600000,
+          headersTimeout: 600000
+        },
+        handler
+      );
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('applies upstream timeouts through a CCR upstream proxy dispatcher', async () => {
+    const originalFetch = global.fetch;
+    const globalDispatcher = { dispatch: undiciMock.dispatch };
+    undiciMock.getGlobalDispatcher.mockReturnValue(globalDispatcher);
+    process.env.CCR_UPSTREAM_PROXY_URL = 'http://127.0.0.1:8888';
+    process.env.NO_PROXY = 'localhost,127.0.0.1';
+
+    try {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response('{}', { status: 200 })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      const response = await callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        600000
+      );
+
+      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+      const handler = {};
+      const dispatchResult = (fetchInit?.dispatcher as TestDispatcher | undefined)?.dispatch(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST'
+        },
+        handler
+      );
+
+      expect(response.status).toBe(200);
+      expect(dispatchResult).toBe(true);
+      expect(undiciMock.proxyAgentInputs).toEqual(['http://127.0.0.1:8888']);
+      expect(undiciMock.proxyDispatch).toHaveBeenCalledWith(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST',
+          bodyTimeout: 600000,
+          headersTimeout: 600000
+        },
+        handler
+      );
+      expect(undiciMock.dispatch).not.toHaveBeenCalled();
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('applies the upstream proxy dispatcher when upstream timeout is disabled', async () => {
+    const originalFetch = global.fetch;
+    const globalDispatcher = { dispatch: undiciMock.dispatch };
+    undiciMock.getGlobalDispatcher.mockReturnValue(globalDispatcher);
+    process.env.CCR_UPSTREAM_PROXY_URL = 'http://127.0.0.1:7777';
+
+    try {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response('{}', { status: 200 })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      const response = await callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        0
+      );
+
+      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+      const handler = {};
+      const dispatchResult = (fetchInit?.dispatcher as TestDispatcher | undefined)?.dispatch(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST'
+        },
+        handler
+      );
+
+      expect(response.status).toBe(200);
+      expect(dispatchResult).toBe(true);
+      expect(undiciMock.proxyAgentInputs).toEqual(['http://127.0.0.1:7777']);
+      expect(undiciMock.proxyDispatch).toHaveBeenCalledWith(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST'
+        },
+        handler
+      );
+      expect(undiciMock.dispatch).not.toHaveBeenCalled();
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('bypasses CCR upstream proxy for NO_PROXY matches while preserving timeouts', async () => {
+    const originalFetch = global.fetch;
+    const globalDispatcher = { dispatch: undiciMock.dispatch };
+    undiciMock.getGlobalDispatcher.mockReturnValue(globalDispatcher);
+    process.env.CCR_UPSTREAM_PROXY_URL = 'http://127.0.0.1:8888';
+    process.env.NO_PROXY = '.test';
+
+    try {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response('{}', { status: 200 })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      const response = await callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        600000
+      );
+
+      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+      const handler = {};
+      const dispatchResult = (fetchInit?.dispatcher as TestDispatcher | undefined)?.dispatch(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST'
+        },
+        handler
+      );
+
+      expect(response.status).toBe(200);
+      expect(dispatchResult).toBe(true);
+      expect(undiciMock.proxyAgentInputs).toEqual([]);
+      expect(undiciMock.dispatch).toHaveBeenCalledWith(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST',
+          bodyTimeout: 600000,
+          headersTimeout: 600000
+        },
+        handler
+      );
+      expect(undiciMock.proxyDispatch).not.toHaveBeenCalled();
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('keeps active MockAgent dispatchers ahead of environment proxies', async () => {
+    const originalFetch = global.fetch;
+    const globalDispatcher = { dispatch: undiciMock.dispatch, isMockActive: true };
+    undiciMock.getGlobalDispatcher.mockReturnValue(globalDispatcher);
+    process.env.CCR_UPSTREAM_PROXY_URL = 'http://127.0.0.1:9999';
+
+    try {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response('{}', { status: 200 })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      const response = await callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        600000
+      );
+
+      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+      const handler = {};
+      const dispatchResult = (fetchInit?.dispatcher as TestDispatcher | undefined)?.dispatch(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST'
+        },
+        handler
+      );
+
+      expect(response.status).toBe(200);
+      expect(dispatchResult).toBe(true);
+      expect((fetchInit?.dispatcher as TestDispatcher | undefined)?.isMockActive).toBe(true);
+      expect(undiciMock.proxyAgentInputs).toEqual([]);
       expect(undiciMock.dispatch).toHaveBeenCalledWith(
         {
           origin: 'https://example.test',
@@ -406,6 +653,23 @@ describe('callUpstream', () => {
     }
   });
 });
+
+function clearProxyEnv(): void {
+  for (const name of proxyEnvNames) {
+    delete process.env[name];
+  }
+}
+
+function restoreProxyEnv(): void {
+  for (const name of proxyEnvNames) {
+    const value = originalProxyEnv.get(name);
+    if (value === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = value;
+    }
+  }
+}
 
 describe('upstream response abort handling', () => {
   it('aborts response body reads when the client abort signal fires', async () => {

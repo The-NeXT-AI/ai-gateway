@@ -1,6 +1,6 @@
 import { Readable } from 'node:stream';
 import type { FastifyReply } from 'fastify';
-import { Dispatcher, getGlobalDispatcher } from 'undici';
+import { Dispatcher, getGlobalDispatcher, ProxyAgent } from 'undici';
 
 export interface UpstreamCallLogContext {
   logger?: {
@@ -41,6 +41,12 @@ interface NormalizedUpstreamRetryOptions {
 
 type FetchDispatcher = NonNullable<RequestInit['dispatcher']>;
 type FetchInitWithDispatcher = RequestInit & { dispatcher?: FetchDispatcher };
+type UpstreamDispatchTarget = Pick<Dispatcher, 'dispatch'> & { isMockActive?: unknown };
+type UpstreamProxyEnvOptions = {
+  httpProxy?: string;
+  httpsProxy?: string;
+  noProxy?: string;
+};
 
 const hopByHopHeaders = new Set([
   'connection',
@@ -105,6 +111,7 @@ const maxLoggedStringLength = 4096;
 const maxLoggedPayloadLength = 32768;
 const maxUpstreamConnectAttempts = 2;
 const upstreamRetryDelayMs = 150;
+const upstreamProxyAgentCache = new Map<string, Dispatcher>();
 
 export async function callUpstream(
   url: string,
@@ -138,7 +145,7 @@ export async function callUpstream(
       'Upstream request dispatched.'
     );
   }
-  const dispatcher = upstreamFetchDispatcherForTimeout(timeoutMs);
+  const dispatcher = upstreamFetchDispatcher(timeoutMs);
 
   let lastError: unknown;
   let timedOut = false;
@@ -293,13 +300,19 @@ export async function callUpstream(
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-function upstreamFetchDispatcherForTimeout(timeoutMs: number): FetchDispatcher | undefined {
+function upstreamFetchDispatcher(timeoutMs: number): FetchDispatcher | undefined {
   const normalizedTimeoutMs = normalizeDispatcherTimeoutMs(timeoutMs);
-  if (normalizedTimeoutMs === undefined) {
+  const proxyOptions = readUpstreamProxyEnvOptions();
+  if (normalizedTimeoutMs === undefined && !proxyOptions) {
     return undefined;
   }
 
-  return new UpstreamTimeoutDispatcher(normalizedTimeoutMs) as unknown as FetchDispatcher;
+  const baseDispatcher = upstreamBaseDispatcher(proxyOptions);
+  if (normalizedTimeoutMs === undefined) {
+    return baseDispatcher as unknown as FetchDispatcher;
+  }
+
+  return new UpstreamTimeoutDispatcher(normalizedTimeoutMs, baseDispatcher) as unknown as FetchDispatcher;
 }
 
 function normalizeDispatcherTimeoutMs(timeoutMs: number): number | undefined {
@@ -310,20 +323,131 @@ function normalizeDispatcherTimeoutMs(timeoutMs: number): number | undefined {
   return Math.max(1, Math.trunc(timeoutMs));
 }
 
-class UpstreamTimeoutDispatcher extends Dispatcher {
-  constructor(private readonly timeoutMs: number) {
+function upstreamBaseDispatcher(proxyOptions?: UpstreamProxyEnvOptions): UpstreamDispatchTarget {
+  const globalDispatcher = getGlobalDispatcher();
+  if (isMockDispatcher(globalDispatcher)) {
+    return globalDispatcher;
+  }
+
+  return proxyOptions ? new UpstreamEnvProxyDispatcher(proxyOptions, globalDispatcher) : globalDispatcher;
+}
+
+function upstreamProxyAgent(proxyUrl: string): UpstreamDispatchTarget {
+  const cached = upstreamProxyAgentCache.get(proxyUrl);
+  if (cached) {
+    return cached;
+  }
+
+  const dispatcher = new ProxyAgent(proxyUrl);
+  upstreamProxyAgentCache.set(proxyUrl, dispatcher);
+  return dispatcher;
+}
+
+function readUpstreamProxyEnvOptions(): UpstreamProxyEnvOptions | undefined {
+  const ccrProxy = readProxyEnvValue('CCR_UPSTREAM_PROXY_URL');
+  const allProxy = readProxyEnvValue('all_proxy', 'ALL_PROXY');
+  const httpProxy = ccrProxy ?? readProxyEnvValue('http_proxy', 'HTTP_PROXY') ?? allProxy;
+  const httpsProxy = ccrProxy ?? readProxyEnvValue('https_proxy', 'HTTPS_PROXY') ?? allProxy;
+  const noProxy = readProxyEnvValue('no_proxy', 'NO_PROXY');
+
+  if (!httpProxy && !httpsProxy) {
+    return undefined;
+  }
+
+  return {
+    ...(httpProxy ? { httpProxy } : {}),
+    ...(httpsProxy ? { httpsProxy } : {}),
+    ...(noProxy ? { noProxy } : {})
+  };
+}
+
+function readProxyEnvValue(...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = process.env[name]?.trim();
+    if (value) {
+      return value;
+    }
+  }
+}
+
+function isMockDispatcher(dispatcher: UpstreamDispatchTarget): boolean {
+  return Boolean(dispatcher.isMockActive);
+}
+
+class UpstreamEnvProxyDispatcher extends Dispatcher {
+  constructor(
+    private readonly options: UpstreamProxyEnvOptions,
+    private readonly directDispatcher: UpstreamDispatchTarget
+  ) {
     super();
   }
 
   get isMockActive(): unknown {
-    return (getGlobalDispatcher() as { isMockActive?: unknown }).isMockActive;
+    return this.directDispatcher.isMockActive;
   }
 
   dispatch(
     options: Parameters<Dispatcher['dispatch']>[0],
     handler: Parameters<Dispatcher['dispatch']>[1]
   ): boolean {
-    return getGlobalDispatcher().dispatch(
+    return this.dispatcherFor(options.origin).dispatch(options, handler);
+  }
+
+  private dispatcherFor(origin: string | URL | undefined): UpstreamDispatchTarget {
+    const url = proxyOriginUrl(origin);
+    if (!url || shouldBypassUpstreamProxy(url, this.options.noProxy)) {
+      return this.directDispatcher;
+    }
+
+    const proxyUrl = url.protocol === 'https:'
+      ? this.options.httpsProxy ?? this.options.httpProxy
+      : this.options.httpProxy;
+    return proxyUrl ? upstreamProxyAgent(proxyUrl) : this.directDispatcher;
+  }
+
+  close(): Promise<void>;
+  close(callback: () => void): void;
+  close(callback?: () => void): Promise<void> | void {
+    if (callback) {
+      queueMicrotask(callback);
+      return;
+    }
+
+    return Promise.resolve();
+  }
+
+  destroy(): Promise<void>;
+  destroy(error: Error | null): Promise<void>;
+  destroy(callback: () => void): void;
+  destroy(error: Error | null, callback: () => void): void;
+  destroy(errorOrCallback?: Error | null | (() => void), callback?: () => void): Promise<void> | void {
+    const done = typeof errorOrCallback === 'function' ? errorOrCallback : callback;
+    if (done) {
+      queueMicrotask(done);
+      return;
+    }
+
+    return Promise.resolve();
+  }
+}
+
+class UpstreamTimeoutDispatcher extends Dispatcher {
+  constructor(
+    private readonly timeoutMs: number,
+    private readonly baseDispatcher: UpstreamDispatchTarget
+  ) {
+    super();
+  }
+
+  get isMockActive(): unknown {
+    return this.baseDispatcher.isMockActive;
+  }
+
+  dispatch(
+    options: Parameters<Dispatcher['dispatch']>[0],
+    handler: Parameters<Dispatcher['dispatch']>[1]
+  ): boolean {
+    return this.baseDispatcher.dispatch(
       {
         ...options,
         bodyTimeout: this.timeoutMs,
@@ -357,6 +481,65 @@ class UpstreamTimeoutDispatcher extends Dispatcher {
 
     return Promise.resolve();
   }
+}
+
+function proxyOriginUrl(origin: string | URL | undefined): URL | undefined {
+  if (!origin) {
+    return undefined;
+  }
+
+  try {
+    return origin instanceof URL ? origin : new URL(String(origin));
+  } catch {
+    return undefined;
+  }
+}
+
+function shouldBypassUpstreamProxy(url: URL, noProxy: string | undefined): boolean {
+  const value = noProxy?.trim();
+  if (!value) {
+    return false;
+  }
+  if (value === '*') {
+    return true;
+  }
+
+  const hostname = url.host.replace(/:\d*$/, '').toLowerCase();
+  const port = Number.parseInt(url.port, 10) || defaultProxyPort(url.protocol);
+  for (const entry of parseNoProxyEntries(value)) {
+    if (entry.port && entry.port !== port) {
+      continue;
+    }
+    if (!/^[.*]/.test(entry.hostname)) {
+      if (hostname === entry.hostname) {
+        return true;
+      }
+      continue;
+    }
+    if (hostname.endsWith(entry.hostname.replace(/^\*/, ''))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function defaultProxyPort(protocol: string): number {
+  return protocol === 'http:' ? 80 : protocol === 'https:' ? 443 : 0;
+}
+
+function parseNoProxyEntries(value: string): Array<{ hostname: string; port: number }> {
+  return value
+    .split(/[,\s]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const parsed = entry.match(/^(.+):(\d+)$/);
+      return {
+        hostname: (parsed ? parsed[1] : entry).toLowerCase(),
+        port: parsed ? Number.parseInt(parsed[2], 10) : 0
+      };
+    });
 }
 
 function isEventStreamResponse(response: Response): boolean {

@@ -182,6 +182,7 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.PROVIDER_EXTERNAL_STDIO_COMMAND;
     delete process.env.PROVIDER_EXTERNAL_STDIO_ARGS;
     delete process.env.PROVIDER_EXTERNAL_STDIO_CWD;
+    delete process.env.UPSTREAM_TIMEOUT_MS;
   });
 
   it('parses trusted reverse proxy settings from config and env', () => {
@@ -212,6 +213,14 @@ describe('Gateway config providerPlugins', () => {
     expect(() =>
       parseGatewayConfigFromRaw({ trustedProxyHeader: 'x-arbitrary-client-ip' })
     ).toThrow(/trustedProxyHeader must be one of/);
+  });
+
+  it('does not allow negative upstream timeout values', () => {
+    expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: -1 }).upstreamTimeoutMs).toBe(0);
+
+    process.env.UPSTREAM_TIMEOUT_MS = '-5';
+    expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: -1 }).upstreamTimeoutMs).toBe(0);
+    expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: 5000 }).upstreamTimeoutMs).toBe(5000);
   });
 
   it('resolves provider api keys from apiKeyEnv', () => {

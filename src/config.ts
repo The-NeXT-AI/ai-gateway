@@ -1036,8 +1036,8 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
         1
       ),
     upstreamTimeoutMs:
-      readFiniteNumber(process.env.UPSTREAM_TIMEOUT_MS) ??
-      readFiniteNumber(jsonConfig.upstreamTimeoutMs) ??
+      readNonNegativeNumber(process.env.UPSTREAM_TIMEOUT_MS) ??
+      readNonNegativeNumber(jsonConfig.upstreamTimeoutMs) ??
       0,
     defaultOpenAIModel:
       readString(process.env.DEFAULT_OPENAI_MODEL) ||

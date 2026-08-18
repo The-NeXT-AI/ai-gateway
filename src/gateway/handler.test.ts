@@ -697,6 +697,48 @@ describe('virtual model multimodal reference rewriting', () => {
     expect(serializedInput).not.toContain(imageUrl);
   });
 
+  it('derives media reference ids from content so prefix caching survives across turns', () => {
+    const imageUrl = 'https://example.com/private/image.png?token=secret';
+    const otherUrl = 'https://example.com/private/other.png?token=secret';
+    const rewriteOnce = (url: string) =>
+      rewriteVirtualModelMultimodalInput(
+        {
+          model: 'gpt-5:vision_tool',
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'input_text', text: 'inspect this image' }]
+            }
+          ]
+        },
+        {
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'inspect this image' },
+                { type: 'image_url', image_url: { url } }
+              ]
+            }
+          ]
+        },
+        'openai_chat'
+      );
+
+    // The placeholder is part of the prompt sent upstream. If the id were random, the bytes
+    // at the attachment's position would differ on every turn and the upstream prefix cache
+    // would break there, forcing a full recompute of everything after it.
+    const first = rewriteOnce(imageUrl);
+    const second = rewriteOnce(imageUrl);
+    expect(first.references[0]!.id).toBe(second.references[0]!.id);
+    expect(JSON.stringify(first.request.input)).toBe(JSON.stringify(second.request.input));
+
+    // Distinct attachments still get distinct ids.
+    expect(rewriteOnce(otherUrl).references[0]!.id).not.toBe(first.references[0]!.id);
+    expect(first.references[0]!.id).toMatch(/^mm_[0-9a-f]{32}$/);
+  });
+
   it('does not treat object storage URIs as gateway media URLs', () => {
     const imageUrl = 's3://private-bucket/image.png';
     const rewrite = rewriteVirtualModelMultimodalInput(

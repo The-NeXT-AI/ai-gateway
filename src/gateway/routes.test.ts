@@ -8550,6 +8550,107 @@ export function createGatewayPlugin() {
     }
   });
 
+  it('leaves gateway-owned calls unrun in a mixed turn that would exceed maxToolCalls', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          id: 'chatcmpl_mixed_budget_1',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'tool_calls',
+              message: {
+                role: 'assistant',
+                content: '',
+                tool_calls: [
+                  {
+                    id: 'call_search_1',
+                    type: 'function',
+                    function: { name: 'search_web', arguments: '{"query":"first"}' }
+                  },
+                  {
+                    id: 'call_search_2',
+                    type: 'function',
+                    function: { name: 'search_web', arguments: '{"query":"second"}' }
+                  },
+                  {
+                    id: 'call_client_1',
+                    type: 'function',
+                    function: { name: 'private_client_tool', arguments: '{"value":1}' }
+                  }
+                ]
+              }
+            }
+          ],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 }
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const executedToolCalls: string[] = [];
+    const toolProvider = {
+      listDefinitions: async () => [
+        { name: 'search_web', description: 'Search the web', inputSchema: { type: 'object', properties: {} } }
+      ],
+      has: async () => true,
+      execute: async (name: string) => {
+        executedToolCalls.push(name);
+        return { summary: 'the image shows a red square' };
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])]);
+    config.transparentToolExecution = {
+      enabled: true,
+      maxTurns: 4,
+      maxToolCalls: 1,
+      requireClientDeclaration: true,
+      unknownToolPolicy: 'return_to_client',
+      allowTools: [],
+      denyTools: []
+    };
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: { 'content-type': 'application/json' },
+        payload: {
+          model: 'openai-main/glm-5',
+          messages: [{ role: 'user', content: 'Look twice, then run the tool' }],
+          tools: [
+            { type: 'function', function: { name: 'search_web', parameters: { type: 'object', properties: {} } } },
+            { type: 'function', function: { name: 'private_client_tool', parameters: { type: 'object', properties: {} } } }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      // A client-owned call in the turn must not buy the gateway an unmetered batch:
+      // two gateway calls do not fit under maxToolCalls=1, so neither runs.
+      expect(executedToolCalls).toEqual([]);
+
+      const payload = JSON.parse(response.body);
+      const message = payload.choices[0]?.message;
+      expect(String(message?.content ?? '')).not.toContain('the image shows a red square');
+      // The turn goes back untouched rather than failing. Transparent tools are ones the
+      // client declared, so the unrun calls stay in the reply and the client can run them
+      // itself — the same thing that happened before mixed turns executed anything.
+      const returnedTools = (message?.tool_calls || []).map((call: { function: { name: string } }) => call.function.name);
+      expect(returnedTools).toEqual(['search_web', 'search_web', 'private_client_tool']);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('returns ordinary tool calls to the client when transparent tools are unknown', async () => {
     const fetchMock = vi.fn(async () =>
       new Response(
@@ -8861,6 +8962,103 @@ export function createGatewayPlugin() {
 
       const message = JSON.parse(response.body).choices[0]?.message;
       expect(String(message?.content)).toContain('Ghisha Expert hours, inside the air gap.');
+      const names = (message?.tool_calls || []).map((c: { function: { name: string } }) => c.function.name);
+      expect(names).toEqual(['Bash']);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('skips internal tools in a mixed turn that would exceed maxToolCalls', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: 'chatcmpl_mixed_budget_buffered_1',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'tool_calls',
+              message: {
+                role: 'assistant',
+                content: '',
+                tool_calls: [
+                  { id: 'call_i1', type: 'function', function: { name: 'search_web', arguments: '{"query":"page 1"}' } },
+                  { id: 'call_i2', type: 'function', function: { name: 'search_web', arguments: '{"query":"page 2"}' } },
+                  { id: 'call_c1', type: 'function', function: { name: 'Bash', arguments: '{"command":"date"}' } }
+                ]
+              }
+            }
+          ],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 }
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const executed: string[] = [];
+    const toolProvider = {
+      listDefinitions: async () => [
+        { name: 'search_web', description: 'Search', inputSchema: { type: 'object', properties: {} } }
+      ],
+      has: async () => true,
+      execute: async (name: string) => {
+        executed.push(name);
+        return { transcript: 'Ghisha Expert hours, inside the air gap.' };
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'fold-budget-profile',
+          key: 'fold-budget-profile',
+          displayName: 'Fold Budget',
+          enabled: true,
+          match: { exactAliases: [], prefixes: [], suffixes: [':search'] },
+          baseModel: { mode: 'strip_suffix' },
+          tools: [{ name: 'search_web', visibility: 'internal' }],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 1,
+            clientToolsPolicy: 'allow',
+            foldInternalResults: true,
+            streamMode: 'buffered'
+          },
+          materialization: { enabled: true, includeInGatewayModels: true }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: { 'content-type': 'application/json' },
+        payload: {
+          model: 'openai-main/glm-5:search',
+          messages: [{ role: 'user', content: 'Transcribe both pages' }],
+          tools: [{ type: 'function', function: { name: 'Bash', parameters: { type: 'object', properties: {} } } }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // Two internal calls do not fit under maxToolCalls=1, so the mixed turn runs none
+      // of them — the client tool must not widen the gateway's budget.
+      expect(executed).toEqual([]);
+
+      const message = JSON.parse(response.body).choices[0]?.message;
+      expect(String(message?.content ?? '')).not.toContain('Ghisha Expert hours');
       const names = (message?.tool_calls || []).map((c: { function: { name: string } }) => c.function.name);
       expect(names).toEqual(['Bash']);
     } finally {
@@ -9821,6 +10019,99 @@ export function createGatewayPlugin() {
       expect(body).toContain('"stop_reason":"tool_use"');
       expect(body).not.toContain('call_vision_mixed_1');
       expect(body).not.toContain('"name":"vision_understand"');
+      expect(body).not.toContain('event: error');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('skips internal tools on an optimistic mixed turn that would exceed maxToolCalls', async () => {
+    const firstStream = [
+      'data: {"id":"chatcmpl_mixed_budget_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+      'data: {"id":"chatcmpl_mixed_budget_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"on it. "}}]}\n\n',
+      'data: {"id":"chatcmpl_mixed_budget_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_vision_budget_1","type":"function","function":{"name":"vision_understand"}},{"index":1,"id":"call_vision_budget_2","type":"function","function":{"name":"vision_understand"}},{"index":2,"id":"call_bash_budget_1","type":"function","function":{"name":"Bash"}}]}}]}\n\n',
+      'data: {"id":"chatcmpl_mixed_budget_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"prompt\\":\\"page 1\\"}"}},{"index":1,"function":{"arguments":"{\\"prompt\\":\\"page 2\\"}"}},{"index":2,"function":{"arguments":"{\\"command\\":\\"date\\"}"}}]}}]}\n\n',
+      'data: {"id":"chatcmpl_mixed_budget_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":4,"total_tokens":11}}\n\n',
+      'data: [DONE]\n\n'
+    ].join('');
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(firstStream, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const executed: string[] = [];
+    const toolProvider = {
+      listDefinitions: async () => [
+        { name: 'vision_understand', description: 'Read an image', inputSchema: { type: 'object', properties: {} } }
+      ],
+      has: async () => true,
+      execute: async (name: string) => {
+        executed.push(name);
+        return { content: [{ type: 'text', text: 'INVOICE #4417 — total 41.70' }] };
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'mixed-stream-budget-profile',
+          key: 'mixed-stream-budget',
+          displayName: 'Mixed Stream Budget',
+          enabled: true,
+          match: { exactAliases: [], prefixes: [], suffixes: [':mixed-stream-budget'] },
+          baseModel: { mode: 'strip_suffix' },
+          tools: [{ name: 'vision_understand', visibility: 'internal' }],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 1,
+            clientToolsPolicy: 'allow',
+            foldInternalResults: true,
+            streamMode: 'optimistic'
+          },
+          materialization: { enabled: true, includeInGatewayModels: true }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: { 'content-type': 'application/json' },
+        payload: {
+          model: 'openai-main/glm-5:mixed-stream-budget',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'Read both pages, then tell me the date' }],
+          tools: [
+            {
+              name: 'Bash',
+              description: 'Run a command',
+              input_schema: { type: 'object', properties: { command: { type: 'string' } } }
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // Two internal calls do not fit under maxToolCalls=1: the stream runs neither
+      // instead of spending an unbounded batch because the turn also called a client tool.
+      expect(executed).toEqual([]);
+
+      const body = response.body;
+      expect(body).not.toContain('INVOICE #4417');
+      // The client's own call still reaches it, and the stream ends cleanly.
+      expect(body).toContain('"type":"tool_use","id":"call_bash_budget_1","name":"Bash"');
+      expect(body).toContain('"stop_reason":"tool_use"');
       expect(body).not.toContain('event: error');
     } finally {
       await app.close();

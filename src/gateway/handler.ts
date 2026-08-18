@@ -1659,7 +1659,15 @@ async function runTransparentToolExecutionLoop(input: {
       // as text: that keeps the result in the conversation the client stores, so it
       // survives into later turns instead of being silently discarded.
       let responseForClient = lastResponse;
-      if (toolResolution.executableCalls.length > 0) {
+      if (
+        toolResolution.executableCalls.length > 0 &&
+        internalToolCallsFitBudget(
+          executedToolCalls,
+          toolResolution.executableCalls.length,
+          executionConfig.maxToolCalls
+        )
+      ) {
+        executedToolCalls += toolResolution.executableCalls.length;
         const internalResults = await executeTransparentToolCalls(
           input.runtime,
           input.source,
@@ -2564,8 +2572,14 @@ async function handleVirtualModelRequest(
         // so running them would only burn an upstream call.
         if (
           callPartition.internal.length > 0 &&
-          virtualModel.profile.execution.foldInternalResults
+          virtualModel.profile.execution.foldInternalResults &&
+          internalToolCallsFitBudget(
+            internalToolCalls,
+            callPartition.internal.length,
+            virtualModel.profile.execution.maxToolCalls
+          )
         ) {
+          internalToolCalls += callPartition.internal.length;
           const mixedResults = await executeInternalVirtualToolCalls(
             runtime,
             virtualModel.profile,
@@ -3850,7 +3864,12 @@ async function* runOptimisticVirtualModelStream(input: {
         // believing its call went nowhere.
         if (
           callPartition.internal.length > 0 &&
-          input.virtualModel.profile.execution.foldInternalResults
+          input.virtualModel.profile.execution.foldInternalResults &&
+          internalToolCallsFitBudget(
+            internalToolCalls,
+            callPartition.internal.length,
+            input.virtualModel.profile.execution.maxToolCalls
+          )
         ) {
           internalToolCalls += callPartition.internal.length;
           const mixedResults: StandardRequestInputContent[] = [];
@@ -4404,6 +4423,22 @@ function extractFunctionCallsFromStandardResponse(
   return response.output.filter(
     (item): item is StandardResponseFunctionCall => item.type === 'function_call'
   );
+}
+
+/**
+ * A mixed turn ends the loop — it has to go back for the client's tool result — so its
+ * gateway-owned calls are the last ones this request will run. They still spend the same
+ * budget as any other turn's calls: run the batch only when it fits under `maxToolCalls`,
+ * otherwise the configured bound stops holding on exactly the path that mixes client and
+ * gateway tools. Over budget the calls are skipped and the turn goes back unchanged,
+ * rather than failing a turn the client can still act on.
+ */
+function internalToolCallsFitBudget(
+  spentToolCalls: number,
+  pendingToolCalls: number,
+  maxToolCalls: number
+): boolean {
+  return spentToolCalls + pendingToolCalls <= maxToolCalls;
 }
 
 function partitionVirtualFunctionCalls(

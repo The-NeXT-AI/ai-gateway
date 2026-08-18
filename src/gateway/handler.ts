@@ -7198,7 +7198,11 @@ function applyProviderCredentials(
       url,
       headers: {
         ...headers,
-        'x-api-key': apiKey
+        'x-api-key': apiKey,
+        // OpenAI-compatible-hosted Anthropic endpoints (e.g. Ollama Cloud)
+        // reject x-api-key and require the Bearer form. Anthropic's own API
+        // accepts both, so send both.
+        authorization: `Bearer ${apiKey}`
       }
     };
   }

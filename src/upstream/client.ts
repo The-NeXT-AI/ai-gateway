@@ -1,6 +1,8 @@
 import { Readable } from 'node:stream';
 import type { FastifyReply } from 'fastify';
-import { Dispatcher, getGlobalDispatcher, ProxyAgent } from 'undici';
+import { Dispatcher, fetch as undiciFetch, getGlobalDispatcher, ProxyAgent } from 'undici';
+
+const dispatcherFetch = undiciFetch as unknown as typeof globalThis.fetch;
 
 export interface UpstreamCallLogContext {
   logger?: {
@@ -187,7 +189,9 @@ export async function callUpstream(
           signal: controller.signal,
           ...(dispatcher ? { dispatcher: dispatcher as unknown as FetchDispatcher } : {})
         };
-        const response = await fetch(url, fetchInit);
+        const response = dispatcher
+          ? await dispatcherFetch(url, fetchInit)
+          : await fetch(url, fetchInit);
 
         if (shouldLog && requestLogPayload) {
           const responseBody =

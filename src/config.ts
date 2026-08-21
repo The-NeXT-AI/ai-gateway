@@ -4075,6 +4075,8 @@ function parseVirtualModelExecutionConfig(
     maxToolCalls: resolveInteger([raw.maxToolCalls], 8, 1),
     clientToolsPolicy: policyRaw === 'deny' ? 'deny' : 'allow',
     matchMultimodal: readBoolean(raw.matchMultimodal ?? raw.match_multimodal) ?? false,
+    foldInternalResults:
+      readBoolean(raw.foldInternalResults ?? raw.fold_internal_results) ?? false,
     matchWebSearch:
       readBoolean(raw.matchWebSearch ?? raw.match_web_search ?? raw.matchWebsearch) ?? false,
     streamMode: streamModeRaw === 'optimistic' ? 'optimistic' : 'buffered'

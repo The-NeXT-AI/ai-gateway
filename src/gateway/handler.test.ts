@@ -5,8 +5,10 @@ import {
   buildGatewayBillingTraceSnapshot,
   extractGatewayRequestClientContext,
   hydrateVirtualMultimodalReferences,
+  keepAliveWhilePending,
   rewriteVirtualModelMultimodalInput,
-  resolveBillingResponseSnapshot
+  resolveBillingResponseSnapshot,
+  streamInternalVirtualToolCalls
 } from './handler';
 import {
   collectAnthropicNonStreamPayloadFromEventStream,
@@ -16,6 +18,7 @@ import {
   relayOptimisticAnthropicDeferredContent,
   relayOptimisticAnthropicMessagesStreamTurn,
   relayOptimisticOpenAIChatStreamToolCalls,
+  relayOptimisticStreamText,
   relayConvertedStreamFromStandardResponse
 } from './streaming-conversion';
 
@@ -1421,6 +1424,202 @@ describe('optimistic stream conversion', () => {
     expect(result.upstreamPayload).toBeUndefined();
     expect(frames.join('')).not.toContain('event: message_delta');
     expect(frames.join('')).not.toContain('event: message_stop');
+  });
+});
+
+describe('keepAliveWhilePending', () => {
+  it('yields nothing when the work finishes inside the first interval', async () => {
+    const frames: string[] = [];
+    for await (const frame of keepAliveWhilePending(Promise.resolve('done'), ': ping\n\n', 50)) {
+      frames.push(frame);
+    }
+
+    expect(frames).toEqual([]);
+  });
+
+  it('keeps yielding while the work is still running', async () => {
+    let resolveWork!: () => void;
+    const work = new Promise<void>((resolve) => {
+      resolveWork = resolve;
+    });
+
+    const frames: string[] = [];
+    const consume = (async () => {
+      for await (const frame of keepAliveWhilePending(work, ': ping\n\n', 10)) {
+        frames.push(frame);
+        if (frames.length >= 3) {
+          resolveWork();
+        }
+      }
+    })();
+
+    await consume;
+    expect(frames.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(frames)).toEqual(new Set([': ping\n\n']));
+  });
+
+  it('stops on a rejected promise instead of spinning forever', async () => {
+    const work = Promise.reject(new Error('tool blew up'));
+    const frames: string[] = [];
+    for await (const frame of keepAliveWhilePending(work, ': ping\n\n', 10)) {
+      frames.push(frame);
+    }
+
+    // The caller still owns the rejection; the keep-alive must not swallow it silently
+    // in a way that leaves the generator running.
+    await expect(work).rejects.toThrow('tool blew up');
+    expect(frames).toEqual([]);
+  });
+});
+
+describe('streamInternalVirtualToolCalls', () => {
+  const profile = {
+    id: 'vision',
+    key: 'vision',
+    displayName: 'vision',
+    enabled: true,
+    baseModel: { mode: 'fixed', fixedModel: 'openai-main/glm-5' },
+    execution: {
+      mode: 'tool_loop',
+      maxTurns: 4,
+      maxToolCalls: 4,
+      clientToolsPolicy: 'allow',
+      streamMode: 'optimistic',
+      foldInternalResults: true
+    }
+  } as unknown as Parameters<typeof streamInternalVirtualToolCalls>[0]['profile'];
+
+  function createRelay() {
+    const relay = createOptimisticOpenAIChatStreamRelay({ adapterKey: 'anthropic_messages' });
+    if (!relay) {
+      throw new Error('Expected an Anthropic optimistic relay.');
+    }
+    // By the time internal tools run, the turn relay has already emitted message_start —
+    // `ping` is only a legal frame inside an open message.
+    relayOptimisticStreamText(relay, 'looking at it. ');
+    return relay;
+  }
+
+  function createRuntime(execute: () => Promise<unknown>) {
+    return {
+      toolProvider: {
+        listDefinitions: async () => [],
+        has: async () => true,
+        execute,
+        close: async () => undefined
+      }
+    } as unknown as Parameters<typeof streamInternalVirtualToolCalls>[0]['runtime'];
+  }
+
+  const call = {
+    id: 'call_vision_1',
+    type: 'function_call',
+    call_id: 'call_vision_1',
+    name: 'vision_understand',
+    arguments: '{"prompt":"read it"}',
+    status: 'completed'
+  } as const;
+
+  it('holds the stream open with pings while a slow tool runs, then streams its output', async () => {
+    let releaseTool!: () => void;
+    const toolGate = new Promise<void>((resolve) => {
+      releaseTool = resolve;
+    });
+
+    const collected: Array<Record<string, unknown>> = [];
+    const frames: string[] = [];
+    const consume = (async () => {
+      for await (const frame of streamInternalVirtualToolCalls({
+        runtime: createRuntime(async () => {
+          await toolGate;
+          return { content: [{ type: 'text', text: 'INVOICE #4417' }] };
+        }),
+        profile,
+        toolOwners: new Map([
+          ['vision_understand', { visibility: 'internal' as const, source: 'profile' as const }]
+        ]),
+        multimodalReferences: [],
+        relay: createRelay(),
+        calls: [call],
+        collected: collected as never,
+        keepAliveIntervalMs: 10
+      })) {
+        frames.push(frame);
+        // Release on any two frames, not just pings: a keep-alive that came out in the
+        // wrong shape should fail the assertion below, not hang the test.
+        if (frames.length >= 2) {
+          releaseTool();
+        }
+      }
+    })();
+
+    await consume;
+
+    const pings = frames.filter((frame) => frame.includes('event: ping'));
+    // Without these the socket sits idle for the whole tool call, which is what makes a
+    // multi-minute vision call look like a dead stream.
+    expect(pings.length).toBeGreaterThanOrEqual(2);
+
+    const body = frames.join('');
+    // The MCP envelope is unwrapped, and the result reaches the client as it lands
+    // rather than waiting for the loop's next upstream turn.
+    expect(body).toContain('"type":"text_delta"');
+    expect(body).toContain('INVOICE #4417');
+    expect(body).not.toContain('"content":[{"type":"text"');
+    expect(body).toContain('[vision_understand]');
+
+    // The result is still handed back for the tool loop to send upstream.
+    expect(collected).toHaveLength(1);
+    expect(collected[0]).toMatchObject({ type: 'tool_result', tool_use_id: 'call_vision_1' });
+  });
+
+  it('collects the result without streaming it when the profile does not fold', async () => {
+    const collected: Array<Record<string, unknown>> = [];
+    const frames: string[] = [];
+    for await (const frame of streamInternalVirtualToolCalls({
+      runtime: createRuntime(async () => ({ content: [{ type: 'text', text: 'INVOICE #4417' }] })),
+      profile: {
+        ...profile,
+        execution: { ...profile.execution, foldInternalResults: false }
+      },
+      toolOwners: new Map([
+        ['vision_understand', { visibility: 'internal' as const, source: 'profile' as const }]
+      ]),
+      multimodalReferences: [],
+      relay: createRelay(),
+      calls: [call],
+      collected: collected as never,
+      keepAliveIntervalMs: 10
+    })) {
+      frames.push(frame);
+    }
+
+    expect(frames.join('')).not.toContain('INVOICE #4417');
+    expect(collected).toHaveLength(1);
+  });
+
+  it('reports a failing tool to the client instead of going quiet', async () => {
+    const collected: Array<Record<string, unknown>> = [];
+    const frames: string[] = [];
+    for await (const frame of streamInternalVirtualToolCalls({
+      runtime: createRuntime(async () => {
+        throw new Error('vision upstream refused the image');
+      }),
+      profile,
+      toolOwners: new Map([
+        ['vision_understand', { visibility: 'internal' as const, source: 'profile' as const }]
+      ]),
+      multimodalReferences: [],
+      relay: createRelay(),
+      calls: [call],
+      collected: collected as never,
+      keepAliveIntervalMs: 10
+    })) {
+      frames.push(frame);
+    }
+
+    expect(frames.join('')).toContain('vision upstream refused the image');
+    expect(collected[0]).toMatchObject({ is_error: true });
   });
 });
 

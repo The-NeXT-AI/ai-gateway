@@ -54,11 +54,14 @@ import {
   collectOpenAINonStreamPayloadFromEventStream,
   createOptimisticOpenAIChatStreamRelay,
   finalizeOptimisticOpenAIChatStreamRelay,
+  type OptimisticOpenAIChatRelay,
   type OptimisticOpenAIChatStreamTurnResult,
+  optimisticStreamKeepAliveFrame,
   relayOptimisticAnthropicDeferredContent,
   relayOptimisticAnthropicMessagesStreamTurn,
   relayOptimisticOpenAIChatStreamToolCalls,
   relayOptimisticOpenAIChatStreamTurn,
+  relayOptimisticStreamText,
   relayConvertedStreamFromStandardResponse,
   relayConvertedStreamFromUpstreamResponse
 } from './streaming-conversion';
@@ -207,7 +210,7 @@ type TransparentToolResolution =
     }
   | {
       ok: true;
-      executableCalls: [];
+      executableCalls: StandardResponseFunctionCall[];
       bindings: Map<string, TransparentToolBinding>;
       returnToClient: true;
     };
@@ -1649,11 +1652,46 @@ async function runTransparentToolExecutionLoop(input: {
     }
 
     if ('returnToClient' in toolResolution) {
+      // The turn mixes gateway-owned tools with client-owned ones. The client cannot
+      // produce a tool_result for a tool it never declared, and the gateway cannot
+      // continue the loop without the client's result, so the turn must go back. Run
+      // the gateway-owned calls first and fold their output into the assistant message
+      // as text: that keeps the result in the conversation the client stores, so it
+      // survives into later turns instead of being silently discarded.
+      let responseForClient = lastResponse;
+      if (
+        toolResolution.executableCalls.length > 0 &&
+        internalToolCallsFitBudget(
+          executedToolCalls,
+          toolResolution.executableCalls.length,
+          executionConfig.maxToolCalls
+        )
+      ) {
+        executedToolCalls += toolResolution.executableCalls.length;
+        const internalResults = await executeTransparentToolCalls(
+          input.runtime,
+          input.source,
+          input.targetProvider,
+          input.targetProviderConfig,
+          toolResolution.executableCalls,
+          toolResolution.bindings
+        );
+        aggregatedUsage = addServerToolUseToStandardUsage(
+          aggregatedUsage,
+          countTransparentWebSearchToolCalls(toolResolution.executableCalls, toolResolution.bindings)
+        );
+        responseForClient = foldInternalToolResultsIntoResponse(
+          lastResponse,
+          toolResolution.executableCalls,
+          internalResults
+        );
+      }
+
       return {
         ok: true,
         standardRequest: workingRequest,
         standardResponse: {
-          ...lastResponse,
+          ...responseForClient,
           usage: aggregatedUsage
         },
         upstreamRequest: lastUpstreamRequest,
@@ -2156,6 +2194,12 @@ async function handleVirtualModelRequest(
       model
     };
     let aggregatedUsage: StandardUsage = {};
+      // Internal tools run inside this loop, so the client never sees their
+      // tool_use/tool_result pair. Keep their output here and fold it into the
+      // reply — otherwise the work only survives if the model happens to restate
+      // it, which is exactly how a later turn ends up blind to what was read.
+      const internalCallsRun: StandardResponseFunctionCall[] = [];
+      const internalResultsRun: StandardRequestInputContent[] = [];
     let internalToolCalls = 0;
     let lastUpstreamRequest: UpstreamRequest | undefined;
     let lastResponse: StandardResponse | undefined;
@@ -2501,10 +2545,15 @@ async function handleVirtualModelRequest(
           targetProviderConfig,
           attempts.length,
           lastAttemptSequence,
-        filterInternalToolCallsFromStandardResponse(
-          lastResponse,
-          mergedToolingResult.toolOwners,
-          aggregatedUsage
+        maybeFoldInternalToolResults(
+          virtualModel.profile,
+          filterInternalToolCallsFromStandardResponse(
+            lastResponse,
+            mergedToolingResult.toolOwners,
+            aggregatedUsage
+          ),
+          internalCallsRun,
+          internalResultsRun
         ),
         isStreaming,
         model,
@@ -2514,6 +2563,37 @@ async function handleVirtualModelRequest(
       }
 
       if (callPartition.client.length > 0 || callPartition.unknown.length > 0) {
+        // The turn mixes internal tools with tools only the client can run. The client
+        // cannot answer a tool it never saw, and the loop cannot continue without the
+        // client's result, so the turn has to go back. Run the internal calls first and
+        // fold their output in as text: dropping them loses the work silently, and the
+        // model has no way to learn its call went nowhere. Without folding there is
+        // nowhere for the output to go — the calls are stripped and the loop returns —
+        // so running them would only burn an upstream call.
+        if (
+          callPartition.internal.length > 0 &&
+          virtualModel.profile.execution.foldInternalResults &&
+          internalToolCallsFitBudget(
+            internalToolCalls,
+            callPartition.internal.length,
+            virtualModel.profile.execution.maxToolCalls
+          )
+        ) {
+          internalToolCalls += callPartition.internal.length;
+          const mixedResults = await executeInternalVirtualToolCalls(
+            runtime,
+            virtualModel.profile,
+            callPartition.internal,
+            mergedToolingResult.toolOwners,
+            multimodalRewrite.references
+          );
+          aggregatedUsage = addServerToolUseToStandardUsage(
+            aggregatedUsage,
+            countInternalWebSearchToolCalls(virtualModel.profile, callPartition.internal)
+          );
+          internalCallsRun.push(...callPartition.internal);
+          internalResultsRun.push(...mixedResults);
+        }
         return sendVirtualModelResponse(
           reply,
           request,
@@ -2524,10 +2604,15 @@ async function handleVirtualModelRequest(
           targetProviderConfig,
           attempts.length,
           lastAttemptSequence,
-        filterInternalToolCallsFromStandardResponse(
-          lastResponse,
-          mergedToolingResult.toolOwners,
-          aggregatedUsage
+        maybeFoldInternalToolResults(
+          virtualModel.profile,
+          filterInternalToolCallsFromStandardResponse(
+            lastResponse,
+            mergedToolingResult.toolOwners,
+            aggregatedUsage
+          ),
+          internalCallsRun,
+          internalResultsRun
         ),
         isStreaming,
         model,
@@ -2558,6 +2643,8 @@ async function handleVirtualModelRequest(
         mergedToolingResult.toolOwners,
         multimodalRewrite.references
       );
+      internalCallsRun.push(...callPartition.internal);
+      internalResultsRun.push(...toolResults);
       aggregatedUsage = addServerToolUseToStandardUsage(
         aggregatedUsage,
         countInternalWebSearchToolCalls(virtualModel.profile, callPartition.internal)
@@ -3777,6 +3864,34 @@ async function* runOptimisticVirtualModelStream(input: {
       if (callPartition.client.length > 0 || callPartition.unknown.length > 0) {
         // Client-owned calls take precedence for a mixed turn: the gateway cannot
         // continue an internal tool loop until the client has supplied its results.
+        // The internal calls still run first when their output can be surfaced —
+        // dropping them unrun would silently discard the work and leave the model
+        // believing its call went nowhere.
+        if (
+          callPartition.internal.length > 0 &&
+          input.virtualModel.profile.execution.foldInternalResults &&
+          internalToolCallsFitBudget(
+            internalToolCalls,
+            callPartition.internal.length,
+            input.virtualModel.profile.execution.maxToolCalls
+          )
+        ) {
+          internalToolCalls += callPartition.internal.length;
+          const mixedResults: StandardRequestInputContent[] = [];
+          yield* streamInternalVirtualToolCalls({
+            runtime: input.runtime,
+            profile: input.virtualModel.profile,
+            toolOwners: input.mergedToolingResult.toolOwners,
+            multimodalReferences: input.multimodalReferences,
+            relay,
+            calls: callPartition.internal,
+            collected: mixedResults
+          });
+          aggregatedUsage = addServerToolUseToStandardUsage(
+            aggregatedUsage,
+            countInternalWebSearchToolCalls(input.virtualModel.profile, callPartition.internal)
+          );
+        }
         const finalResponse = filterInternalToolCallsFromStandardResponse(
           lastResponse,
           input.mergedToolingResult.toolOwners,
@@ -3838,13 +3953,16 @@ async function* runOptimisticVirtualModelStream(input: {
         return;
       }
 
-      const toolResults = await executeInternalVirtualToolCalls(
-        input.runtime,
-        input.virtualModel.profile,
-        callPartition.internal,
-        input.mergedToolingResult.toolOwners,
-        input.multimodalReferences
-      );
+      const toolResults: StandardRequestInputContent[] = [];
+      yield* streamInternalVirtualToolCalls({
+        runtime: input.runtime,
+        profile: input.virtualModel.profile,
+        toolOwners: input.mergedToolingResult.toolOwners,
+        multimodalReferences: input.multimodalReferences,
+        relay,
+        calls: callPartition.internal,
+        collected: toolResults
+      });
       aggregatedUsage = addServerToolUseToStandardUsage(
         aggregatedUsage,
         countInternalWebSearchToolCalls(input.virtualModel.profile, callPartition.internal)
@@ -4312,6 +4430,22 @@ function extractFunctionCallsFromStandardResponse(
   );
 }
 
+/**
+ * A mixed turn ends the loop — it has to go back for the client's tool result — so its
+ * gateway-owned calls are the last ones this request will run. They still spend the same
+ * budget as any other turn's calls: run the batch only when it fits under `maxToolCalls`,
+ * otherwise the configured bound stops holding on exactly the path that mixes client and
+ * gateway tools. Over budget the calls are skipped and the turn goes back unchanged,
+ * rather than failing a turn the client can still act on.
+ */
+function internalToolCallsFitBudget(
+  spentToolCalls: number,
+  pendingToolCalls: number,
+  maxToolCalls: number
+): boolean {
+  return spentToolCalls + pendingToolCalls <= maxToolCalls;
+}
+
 function partitionVirtualFunctionCalls(
   toolCalls: StandardResponseFunctionCall[],
   toolOwners: Map<string, VirtualToolOwner>
@@ -4432,23 +4566,37 @@ async function resolveTransparentToolCalls(
   const bindings = new Map<string, TransparentToolBinding>();
   const executableCalls: StandardResponseFunctionCall[] = [];
 
+  const unknownToolPolicy = executionConfig?.unknownToolPolicy || 'return_to_client';
+  let hasClientOwnedCall = false;
+
   for (const toolCall of toolCalls) {
     if (
       executionConfig?.requireClientDeclaration !== false &&
       !declaredToolNames.has(toolCall.name)
     ) {
-      return handleTransparentUnknownTool(
-        executionConfig?.unknownToolPolicy || 'return_to_client',
-        `Transparent tool execution cannot run undeclared tool: ${toolCall.name}`
-      );
+      if (unknownToolPolicy === 'fail') {
+        return handleTransparentUnknownTool(
+          unknownToolPolicy,
+          `Transparent tool execution cannot run undeclared tool: ${toolCall.name}`
+        );
+      }
+      hasClientOwnedCall = true;
+      continue;
     }
 
     const resolvedTool = resolveRuntimeToolDefinition(toolCall.name, definitions);
     if (!resolvedTool) {
-      return handleTransparentUnknownTool(
-        executionConfig?.unknownToolPolicy || 'return_to_client',
-        `Transparent tool is not available from MCP provider: ${toolCall.name}`
-      );
+      if (unknownToolPolicy === 'fail') {
+        return handleTransparentUnknownTool(
+          unknownToolPolicy,
+          `Transparent tool is not available from MCP provider: ${toolCall.name}`
+        );
+      }
+      // A tool the client owns (it declared it, the gateway cannot run it). The turn has
+      // to go back so the client can execute it, but any gateway-owned call in the same
+      // turn is still run below and folded into the response as text.
+      hasClientOwnedCall = true;
+      continue;
     }
 
     if ('error' in resolvedTool) {
@@ -4484,11 +4632,225 @@ async function resolveTransparentToolCalls(
     executableCalls.push(toolCall);
   }
 
+  if (hasClientOwnedCall) {
+    return {
+      ok: true,
+      executableCalls,
+      bindings,
+      returnToClient: true
+    };
+  }
+
   return {
     ok: true,
     executableCalls,
     bindings
   };
+}
+
+/**
+ * Drop the gateway-owned function calls from a response and append their results as
+ * assistant text instead.
+ *
+ * The client never declared these tools, so forwarding the calls would be meaningless
+ * to it and dropping them outright would lose the work. Rendering the results as text
+ * keeps them in the transcript the client stores and replays, so later turns can use
+ * them without re-running the tool.
+ */
+/**
+ * MCP tool output arrives as a serialized `{content: [{type, text}]}` envelope. This
+ * text is going into the transcript a person reads, so unwrap it to the text parts
+ * when it has that shape and leave anything else untouched.
+ */
+function readableToolOutput(raw: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+  if (!isObject(parsed) || !Array.isArray(parsed.content)) {
+    return raw;
+  }
+  const parts: string[] = [];
+  for (const item of parsed.content) {
+    if (isObject(item) && item.type === 'text' && typeof item.text === 'string' && item.text.trim()) {
+      parts.push(item.text.trim());
+    }
+  }
+  return parts.length > 0 ? parts.join('\n\n') : raw;
+}
+
+function maybeFoldInternalToolResults(
+  profile: VirtualModelProfileConfig,
+  response: StandardResponse,
+  calls: StandardResponseFunctionCall[],
+  results: StandardRequestInputContent[]
+): StandardResponse {
+  if (!profile.execution.foldInternalResults || calls.length === 0) {
+    return response;
+  }
+  return foldInternalToolResultsIntoResponse(response, calls, results);
+}
+
+/**
+ * Render executed gateway-owned tool calls as the assistant text a person reads.
+ *
+ * Shared by the buffered path, which folds this into the finished response, and the
+ * streaming path, which emits it the moment each call returns.
+ */
+function renderInternalToolResultsText(
+  executedCalls: StandardResponseFunctionCall[],
+  results: StandardRequestInputContent[]
+): string | undefined {
+  const texts: string[] = [];
+  for (const result of results) {
+    if (result.type !== 'tool_result' || typeof result.content !== 'string' || !result.content.trim()) {
+      continue;
+    }
+    texts.push(readableToolOutput(result.content.trim()));
+  }
+  if (texts.length === 0) {
+    return undefined;
+  }
+
+  const executedNames = executedCalls.map((call) => call.name);
+  const label = executedNames.length === 1 ? executedNames[0] : executedNames.join(', ');
+  return `[${label}]\n${texts.join('\n\n')}`;
+}
+
+function foldInternalToolResultsIntoResponse(
+  response: StandardResponse,
+  executedCalls: StandardResponseFunctionCall[],
+  results: StandardRequestInputContent[]
+): StandardResponse {
+  const executedIds = new Set(executedCalls.map((call) => call.call_id || call.id));
+  const text = renderInternalToolResultsText(executedCalls, results);
+
+  if (text === undefined) {
+    // Nothing usable came back; still strip the calls so the client is not handed a
+    // tool_use it cannot answer.
+    return {
+      ...response,
+      output: response.output.filter(
+        (item) => item.type !== 'function_call' || !executedIds.has(item.call_id || item.id)
+      )
+    };
+  }
+
+  const output = response.output.filter(
+    (item) => item.type !== 'function_call' || !executedIds.has(item.call_id || item.id)
+  );
+
+  return {
+    ...response,
+    output: [
+      {
+        type: 'message',
+        id: `msg_${randomUUID()}`,
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text, annotations: [] }]
+      },
+      ...output
+    ],
+    output_text: response.output_text ? `${response.output_text}\n\n${text}` : text
+  };
+}
+
+/**
+ * How long the stream may go quiet while a gateway-owned tool runs before a keep-alive
+ * frame goes out. Well under the 60s idle timeout common to proxies and HTTP clients.
+ */
+const INTERNAL_TOOL_STREAM_KEEP_ALIVE_MS = 10_000;
+
+/**
+ * Run gateway-owned tool calls inside a live stream, one at a time.
+ *
+ * The buffered path can afford to run every call and fold the output into the finished
+ * response. A stream cannot: a vision or search call holds the turn for minutes, and a
+ * client that sees no bytes in that window times out and loses the whole turn. So each
+ * call keeps the connection warm while it runs, and its output goes out as assistant
+ * text the moment it lands rather than waiting for the loop to come back around.
+ */
+export async function* streamInternalVirtualToolCalls(input: {
+  runtime: GatewayRuntime;
+  profile: VirtualModelProfileConfig;
+  toolOwners: Map<string, VirtualToolOwner>;
+  multimodalReferences: VirtualMultimodalReference[];
+  relay: OptimisticOpenAIChatRelay;
+  calls: StandardResponseFunctionCall[];
+  collected: StandardRequestInputContent[];
+  keepAliveIntervalMs?: number;
+}): AsyncGenerator<string> {
+  const keepAliveFrame = optimisticStreamKeepAliveFrame(input.relay);
+  const keepAliveIntervalMs = input.keepAliveIntervalMs ?? INTERNAL_TOOL_STREAM_KEEP_ALIVE_MS;
+
+  for (const call of input.calls) {
+    const pending = executeInternalVirtualToolCalls(
+      input.runtime,
+      input.profile,
+      [call],
+      input.toolOwners,
+      input.multimodalReferences
+    );
+    yield* keepAliveWhilePending(pending, keepAliveFrame, keepAliveIntervalMs);
+
+    const results = await pending;
+    input.collected.push(...results);
+    if (!input.profile.execution.foldInternalResults) {
+      continue;
+    }
+
+    const text = renderInternalToolResultsText([call], results);
+    if (text) {
+      yield* relayOptimisticStreamText(input.relay, `${text}\n\n`);
+    }
+  }
+}
+
+/**
+ * Yield `frame` every `intervalMs` until `pending` settles. Yields nothing if it settles
+ * first, so a fast tool adds no frames at all.
+ */
+export async function* keepAliveWhilePending(
+  pending: Promise<unknown>,
+  frame: string,
+  intervalMs: number
+): AsyncGenerator<string> {
+  if (!frame || intervalMs <= 0) {
+    return;
+  }
+
+  let settled = false;
+  // The caller awaits `pending` itself; this derived promise only tracks completion, so
+  // swallowing the rejection here is right — it would otherwise look unhandled.
+  const settledPromise = pending.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    }
+  );
+
+  while (!settled) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      settledPromise.then(() => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), intervalMs);
+      })
+    ]);
+    if (timer) {
+      clearTimeout(timer);
+    }
+    if (!timedOut || settled) {
+      return;
+    }
+
+    yield frame;
+  }
 }
 
 function handleTransparentUnknownTool(

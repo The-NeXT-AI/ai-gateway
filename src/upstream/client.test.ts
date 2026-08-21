@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const undiciMock = vi.hoisted(() => ({
   dispatch: vi.fn(() => true),
+  fetch: vi.fn((input: string | URL | Request, init?: RequestInit) => globalThis.fetch(input, init)),
   proxyAgentInputs: [] as unknown[],
   proxyDispatch: vi.fn(() => true),
   getGlobalDispatcher: vi.fn()
@@ -60,6 +61,7 @@ vi.mock('undici', () => ({
       return Promise.resolve();
     }
   },
+  fetch: undiciMock.fetch,
   getGlobalDispatcher: undiciMock.getGlobalDispatcher
 }));
 
@@ -93,6 +95,7 @@ describe('callUpstream', () => {
   beforeEach(() => {
     clearProxyEnv();
     undiciMock.dispatch.mockClear();
+    undiciMock.fetch.mockClear();
     undiciMock.proxyAgentInputs.length = 0;
     undiciMock.proxyDispatch.mockClear();
     undiciMock.getGlobalDispatcher.mockReset();
@@ -171,14 +174,13 @@ describe('callUpstream', () => {
     }
   });
 
-  it('passes timeout-aware dispatchers to upstream fetch', async () => {
+  it('uses undici fetch for dispatcher-carrying requests', async () => {
     const originalFetch = global.fetch;
 
     try {
-      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
-        new Response('{}', { status: 200 })
-      );
-      global.fetch = fetchMock as typeof fetch;
+      const globalFetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+      global.fetch = globalFetchMock as typeof fetch;
+      undiciMock.fetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
 
       const response = await callUpstream(
         'https://example.test/v1/responses',
@@ -187,9 +189,11 @@ describe('callUpstream', () => {
         600000
       );
 
-      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+      const fetchInit = undiciMock.fetch.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
 
       expect(response.status).toBe(200);
+      expect(undiciMock.fetch).toHaveBeenCalledTimes(1);
+      expect(globalFetchMock).not.toHaveBeenCalled();
       expect(fetchInit?.dispatcher).toBeTruthy();
     } finally {
       global.fetch = originalFetch;
@@ -486,6 +490,7 @@ describe('callUpstream', () => {
 
       expect(response.status).toBe(200);
       expect(fetchInit?.dispatcher).toBeUndefined();
+      expect(undiciMock.fetch).not.toHaveBeenCalled();
       expect(undiciMock.getGlobalDispatcher).not.toHaveBeenCalled();
     } finally {
       global.fetch = originalFetch;

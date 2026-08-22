@@ -7496,7 +7496,7 @@ function findProviderConfigByName(
   return providers.find((item) => item.name.trim().toLowerCase() === normalized);
 }
 
-function overrideUpstreamBaseUrl(
+export function overrideUpstreamBaseUrl(
   url: string,
   overriddenBaseUrl: string,
   provider: Provider,
@@ -7507,19 +7507,55 @@ function overrideUpstreamBaseUrl(
     return url;
   }
 
-  if (url.startsWith(defaultBaseUrl)) {
-    return `${overriddenBaseUrl}${url.slice(defaultBaseUrl.length)}`;
+  // The conversion-path adapters already build the URL from the target
+  // provider's own base URL. Prepending the base path again would double it
+  // (e.g. /anthropic/anthropic/v1/messages), so leave it untouched. This must
+  // run before the default-base rewrite: when the default base is a parent of
+  // the override base (e.g. https://host vs https://host/anthropic), the
+  // rewrite below would also match provider-specific URLs and double them.
+  const normalizedOverrideBase = trimRightSlash(overriddenBaseUrl);
+  if (urlMatchesBase(url, normalizedOverrideBase)) {
+    return url;
+  }
+
+  const normalizedDefaultBase = trimRightSlash(defaultBaseUrl);
+  if (url === normalizedDefaultBase || url.startsWith(`${normalizedDefaultBase}/`)) {
+    return `${normalizedOverrideBase}${url.slice(normalizedDefaultBase.length)}`;
   }
 
   try {
     const parsedUrl = new URL(url);
-    const parsedOverrideBase = new URL(overriddenBaseUrl);
+    const parsedOverrideBase = new URL(normalizedOverrideBase);
     const overridePath = trimRightSlash(parsedOverrideBase.pathname);
     parsedOverrideBase.pathname = `${overridePath}${parsedUrl.pathname}`;
     parsedOverrideBase.search = parsedUrl.search;
     return parsedOverrideBase.toString();
   } catch {
     return url;
+  }
+}
+
+// Compares on URL origin plus path-segment boundary, so neither a host prefix
+// ("https://host.evil.com") nor a path prefix ("https://host/anthropic2")
+// counts as a match for a base of "https://host" or "https://host/anthropic".
+function urlMatchesBase(url: string, baseUrl: string): boolean {
+  try {
+    const parsedUrl = new URL(url);
+    const parsedBase = new URL(baseUrl);
+    if (parsedUrl.origin !== parsedBase.origin) {
+      return false;
+    }
+
+    const basePath = trimRightSlash(parsedBase.pathname);
+    if (!basePath) {
+      return true;
+    }
+
+    const urlPath = trimRightSlash(parsedUrl.pathname);
+    return urlPath === basePath || urlPath.startsWith(`${basePath}/`);
+  } catch {
+    const normalizedBase = trimRightSlash(baseUrl);
+    return url === normalizedBase || url.startsWith(`${normalizedBase}/`);
   }
 }
 

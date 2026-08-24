@@ -2576,10 +2576,6 @@ function parseConfiguredModelReferenceProvider(
     return undefined;
   }
 
-  if (provider === 'openai' || provider === 'anthropic' || provider === 'gemini') {
-    return provider;
-  }
-
   return providerConfigs.some((providerConfig) => providerFromProviderType(providerConfig.type) === provider)
     ? provider
     : undefined;

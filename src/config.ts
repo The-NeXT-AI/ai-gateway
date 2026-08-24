@@ -1002,6 +1002,8 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
       readString(jsonConfig.anthropicApiKey),
     geminiApiKey:
       readString(process.env.GEMINI_API_KEY) ||
+      readString(process.env.GOOGLE_AI_KEY) ||
+      readString(process.env.GOOGLE_API_KEY) ||
       geminiProviderConfig?.apikey ||
       readString(jsonConfig.geminiApiKey),
     openaiBaseUrl: trimTrailingSlash(

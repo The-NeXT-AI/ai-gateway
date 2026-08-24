@@ -227,6 +227,42 @@ describe('buildGeminiUrl', () => {
 
     expect(result.value).toBe('https://mock.local/v1beta/models/gemini-2.5-pro:generateContent?alt=sse&key=sk-test');
   });
+
+  it('falls back to GOOGLE_AI_KEY env var when no geminiApiKey is configured', () => {
+    const previous = process.env.GOOGLE_AI_KEY;
+    delete process.env.GEMINI_API_KEY;
+    process.env.GOOGLE_AI_KEY = 'env-google-ai-key';
+
+    try {
+      const result = buildGeminiUrl(
+        {
+          url: '/v1beta/models/gemini-2.5-flash:generateContent',
+          headers: {}
+        } as never,
+        'gemini-2.5-flash',
+        'generateContent',
+        'v1beta',
+        {
+          geminiBaseUrl: 'https://mock.local'
+        } as never
+      );
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.value).toBe(
+        'https://mock.local/v1beta/models/gemini-2.5-flash:generateContent?key=env-google-ai-key'
+      );
+    } finally {
+      if (previous === undefined) {
+        delete process.env.GOOGLE_AI_KEY;
+      } else {
+        process.env.GOOGLE_AI_KEY = previous;
+      }
+    }
+  });
 });
 
 describe('normalizeOpenAIResponsesUsage', () => {

@@ -145,7 +145,7 @@ function buildHealthCheckRequest(
     };
   }
 
-  const apiKey = providerConfig.apikey || config.geminiApiKey || process.env.GEMINI_API_KEY;
+  const apiKey = providerConfig.apikey || config.geminiApiKey || process.env.GEMINI_API_KEY || process.env.GOOGLE_AI_KEY || process.env.GOOGLE_API_KEY;
   if (!apiKey) {
     return { ok: false, error: 'GEMINI_API_KEY is missing.' };
   }

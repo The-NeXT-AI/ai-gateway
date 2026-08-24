@@ -9,6 +9,10 @@ type OpenAIHeaderBuildConfig = Pick<GatewayConfig, 'openaiApiKey' | 'auth'> & {
   allowEnvApiKeyFallback?: boolean;
 };
 
+export function geminiApiKeyFromEnv(): string | undefined {
+  return process.env.GEMINI_API_KEY ?? process.env.GOOGLE_AI_KEY ?? process.env.GOOGLE_API_KEY;
+}
+
 export function buildOpenAIHeaders(
   headers: HeaderBag,
   config: OpenAIHeaderBuildConfig
@@ -97,7 +101,7 @@ export function buildGeminiUrl(
   const query = new URLSearchParams();
 
   const keyFromQuery = incomingQuery.get('key');
-  const key = keyFromQuery || config.geminiApiKey || process.env.GEMINI_API_KEY;
+  const key = keyFromQuery || config.geminiApiKey || geminiApiKeyFromEnv();
   if (!key) {
     return err('GEMINI_API_KEY is missing.');
   }
@@ -124,7 +128,7 @@ export function buildGeminiInteractionsUrl(
   const query = new URLSearchParams();
 
   const keyFromQuery = incomingQuery.get('key');
-  const key = keyFromQuery || config.geminiApiKey || process.env.GEMINI_API_KEY;
+  const key = keyFromQuery || config.geminiApiKey || geminiApiKeyFromEnv();
   if (!key) {
     return err('GEMINI_API_KEY is missing.');
   }

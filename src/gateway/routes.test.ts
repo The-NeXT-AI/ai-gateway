@@ -11573,6 +11573,57 @@ export function createGatewayPlugin() {
       await app.close();
     }
   });
+
+  it('routes a google/gemini- model selector to the configured provider when no gemini provider is configured', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          object: 'chat.completion',
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: 'Hello' },
+              finish_reason: 'stop'
+            }
+          ]
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([
+        createProviderConfig('openrouter-main', 'openai_chat_completions', ['google/gemini-3.5-flash'])
+      ]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'x-target-provider': 'openrouter-main'
+        },
+        payload: {
+          model: 'google/gemini-3.5-flash',
+          max_tokens: 1024,
+          messages: [{ role: 'user', content: 'reply OK' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 function createConfig(

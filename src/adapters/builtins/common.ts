@@ -5,6 +5,23 @@ import { asNumber, isObject, readBearerToken, readFirstNonEmptyString, readHeade
 
 const defaultAnthropicVersion = '2023-06-01';
 const geminiPassthroughQueryParams = new Set(['alt', 'fields', 'prettyPrint', 'quotaUser', 'userIp']);
+const openAIPassthroughHeaderAllowlist = new Set([
+  'accept',
+  'accept-language',
+  'idempotency-key',
+  'openai-beta',
+  'openai-organization',
+  'openai-project',
+  'originator',
+  'sec-fetch-mode',
+  'session-id',
+  'thread-id',
+  'user-agent',
+  'x-client-request-id',
+  'x-codex-beta-features',
+  'x-codex-turn-metadata',
+  'x-codex-window-id'
+]);
 type OpenAIHeaderBuildConfig = Pick<GatewayConfig, 'openaiApiKey' | 'auth'> & {
   allowEnvApiKeyFallback?: boolean;
 };
@@ -13,21 +30,14 @@ export function buildOpenAIHeaders(
   headers: HeaderBag,
   config: OpenAIHeaderBuildConfig
 ): Result<Record<string, string>> {
-  const bearer = readBearerToken(readHeader(headers.authorization));
-  const fromApiKeyHeader = readHeader(headers['x-api-key']) || readHeader(headers['api-key']);
-  const managedApiKey =
-    config.openaiApiKey || (config.allowEnvApiKeyFallback === false ? undefined : process.env.OPENAI_API_KEY);
-  const shouldPreferManaged = shouldPreferManagedCredential(config);
-  const apiKey = shouldPreferManaged
-    ? managedApiKey || bearer || fromApiKeyHeader
-    : bearer || fromApiKeyHeader || managedApiKey;
-  if (!apiKey) {
-    return err('OPENAI_API_KEY is missing.');
+  const apiKeyResult = resolveOpenAIApiKey(headers, config);
+  if (!apiKeyResult.ok) {
+    return apiKeyResult;
   }
 
   const mapped: Record<string, string> = {
     'content-type': 'application/json',
-    authorization: `Bearer ${apiKey}`
+    authorization: `Bearer ${apiKeyResult.value}`
   };
 
   const organization = readHeader(headers['openai-organization']);
@@ -41,6 +51,71 @@ export function buildOpenAIHeaders(
   }
 
   return ok(mapped);
+}
+
+export function buildOpenAIPassthroughHeaders(
+  headers: HeaderBag,
+  config: OpenAIHeaderBuildConfig
+): Result<Record<string, string>> {
+  const apiKeyResult = resolveOpenAIApiKey(headers, config);
+  if (!apiKeyResult.ok) {
+    return apiKeyResult;
+  }
+
+  const mapped: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    const normalizedKey = key.trim().toLowerCase();
+    if (!openAIPassthroughHeaderAllowlist.has(normalizedKey)) {
+      continue;
+    }
+
+    const headerValue = stringifyHeaderValue(value);
+    if (headerValue) {
+      mapped[normalizedKey] = headerValue;
+    }
+  }
+
+  mapped['content-type'] = 'application/json';
+  mapped.authorization = `Bearer ${apiKeyResult.value}`;
+  return ok(mapped);
+}
+
+function resolveOpenAIApiKey(
+  headers: HeaderBag,
+  config: OpenAIHeaderBuildConfig
+): Result<string> {
+  const bearer = readBearerToken(readHeader(headers.authorization));
+  const fromApiKeyHeader = readHeader(headers['x-api-key']) || readHeader(headers['api-key']);
+  const managedApiKey =
+    config.openaiApiKey || (config.allowEnvApiKeyFallback === false ? undefined : process.env.OPENAI_API_KEY);
+  const shouldPreferManaged = shouldPreferManagedCredential(config);
+  const apiKey = shouldPreferManaged
+    ? managedApiKey || bearer || fromApiKeyHeader
+    : bearer || fromApiKeyHeader || managedApiKey;
+  if (!apiKey) {
+    return err('OPENAI_API_KEY is missing.');
+  }
+
+  return ok(apiKey);
+}
+
+function stringifyHeaderValue(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((item) => String(item).trim())
+      .filter(Boolean);
+    return parts.length > 0 ? parts.join(', ') : undefined;
+  }
+
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  return String(value);
 }
 
 export function buildAnthropicHeaders(

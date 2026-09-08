@@ -1,7 +1,7 @@
 import type { SourceAdapter } from '../../../types';
 import { ok } from '../../../types';
 import { asBoolean } from '../../../utils';
-import { buildOpenAIHeaders, normalizeOpenAIResponsesCompletedResponse } from '../common';
+import { buildOpenAIPassthroughHeaders, normalizeOpenAIResponsesCompletedResponse } from '../common';
 import { parseOpenAIResponsesRequest } from './parsers';
 import { addNamespaceFieldsToStandardResponse } from '../target/tools';
 
@@ -20,7 +20,7 @@ export const openAIResponsesSourceAdapter: SourceAdapter = {
     return asBoolean(input.body.stream) === true;
   },
   buildPassthroughRequest(input) {
-    const headersResult = buildOpenAIHeaders(input.request.headers, input.config);
+    const headersResult = buildOpenAIPassthroughHeaders(input.request.headers, input.config);
     if (!headersResult.ok) {
       return headersResult;
     }

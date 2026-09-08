@@ -1113,7 +1113,13 @@ export async function handleGatewayRequest(
           }
           continue;
         }
-        passthroughStreamResponse = streamHookResult.value;
+        passthroughStreamResponse = normalizeOpenAIResponsesPassthroughStreamTermination({
+          source,
+          targetProvider,
+          targetProviderConfig,
+          model: passthroughModel,
+          response: streamHookResult.value
+        });
         const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, passthroughStreamResponse);
         void tryPublishStreamingBillingEventFromUpstreamResponse(
           request,
@@ -10294,6 +10300,334 @@ function shouldForceEventStreamHeaders(source: GatewaySourceContext, streaming: 
   }
 
   return source.adapterKey === 'openai_responses' || source.adapterKey === 'openai_chat';
+}
+
+interface OpenAIResponsesPassthroughStreamError {
+  code?: string;
+  message: string;
+  type?: string;
+}
+
+interface OpenAIResponsesPassthroughStreamState {
+  completed: boolean;
+  done: boolean;
+  error?: OpenAIResponsesPassthroughStreamError;
+  outputItems: Record<string, unknown>[];
+  pending: string;
+  responseId?: string;
+  responseModel?: string;
+  syntheticCompletionSent: boolean;
+}
+
+function normalizeOpenAIResponsesPassthroughStreamTermination(input: {
+  source: GatewaySourceContext;
+  targetProvider: Provider;
+  targetProviderConfig?: ProviderConfig;
+  model?: string;
+  response: Response;
+}): Response {
+  if (
+    input.source.adapterKey !== 'openai_responses' ||
+    input.targetProvider !== 'openai' ||
+    input.targetProviderConfig?.type !== 'openai_responses' ||
+    !input.response.body ||
+    !isEventStreamResponse(input.response)
+  ) {
+    return input.response;
+  }
+
+  const reader = input.response.body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const state: OpenAIResponsesPassthroughStreamState = {
+    completed: false,
+    done: false,
+    outputItems: [],
+    pending: '',
+    responseModel: input.model,
+    syntheticCompletionSent: false
+  };
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      void pumpOpenAIResponsesPassthroughStream(reader, decoder, encoder, controller, state);
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    }
+  });
+
+  return new Response(stream, {
+    status: input.response.status,
+    statusText: input.response.statusText,
+    headers: input.response.headers
+  });
+}
+
+async function pumpOpenAIResponsesPassthroughStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  decoder: TextDecoder,
+  encoder: TextEncoder,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  state: OpenAIResponsesPassthroughStreamState
+): Promise<void> {
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        break;
+      }
+      processOpenAIResponsesPassthroughSseText(decoder.decode(chunk.value, { stream: true }), encoder, controller, state);
+    }
+
+    const remaining = decoder.decode();
+    if (remaining) {
+      processOpenAIResponsesPassthroughSseText(remaining, encoder, controller, state);
+    }
+    flushOpenAIResponsesPassthroughPending(encoder, controller, state);
+    appendOpenAIResponsesSyntheticErrorCompletionIfNeeded(encoder, controller, state);
+    if (state.syntheticCompletionSent && !state.done) {
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+    }
+    controller.close();
+  } catch (error) {
+    if (state.error && !state.completed) {
+      appendOpenAIResponsesSyntheticErrorCompletionIfNeeded(encoder, controller, state);
+      if (state.syntheticCompletionSent && !state.done) {
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      }
+      controller.close();
+      return;
+    }
+    controller.error(error);
+  }
+}
+
+function processOpenAIResponsesPassthroughSseText(
+  text: string,
+  encoder: TextEncoder,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  state: OpenAIResponsesPassthroughStreamState
+): void {
+  state.pending += text;
+  while (true) {
+    const delimiter = findSseBlockDelimiter(state.pending);
+    if (!delimiter) {
+      return;
+    }
+
+    const block = state.pending.slice(0, delimiter.index);
+    const rawBlock = state.pending.slice(0, delimiter.index + delimiter.length);
+    state.pending = state.pending.slice(delimiter.index + delimiter.length);
+    relayOpenAIResponsesPassthroughSseBlock(block, rawBlock, encoder, controller, state);
+  }
+}
+
+function flushOpenAIResponsesPassthroughPending(
+  encoder: TextEncoder,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  state: OpenAIResponsesPassthroughStreamState
+): void {
+  if (!state.pending) {
+    return;
+  }
+
+  relayOpenAIResponsesPassthroughSseBlock(state.pending, state.pending, encoder, controller, state);
+  state.pending = '';
+}
+
+function relayOpenAIResponsesPassthroughSseBlock(
+  block: string,
+  rawBlock: string,
+  encoder: TextEncoder,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  state: OpenAIResponsesPassthroughStreamState
+): void {
+  const action = inspectOpenAIResponsesPassthroughSseBlock(block, state);
+  if (action.done) {
+    state.done = true;
+    appendOpenAIResponsesSyntheticErrorCompletionIfNeeded(encoder, controller, state);
+  }
+  if (!action.suppress) {
+    controller.enqueue(encoder.encode(rawBlock));
+  }
+}
+
+function inspectOpenAIResponsesPassthroughSseBlock(
+  block: string,
+  state: OpenAIResponsesPassthroughStreamState
+): { done: boolean; suppress: boolean } {
+  const parsed = parseSseBlock(block);
+  if (!parsed.data || parsed.data === '[DONE]') {
+    return { done: parsed.data === '[DONE]', suppress: false };
+  }
+
+  const payload = parseJsonObject(parsed.data);
+  if (!payload) {
+    if (isOpenAIResponsesErrorEventName(parsed.event)) {
+      state.error ??= {
+        message: parsed.data
+      };
+      return { done: false, suppress: true };
+    }
+    return { done: false, suppress: false };
+  }
+
+  const payloadType = asString(payload.type);
+  const eventType = payloadType || parsed.event;
+  const response = isObject(payload.response) ? payload.response : undefined;
+  if (response) {
+    state.responseId ??= asString(response.id);
+    state.responseModel ??= asString(response.model);
+  }
+
+  if (eventType === 'response.output_item.added' || eventType === 'response.output_item.done') {
+    const outputIndex = asNumber(payload.output_index);
+    const item = isObject(payload.item) ? payload.item : undefined;
+    if (outputIndex !== undefined && item) {
+      state.outputItems[Math.max(0, Math.trunc(outputIndex))] = item;
+    }
+  }
+
+  if (eventType === 'response.completed') {
+    state.completed = true;
+    return { done: false, suppress: false };
+  }
+
+  const error = extractOpenAIResponsesPassthroughStreamError(parsed.event, payload);
+  if (error) {
+    state.error ??= error;
+    return { done: false, suppress: true };
+  }
+
+  return { done: false, suppress: false };
+}
+
+function parseSseBlock(block: string): { data?: string; event?: string } {
+  const dataLines: string[] = [];
+  let event: string | undefined;
+  for (const rawLine of block.split(/\r?\n/)) {
+    if (!rawLine || rawLine.startsWith(':')) {
+      continue;
+    }
+    const separator = rawLine.indexOf(':');
+    const field = separator === -1 ? rawLine : rawLine.slice(0, separator);
+    const rawValue = separator === -1 ? '' : rawLine.slice(separator + 1);
+    const value = rawValue.startsWith(' ') ? rawValue.slice(1) : rawValue;
+    if (field === 'event') {
+      event = value.trim();
+    } else if (field === 'data') {
+      dataLines.push(value);
+    }
+  }
+
+  return {
+    event,
+    data: dataLines.length > 0 ? dataLines.join('\n').trim() : undefined
+  };
+}
+
+function findSseBlockDelimiter(text: string): { index: number; length: number } | undefined {
+  const candidates = [
+    { index: text.indexOf('\r\n\r\n'), length: 4 },
+    { index: text.indexOf('\n\n'), length: 2 },
+    { index: text.indexOf('\r\r'), length: 2 }
+  ].filter((candidate) => candidate.index >= 0);
+  if (candidates.length === 0) {
+    return undefined;
+  }
+  return candidates.reduce((first, candidate) => candidate.index < first.index ? candidate : first);
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return isObject(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractOpenAIResponsesPassthroughStreamError(
+  eventName: string | undefined,
+  payload: Record<string, unknown>
+): OpenAIResponsesPassthroughStreamError | undefined {
+  const payloadType = asString(payload.type)?.toLowerCase();
+  if (
+    !isOpenAIResponsesErrorEventName(eventName) &&
+    payloadType !== 'error' &&
+    payloadType !== 'response.failed' &&
+    payloadType !== 'response.error'
+  ) {
+    return undefined;
+  }
+
+  const response = isObject(payload.response) ? payload.response : undefined;
+  const source = isObject(payload.error)
+    ? payload.error
+    : isObject(response?.error)
+      ? response.error
+      : payload;
+  const message =
+    asString(source.message) ||
+    asString(source.detail) ||
+    asString(source.reason) ||
+    'Upstream Responses stream failed.';
+  return {
+    code: asString(source.code) || asString(payload.code),
+    message,
+    type: asString(source.type) || asString(payloadType) || asString(source.code) || asString(payload.code)
+  };
+}
+
+function isOpenAIResponsesErrorEventName(eventName: string | undefined): boolean {
+  const event = eventName?.trim().toLowerCase();
+  return event === 'error' || event === 'response.failed' || event === 'response.error';
+}
+
+function appendOpenAIResponsesSyntheticErrorCompletionIfNeeded(
+  encoder: TextEncoder,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  state: OpenAIResponsesPassthroughStreamState
+): void {
+  if (!state.error || state.completed || state.syntheticCompletionSent) {
+    return;
+  }
+
+  state.syntheticCompletionSent = true;
+  const responseId = state.responseId || `resp_gateway_error_${randomUUID().replaceAll('-', '')}`;
+  const messageId = `msg_gateway_error_${randomUUID().replaceAll('-', '')}`;
+  const errorLabel = state.error.code || state.error.type;
+  const visibleText = errorLabel
+    ? `Upstream error ${errorLabel}: ${state.error.message}`
+    : `Upstream error: ${state.error.message}`;
+  const message = {
+    id: messageId,
+    type: 'message',
+    role: 'assistant',
+    status: 'completed',
+    content: [
+      {
+        type: 'output_text',
+        text: visibleText
+      }
+    ]
+  };
+  const response = {
+    id: responseId,
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    status: 'completed',
+    model: state.responseModel || 'unknown',
+    output_text: visibleText,
+    output: [...state.outputItems.filter((item): item is Record<string, unknown> => isObject(item)), message],
+    error: null
+  };
+  const payload = JSON.stringify({
+    type: 'response.completed',
+    response
+  });
+  controller.enqueue(encoder.encode(`event: response.completed\ndata: ${payload}\n\n`));
 }
 
 async function normalizeOpenAIPayloadForResponseParseRecovery(

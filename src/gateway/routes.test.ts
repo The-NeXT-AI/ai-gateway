@@ -4657,6 +4657,233 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('preserves Codex-shaped Responses passthrough bodies for response-native targets', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_codex_passthrough","object":"response","status":"completed","model":"gpt-5.5","output":[{"id":"msg_codex_passthrough","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}]}}\n\ndata: [DONE]\n\n',
+        {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig(
+      'provider-uuroute-09c954e1ff::openai_responses',
+      'openai_responses',
+      ['gpt-5.5']
+    );
+    provider.baseurl = 'https://api.uuroute.ai/v1';
+    provider.apikey = 'uuroute-provider-key';
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, createConfig([provider]), createGatewayRuntime());
+    await app.ready();
+
+    const codexRequest = {
+      model: 'gpt-5.5',
+      instructions: 'You are Codex, a coding agent.',
+      input: [
+        {
+          type: 'message',
+          role: 'developer',
+          content: [{ type: 'input_text', text: 'Developer rules stay in input.' }]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'Diagnose the issue.' }]
+        }
+      ],
+      tools: [
+        {
+          type: 'function',
+          name: 'exec_command',
+          description: 'Runs a command.',
+          parameters: {
+            type: 'object',
+            properties: {
+              cmd: { type: 'string' }
+            },
+            required: ['cmd'],
+            additionalProperties: false
+          }
+        }
+      ],
+      tool_choice: 'auto',
+      parallel_tool_calls: true,
+      reasoning: { effort: 'xhigh' },
+      store: false,
+      stream: true,
+      include: ['reasoning.encrypted_content'],
+      prompt_cache_key: 'codex-cache-key',
+      client_metadata: { surface: 'codex' }
+    };
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          accept: 'text/event-stream',
+          authorization: 'Bearer gateway-client-key',
+          'content-type': 'application/json',
+          cookie: 'session=secret',
+          originator: 'Codex Desktop',
+          'session-id': 'session-123',
+          'thread-id': 'thread-123',
+          'user-agent': 'Codex Desktop/0.153.4',
+          'x-auth-sub': 'subject-123',
+          'x-client-request-id': 'request-123',
+          'x-codex-beta-features': 'remote_compaction_v2',
+          'x-codex-refresh-token': 'refresh-secret',
+          'x-codex-turn-metadata': '{"cwd":"/private/repo"}',
+          'x-codex-window-id': 'window-123',
+          'x-target-provider': 'provider-uuroute-09c954e1ff::openai_responses'
+        },
+        payload: codexRequest
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://api.uuroute.ai/v1/responses');
+      expect(JSON.parse(String(upstreamInit.body))).toEqual(codexRequest);
+      const upstreamHeaders = upstreamInit.headers as Record<string, string>;
+      expect(upstreamHeaders.authorization).toBe('Bearer uuroute-provider-key');
+      expect(upstreamHeaders.accept).toBe('text/event-stream');
+      expect(upstreamHeaders.originator).toBe('Codex Desktop');
+      expect(upstreamHeaders['user-agent']).toBe('Codex Desktop/0.153.4');
+      expect(upstreamHeaders['x-codex-beta-features']).toBe('remote_compaction_v2');
+      expect(upstreamHeaders['x-codex-turn-metadata']).toBe('{"cwd":"/private/repo"}');
+      expect(upstreamHeaders['x-target-provider']).toBeUndefined();
+      expect(upstreamHeaders['x-auth-sub']).toBeUndefined();
+      expect(upstreamHeaders['x-codex-refresh-token']).toBeUndefined();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('relays response-native passthrough text deltas when streaming billing reads a clone', async () => {
+    const upstreamFrames = [
+      'event: response.created\n' +
+        'data: {"type":"response.created","response":{"id":"resp_codex_billing_passthrough","object":"response","status":"in_progress","model":"gpt-5.5"}}\n\n',
+      'event: response.output_text.delta\n' +
+        'data: {"type":"response.output_text.delta","delta":"visible ","output_index":0,"content_index":0}\n\n',
+      'event: response.output_text.delta\n' +
+        'data: {"type":"response.output_text.delta","delta":"text","output_index":0,"content_index":0}\n\n',
+      'event: response.output_text.done\n' +
+        'data: {"type":"response.output_text.done","text":"visible text","output_index":0,"content_index":0}\n\n',
+      'event: response.completed\n' +
+        'data: {"type":"response.completed","response":{"id":"resp_codex_billing_passthrough","object":"response","status":"completed","model":"gpt-5.5","output_text":"visible text","output":[{"id":"msg_codex_billing_passthrough","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"visible text"}]}],"usage":{"input_tokens":9,"output_tokens":3,"total_tokens":12}}}\n\n',
+      'data: [DONE]\n\n'
+    ];
+    const fetchMock = vi.fn(async () => createSseResponse(upstreamFrames));
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig(
+      'provider-uuroute-09c954e1ff::openai_responses',
+      'openai_responses',
+      ['gpt-5.5']
+    );
+    provider.baseurl = 'https://api.uuroute.ai/v1';
+    provider.apikey = 'uuroute-provider-key';
+    const config = createConfig([provider]);
+    config.billing.enabled = true;
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          accept: 'text/event-stream',
+          'content-type': 'application/json',
+          'x-target-provider': 'provider-uuroute-09c954e1ff::openai_responses'
+        },
+        payload: {
+          model: 'gpt-5.5',
+          input: 'hello native stream',
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(response.body).toBe(upstreamFrames.join(''));
+      expect(response.body).toContain('"type":"response.output_text.delta","delta":"visible "');
+      expect(response.body).toContain('"type":"response.output_text.delta","delta":"text"');
+      expect(response.body).toContain('data: [DONE]');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('terminates response-native passthrough SSE error streams for Codex clients', async () => {
+    const upstreamFrames = [
+      'event: response.created\n' +
+        'data: {"type":"response.created","response":{"id":"resp_context_error","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}\n\n',
+      'event: response.in_progress\n' +
+        'data: {"type":"response.in_progress","response":{"id":"resp_context_error","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}\n\n',
+      'event: error\n' +
+        'data: {"code":"context_too_large","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","sequence_number":0,"type":"error"}\n\n'
+    ];
+    const fetchMock = vi.fn(async () => createSseResponse(upstreamFrames));
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig(
+      'provider-uuroute-09c954e1ff::openai_responses',
+      'openai_responses',
+      ['gpt-5.5']
+    );
+    provider.baseurl = 'https://api.uuroute.ai/v1';
+    provider.apikey = 'uuroute-provider-key';
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, createConfig([provider]), createGatewayRuntime());
+    await app.ready();
+
+    const payload = {
+      model: 'gpt-5.5',
+      input: 'hello native stream',
+      stream: true
+    };
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          accept: 'text/event-stream',
+          'content-type': 'application/json',
+          'x-target-provider': 'provider-uuroute-09c954e1ff::openai_responses'
+        },
+        payload
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(JSON.parse(String(upstreamInit.body))).toEqual(payload);
+      expect(response.body).toContain('"type":"response.completed"');
+      expect(response.body).toContain('"status":"completed"');
+      expect(response.body).toContain('"error":null');
+      expect(response.body).toContain('Upstream error context_too_large:');
+      expect(response.body).toContain('Your input exceeds the context window of this model.');
+      expect(response.body).toContain('data: [DONE]');
+      expect(response.body).not.toContain('event: error');
+      expect(response.body.indexOf('event: response.completed')).toBeLessThan(
+        response.body.indexOf('data: [DONE]')
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
   it('forces SSE response headers for openai passthrough streaming when upstream content-type is plain text', async () => {
     const fetchMock = vi.fn(async () => {
       const stream = new ReadableStream<Uint8Array>({

@@ -3,6 +3,7 @@ import {
   buildAnthropicHeaders,
   buildGeminiUrl,
   buildOpenAIHeaders,
+  buildOpenAIPassthroughHeaders,
   normalizeOpenAIResponsesUsage
 } from './common';
 
@@ -128,6 +129,58 @@ describe('buildOpenAIHeaders', () => {
         process.env.OPENAI_API_KEY = previousOpenAIKey;
       }
     }
+  });
+});
+
+describe('buildOpenAIPassthroughHeaders', () => {
+  it('preserves selected Codex headers while replacing credentials and dropping gateway headers', () => {
+    const result = buildOpenAIPassthroughHeaders(
+      {
+        accept: 'text/event-stream',
+        authorization: 'Bearer client-key',
+        cookie: 'session=secret',
+        originator: 'Codex Desktop',
+        'session-id': 'session-123',
+        'thread-id': 'thread-123',
+        'user-agent': 'Codex Desktop/0.153.4',
+        'x-auth-sub': 'subject-123',
+        'x-client-request-id': 'request-123',
+        'x-codex-beta-features': 'remote_compaction_v2',
+        'x-codex-refresh-token': 'refresh-secret',
+        'x-codex-turn-metadata': '{"cwd":"/private/repo"}',
+        'x-codex-window-id': 'window-123',
+        'x-target-provider': 'openai-main'
+      } as never,
+      {
+        openaiApiKey: 'managed-key',
+        auth: {
+          enabled: true,
+          mode: 'static_api_key'
+        }
+      } as never
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value).toMatchObject({
+      accept: 'text/event-stream',
+      authorization: 'Bearer managed-key',
+      originator: 'Codex Desktop',
+      'session-id': 'session-123',
+      'thread-id': 'thread-123',
+      'user-agent': 'Codex Desktop/0.153.4',
+      'x-client-request-id': 'request-123',
+      'x-codex-beta-features': 'remote_compaction_v2',
+      'x-codex-turn-metadata': '{"cwd":"/private/repo"}',
+      'x-codex-window-id': 'window-123'
+    });
+    expect(result.value.cookie).toBeUndefined();
+    expect(result.value['x-auth-sub']).toBeUndefined();
+    expect(result.value['x-codex-refresh-token']).toBeUndefined();
+    expect(result.value['x-target-provider']).toBeUndefined();
   });
 });
 

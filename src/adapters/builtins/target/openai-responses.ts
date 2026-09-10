@@ -680,27 +680,21 @@ function buildOpenAIResponsesReasoningInputItem(
     return undefined;
   }
 
+  const summaryText = [reasoning.summary, reasoning.text]
+    .filter((value): value is string => Boolean(value))
+    .join('\n\n') || undefined;
+
   return {
     type: 'reasoning',
     id: reasoning.id || `rs_${randomUUID().replace(/-/g, '')}`,
-    summary: reasoning.summary
+    summary: summaryText
       ? [
           {
             type: 'summary_text',
-            text: reasoning.summary
+            text: summaryText
           }
         ]
       : [],
-    ...(reasoning.text
-      ? {
-          content: [
-            {
-              type: 'reasoning_text',
-              text: reasoning.text
-            }
-          ]
-        }
-      : {}),
     ...(replayableEncryptedContent ? { encrypted_content: replayableEncryptedContent } : {})
   };
 }

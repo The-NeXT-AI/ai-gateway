@@ -735,10 +735,9 @@ describe('openAIResponsesTargetAdapter', () => {
       {
         type: 'reasoning',
         id: 'rs_reasoning_1',
-        summary: [],
-        content: [
+        summary: [
           {
-            type: 'reasoning_text',
+            type: 'summary_text',
             text: 'visible reasoning summary'
           }
         ],

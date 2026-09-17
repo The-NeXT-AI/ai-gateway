@@ -799,6 +799,47 @@ describe('parseAnthropicMessagesRequest', () => {
       }
     ]);
   });
+
+  // An `image_url` business field is common in ordinary tool output and does
+  // not make the object a protocol content part. Classifying it as one would
+  // swallow the object whole and drop every other field on it.
+  it('does not mistake untyped tool_result objects carrying an image_url field for images', () => {
+    const result = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'toolu_search', name: 'search', input: { query: 'cats' } }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_search',
+              content: [{ title: 'search result', image_url: 'https://example.test/thumbnail.png' }]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    expect(result.value.input[1]?.content).toEqual([
+      {
+        type: 'tool_result',
+        tool_use_id: 'toolu_search',
+        content: '[{"title":"search result","image_url":"https://example.test/thumbnail.png"}]'
+      }
+    ]);
+  });
 });
 
 describe('parseOpenAIChatCompletionsRequest', () => {

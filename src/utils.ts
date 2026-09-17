@@ -200,6 +200,12 @@ export function isObject(value: unknown): value is Record<string, unknown> {
  * OpenAI chat `{type:'image_url',image_url:{url}|string}` and Responses
  * `{type:'input_image',image_url}`. Returns an HTTP(S) URL or a data URL, or
  * undefined when the part is not an image.
+ *
+ * An explicit protocol image `type` is required. Every dialect tags its content
+ * parts, while ordinary tool output routinely carries an `image_url` business
+ * field ({title, image_url, ...}) — treating those as image parts would swallow
+ * the object and drop its other fields. Requiring the tag also keeps anthropic
+ * document blocks ({type:'document',source:{type:'base64',...}}) out.
  */
 export function extractImageUrlFromPart(part: unknown): string | undefined {
   if (!isObject(part)) {
@@ -207,10 +213,7 @@ export function extractImageUrlFromPart(part: unknown): string | undefined {
   }
 
   const type = asString(part.type);
-  // The type guard must run before the `source` lookup: anthropic document
-  // blocks ({type:'document',source:{type:'base64',media_type:'application/pdf',
-  // ...}}) would otherwise be misclassified as images.
-  if (type && type !== 'image' && type !== 'image_url' && type !== 'input_image') {
+  if (type !== 'image' && type !== 'image_url' && type !== 'input_image') {
     return undefined;
   }
 

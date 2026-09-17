@@ -3809,6 +3809,79 @@ describe('openAIResponsesTargetAdapter', () => {
     }
   });
 
+  it('keeps a parallel tool_result batch contiguous and trails their images in one user message', () => {
+    const firstImage = 'data:image/png;base64,Zmlyc3Q=';
+    const secondImage = 'data:image/png;base64,c2Vjb25k';
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'call_one', name: 'screenshot', input: {} },
+            { type: 'tool_use', id: 'call_two', name: 'screenshot', input: {} }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_one',
+              content: 'first shot',
+              images: [firstImage]
+            },
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_two',
+              content: 'second shot',
+              images: [secondImage]
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { type: 'openai_chat_completions' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const chatBody = built.value.body as {
+      messages: Array<{ role: string; content: unknown; tool_call_id?: string }>;
+    };
+    // Every tool message of the parallel batch has to answer before a user turn
+    // opens; an image message wedged between them leaves call_two unanswered.
+    expect(chatBody.messages.map((message) => message.role)).toEqual([
+      'assistant',
+      'tool',
+      'tool',
+      'user'
+    ]);
+    expect(chatBody.messages[1].tool_call_id).toBe('call_one');
+    expect(chatBody.messages[2].tool_call_id).toBe('call_two');
+    expect(chatBody.messages[3]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: firstImage } },
+        { type: 'image_url', image_url: { url: secondImage } }
+      ]
+    });
+  });
+
   it('emits tool_result images in an adjacent user message for responses targets', () => {
     const standardRequest = {
       model: 'target-model',

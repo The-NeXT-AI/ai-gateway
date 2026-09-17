@@ -441,6 +441,7 @@ function standardInputToOpenAIChatMessages(
     }
 
     const toolResults = collectUserToolResults(message.content, true);
+    const batchToolImages: string[] = [];
     for (const toolResult of toolResults) {
       const resultText =
         toolResult.result_format === 'web_search'
@@ -455,19 +456,21 @@ function standardInputToOpenAIChatMessages(
         tool_call_id: toolResult.tool_call_id,
         content: resultText
       });
-      const toolImages = toolResult.images ?? [];
-      if (toolImages.length > 0) {
-        // A tool message's content only accepts text parts, so images ride in
-        // an adjacent user message — the same shape the Responses target uses
-        // for function_call_output.
-        messages.push({
-          role: 'user',
-          content: toolImages.map((url) => ({
-            type: 'image_url',
-            image_url: { url }
-          }))
-        });
-      }
+      batchToolImages.push(...(toolResult.images ?? []));
+    }
+    if (batchToolImages.length > 0) {
+      // A tool message's content only accepts text parts, so images ride in an
+      // adjacent user message. It must trail the *whole* batch: opening a user
+      // turn between two tool messages leaves the assistant's parallel
+      // tool_calls group unanswered, which strict OpenAI-compatible targets
+      // reject.
+      messages.push({
+        role: 'user',
+        content: batchToolImages.map((url) => ({
+          type: 'image_url',
+          image_url: { url }
+        }))
+      });
     }
     const contentParts = buildOrderedUserChatContentParts(message.content);
     if (contentParts.length === 1 && contentParts[0].type === 'text') {

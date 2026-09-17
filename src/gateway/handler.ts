@@ -3917,6 +3917,14 @@ function extractVirtualStandardToolResultMultimodalMessages(
         item.content,
         rewriteState
       );
+      for (const image of item.images ?? []) {
+        addVirtualMultimodalDescription(
+          descriptions,
+          messageIndex,
+          [{ type: 'input_image', image_url: image }],
+          rewriteState
+        );
+      }
     }
   }
   return descriptions;
@@ -4016,9 +4024,18 @@ function rewriteVirtualStandardInputContentMediaReferences(
   }
 
   if (item.type === 'tool_result') {
+    // `images` has to be destructured out of the spread: leaving it in and
+    // conditionally re-adding the filtered array lets the *original* images
+    // survive when every one of them matched a reference — the exact case the
+    // rewrite exists to strip.
+    const { images: originalImages, ...rest } = item;
+    const images = (originalImages ?? []).filter(
+      (image) => !references.some((reference) => standardImageMatchesVirtualReference(image, reference))
+    );
     return {
-      ...item,
-      content: replaceVirtualMultimodalReferenceString(item.content, references)
+      ...rest,
+      content: replaceVirtualMultimodalReferenceString(item.content, references),
+      ...(images.length > 0 ? { images } : {})
     };
   }
 

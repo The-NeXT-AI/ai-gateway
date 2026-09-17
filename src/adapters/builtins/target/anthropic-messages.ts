@@ -415,13 +415,18 @@ function standardContentToAnthropicBlocks(
           tool_name: toolName
         }))
       : [];
+    const imageBlocks = (item.images ?? []).map((url) => ({
+      type: 'image',
+      source: standardImageUrlToAnthropicSource(url)
+    }));
     const toolResultBlock: Record<string, unknown> = {
       type: 'tool_result',
       tool_use_id: item.tool_use_id,
       content:
-        referenceBlocks.length > 0
+        referenceBlocks.length > 0 || imageBlocks.length > 0
           ? [
               ...(item.content ? [{ type: 'text', text: item.content }] : []),
+              ...imageBlocks,
               ...referenceBlocks
             ]
           : appendToolReferencesToResultContent(
@@ -437,6 +442,22 @@ function standardContentToAnthropicBlocks(
   }
 
   return blocks;
+}
+
+/**
+ * Convert a standard image URL (HTTP(S) or data URL) into an anthropic image
+ * source. Data URLs are split into their media type and base64 payload because
+ * the anthropic schema has no data-URL form; extra MIME parameters before the
+ * base64 marker are tolerated. A non-base64 data URL cannot be represented in
+ * the anthropic shape and is passed through as-is (the upstream will reject
+ * it, matching pre-patch behavior for malformed input).
+ */
+function standardImageUrlToAnthropicSource(url: string): Record<string, unknown> {
+  const dataUrl = /^data:([^;,]+)(?:;[^,]*)*;base64,(.*)$/s.exec(url);
+  if (dataUrl) {
+    return { type: 'base64', media_type: dataUrl[1], data: dataUrl[2] };
+  }
+  return { type: 'url', url };
 }
 
 function normalizeAnthropicToolInput(value: unknown): Record<string, unknown> {

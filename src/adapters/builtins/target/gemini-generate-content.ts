@@ -675,6 +675,9 @@ function standardContentToGeminiParts(
       continue;
     }
 
+    // tool_result.images is intentionally not emitted here: the Gemini
+    // functionResponse payload is a JSON struct with no image-part position,
+    // so there is no schema-valid way to carry them.
     const response: Record<string, unknown> = {
       content: appendToolReferencesToResultContent(item.content, item.tool_references, tools)
     };

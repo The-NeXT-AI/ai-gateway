@@ -663,6 +663,183 @@ describe('parseAnthropicMessagesRequest', () => {
       }
     ]);
   });
+
+  it('extracts image blocks from image-only tool_result content instead of JSON-stringifying them', () => {
+    const result = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'toolu_read', name: 'read_image', input: { path: 'x.png' } }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_read',
+              content: [
+                {
+                  type: 'image',
+                  source: { type: 'base64', media_type: 'image/png', data: 'aGVsbG8=' }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    expect(result.value.input[1]?.content).toEqual([
+      {
+        type: 'tool_result',
+        tool_use_id: 'toolu_read',
+        content: '',
+        images: ['data:image/png;base64,aGVsbG8=']
+      }
+    ]);
+  });
+
+  it('keeps text and images from a mixed tool_result content array in their fields', () => {
+    const result = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'toolu_read', name: 'read_image', input: { path: 'x.png' } }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_read',
+              content: [
+                { type: 'text', text: 'rendered at 2x' },
+                {
+                  type: 'image',
+                  source: { type: 'base64', media_type: 'image/jpeg', data: 'anM=' }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    expect(result.value.input[1]?.content).toEqual([
+      {
+        type: 'tool_result',
+        tool_use_id: 'toolu_read',
+        content: 'rendered at 2x',
+        images: ['data:image/jpeg;base64,anM=']
+      }
+    ]);
+  });
+
+  // Documents keep the JSON fallback on purpose: the standard tool_result
+  // shape only carries images today, so a document's base64 still serializes
+  // into the text (same context cost as before this fix). Promoting documents
+  // to a first-class standard field is a separate change.
+  it('does not mistake anthropic document blocks in tool_result content for images', () => {
+    const result = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'toolu_pdf', name: 'read_pdf', input: { path: 'x.pdf' } }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_pdf',
+              content: [
+                {
+                  type: 'document',
+                  source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    expect(result.value.input[1]?.content).toEqual([
+      {
+        type: 'tool_result',
+        tool_use_id: 'toolu_pdf',
+        content: '[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}}]'
+      }
+    ]);
+  });
+
+  // An `image_url` business field is common in ordinary tool output and does
+  // not make the object a protocol content part. Classifying it as one would
+  // swallow the object whole and drop every other field on it.
+  it('does not mistake untyped tool_result objects carrying an image_url field for images', () => {
+    const result = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'toolu_search', name: 'search', input: { query: 'cats' } }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_search',
+              content: [{ title: 'search result', image_url: 'https://example.test/thumbnail.png' }]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    expect(result.value.input[1]?.content).toEqual([
+      {
+        type: 'tool_result',
+        tool_use_id: 'toolu_search',
+        content: '[{"title":"search result","image_url":"https://example.test/thumbnail.png"}]'
+      }
+    ]);
+  });
 });
 
 describe('parseOpenAIChatCompletionsRequest', () => {
@@ -912,6 +1089,75 @@ describe('parseOpenAIChatCompletionsRequest', () => {
       }
     ]);
   });
+
+  it('extracts image parts from tool-message content arrays instead of JSON-stringifying them', () => {
+    const result = parseOpenAIChatCompletionsRequest({
+      model: 'GLM-5.3-Flash',
+      messages: [
+        {
+          role: 'tool',
+          tool_call_id: 'call_shot',
+          content: [
+            { type: 'text', text: 'screenshot captured' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,c2hvdA==' } }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    expect(result.value.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'call_shot',
+            content: 'screenshot captured',
+            images: ['data:image/png;base64,c2hvdA==']
+          }
+        ]
+      }
+    ]);
+  });
+
+  it('extracts text parts from image-less tool-message content arrays', () => {
+    const result = parseOpenAIChatCompletionsRequest({
+      model: 'GLM-5.3-Flash',
+      messages: [
+        {
+          role: 'tool',
+          tool_call_id: 'call_text',
+          content: [{ type: 'text', text: 'plain result' }]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    expect(result.value.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'call_text',
+            content: 'plain result'
+          }
+        ]
+      }
+    ]);
+  });
+
 });
 
 describe('parseGeminiGenerateContentRequest', () => {

@@ -441,18 +441,35 @@ function standardInputToOpenAIChatMessages(
     }
 
     const toolResults = collectUserToolResults(message.content, true);
+    const batchToolImages: string[] = [];
     for (const toolResult of toolResults) {
+      const resultText =
+        toolResult.result_format === 'web_search'
+          ? formatWebSearchResultText(toolResult.content)
+          : appendToolReferencesToResultContent(
+              toolResult.content,
+              toolResult.tool_references,
+              tools
+            );
       messages.push({
         role: 'tool',
         tool_call_id: toolResult.tool_call_id,
-        content:
-          toolResult.result_format === 'web_search'
-            ? formatWebSearchResultText(toolResult.content)
-            : appendToolReferencesToResultContent(
-                toolResult.content,
-                toolResult.tool_references,
-                tools
-              )
+        content: resultText
+      });
+      batchToolImages.push(...(toolResult.images ?? []));
+    }
+    if (batchToolImages.length > 0) {
+      // A tool message's content only accepts text parts, so images ride in an
+      // adjacent user message. It must trail the *whole* batch: opening a user
+      // turn between two tool messages leaves the assistant's parallel
+      // tool_calls group unanswered, which strict OpenAI-compatible targets
+      // reject.
+      messages.push({
+        role: 'user',
+        content: batchToolImages.map((url) => ({
+          type: 'image_url',
+          image_url: { url }
+        }))
       });
     }
     const contentParts = buildOrderedUserChatContentParts(message.content);
@@ -658,6 +675,19 @@ function standardInputToOpenAIResponsesInput(
           tools
         )
       });
+      const toolImages = toolResult.images ?? [];
+      if (toolImages.length > 0) {
+        // function_call_output only accepts a string, so images ride in an
+        // adjacent user message — the same shape used for deferred-tool text.
+        items.push({
+          type: 'message',
+          role: 'user',
+          content: toolImages.map((url) => ({
+            type: 'input_image',
+            image_url: url
+          }))
+        });
+      }
     }
   }
 
@@ -933,6 +963,7 @@ function collectUserToolResults(
 ): Array<{
   tool_call_id: string;
   content: string;
+  images?: string[];
   is_error?: boolean;
   result_format?: 'function' | 'web_search';
   tool_references?: string[];
@@ -940,6 +971,7 @@ function collectUserToolResults(
   const toolResults: Array<{
     tool_call_id: string;
     content: string;
+    images?: string[];
     is_error?: boolean;
     result_format?: 'function' | 'web_search';
     tool_references?: string[];
@@ -962,6 +994,7 @@ function collectUserToolResults(
     toolResults.push({
       tool_call_id: item.tool_use_id,
       content: item.content,
+      images: item.images,
       is_error: item.is_error,
       result_format: item.result_format,
       tool_references: item.tool_references

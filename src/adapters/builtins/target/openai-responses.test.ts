@@ -3749,7 +3749,7 @@ describe('openAIResponsesTargetAdapter', () => {
     ]);
   });
 
-  it('emits tool_result images as image_url parts on chat tool messages', () => {
+  it('emits tool_result images in an adjacent user message for chat targets', () => {
     const standardRequest = {
       model: 'target-model',
       max_output_tokens: 128,
@@ -3787,11 +3787,26 @@ describe('openAIResponsesTargetAdapter', () => {
     const chatBody = built.value.body as {
       messages: Array<{ role: string; content: unknown }>;
     };
-    const toolMessage = chatBody.messages.find((message) => message.role === 'tool');
-    expect(toolMessage?.content).toEqual([
-      { type: 'text', text: 'screenshot captured' },
-      { type: 'image_url', image_url: { url: 'data:image/png;base64,c2hvdA==' } }
-    ]);
+    const toolIndex = chatBody.messages.findIndex((message) => message.role === 'tool');
+    expect(toolIndex).toBeGreaterThanOrEqual(0);
+    // A tool message's content must stay a plain string: the chat schema only
+    // accepts text parts there, so images go into the next user message.
+    expect(chatBody.messages[toolIndex].content).toBe('screenshot captured');
+    expect(chatBody.messages[toolIndex + 1]).toEqual({
+      role: 'user',
+      content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,c2hvdA==' } }]
+    });
+    // The base64 may only ever appear inside an image part, never as text.
+    for (const message of chatBody.messages) {
+      if (typeof message.content === 'string') {
+        expect(message.content).not.toContain('c2hvdA==');
+        continue;
+      }
+      const textParts = (message.content as Array<{ type: string }>).filter(
+        (part) => part.type !== 'image_url'
+      );
+      expect(JSON.stringify(textParts)).not.toContain('c2hvdA==');
+    }
   });
 
   it('emits tool_result images in an adjacent user message for responses targets', () => {

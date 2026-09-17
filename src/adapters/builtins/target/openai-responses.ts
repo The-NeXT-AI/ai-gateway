@@ -450,25 +450,24 @@ function standardInputToOpenAIChatMessages(
               toolResult.tool_references,
               tools
             );
-      const toolImages = toolResult.images ?? [];
-      if (toolImages.length > 0) {
-        // The chat schema allows part arrays on tool messages; text keeps its
-        // leading position and images follow in content order.
-        messages.push({
-          role: 'tool',
-          tool_call_id: toolResult.tool_call_id,
-          content: [
-            ...(resultText ? [{ type: 'text', text: resultText }] : []),
-            ...toolImages.map((url) => ({ type: 'image_url', image_url: { url } }))
-          ]
-        });
-        continue;
-      }
       messages.push({
         role: 'tool',
         tool_call_id: toolResult.tool_call_id,
         content: resultText
       });
+      const toolImages = toolResult.images ?? [];
+      if (toolImages.length > 0) {
+        // A tool message's content only accepts text parts, so images ride in
+        // an adjacent user message — the same shape the Responses target uses
+        // for function_call_output.
+        messages.push({
+          role: 'user',
+          content: toolImages.map((url) => ({
+            type: 'image_url',
+            image_url: { url }
+          }))
+        });
+      }
     }
     const contentParts = buildOrderedUserChatContentParts(message.content);
     if (contentParts.length === 1 && contentParts[0].type === 'text') {

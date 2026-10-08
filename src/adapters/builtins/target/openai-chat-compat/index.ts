@@ -1,12 +1,14 @@
 import type { ProviderConfig } from '../../../../types';
 import { deepSeekOpenAIChatProviderThinkingAdapter } from './deepseek';
 import { minimaxOpenAIChatProviderThinkingAdapter } from './minimax';
+import { obitOpenAIChatProviderThinkingAdapter } from './obit';
 import type { OpenAIChatProviderThinkingAdapter } from './types';
 import { xiaomiMimoOpenAIChatProviderThinkingAdapter } from './xiaomi-mimo';
 import { zhipuOpenAIChatProviderThinkingAdapter } from './zhipu';
 
 const openAIChatProviderThinkingAdapters: OpenAIChatProviderThinkingAdapter[] = [
   minimaxOpenAIChatProviderThinkingAdapter,
+  obitOpenAIChatProviderThinkingAdapter,
   deepSeekOpenAIChatProviderThinkingAdapter,
   xiaomiMimoOpenAIChatProviderThinkingAdapter,
   zhipuOpenAIChatProviderThinkingAdapter

@@ -32,6 +32,10 @@ export function rewriteOpenAIChatCompatibleRequest(
   const model = options.standardRequest?.model || asString(nextBody.model);
   const adapter = resolveOpenAIChatProviderThinkingAdapter(targetProviderConfig, model);
 
+  if (!adapter || adapter.useGenericRequestOptions) {
+    nextBody = rewriteGenericOpenAIChatCompatibleRequest(nextBody, targetProviderConfig, options);
+  }
+
   if (adapter) {
     adapter.rewriteRequest({
       body: nextBody,
@@ -39,8 +43,6 @@ export function rewriteOpenAIChatCompatibleRequest(
       providerConfig: targetProviderConfig,
       model
     });
-  } else {
-    nextBody = rewriteGenericOpenAIChatCompatibleRequest(nextBody, targetProviderConfig, options);
   }
 
   if (shouldStripOpenAIChatThinkingOptions(targetProviderConfig)) {

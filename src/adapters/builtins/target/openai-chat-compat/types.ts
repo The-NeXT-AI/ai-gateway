@@ -12,6 +12,7 @@ export interface OpenAIChatProviderThinkingRewriteInput extends OpenAIChatProvid
 
 export interface OpenAIChatProviderThinkingAdapter {
   key: string;
+  useGenericRequestOptions?: boolean;
   matches(input: OpenAIChatProviderThinkingMatchInput): boolean;
   rewriteRequest(input: OpenAIChatProviderThinkingRewriteInput): void;
 }

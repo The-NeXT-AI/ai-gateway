@@ -285,14 +285,29 @@ export type OptimisticOpenAIChatRelay =
       state: AnthropicRelayState;
     };
 
+export function isQuotaResponseHeader(name: string): boolean {
+  const normalized = name.toLowerCase();
+  return normalized.startsWith('x-codex-') || normalized.includes('ratelimit');
+}
+
+function forwardQuotaResponseHeaders(reply: FastifyReply, upstreamHeaders?: Headers) {
+  upstreamHeaders?.forEach((value, name) => {
+    if (isQuotaResponseHeader(name)) {
+      reply.header(name, value);
+    }
+  });
+}
+
 export function relayConvertedStreamFromStandardResponse(
   reply: FastifyReply,
   source: GatewaySourceContext,
-  standardResponse: StandardResponse
+  standardResponse: StandardResponse,
+  upstreamHeaders?: Headers
 ) {
   const frames = buildConvertedStreamFrames(source, standardResponse);
 
   reply.code(200);
+  forwardQuotaResponseHeaders(reply, upstreamHeaders);
   reply.header('content-type', 'text/event-stream; charset=utf-8');
   reply.header('cache-control', 'no-cache, no-transform');
   reply.header('connection', 'keep-alive');
@@ -309,6 +324,7 @@ export function relayConvertedStreamFromUpstreamResponse(
   abortSignal?: AbortSignal
 ) {
   reply.code(200);
+  forwardQuotaResponseHeaders(reply, upstreamResponse.headers);
   reply.header('content-type', 'text/event-stream; charset=utf-8');
   reply.header('cache-control', 'no-cache, no-transform');
   reply.header('connection', 'keep-alive');

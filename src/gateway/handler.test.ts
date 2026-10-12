@@ -19,7 +19,8 @@ import {
   relayOptimisticAnthropicMessagesStreamTurn,
   relayOptimisticOpenAIChatStreamToolCalls,
   relayOptimisticStreamText,
-  relayConvertedStreamFromStandardResponse
+  relayConvertedStreamFromStandardResponse,
+  relayConvertedStreamFromUpstreamResponse
 } from './streaming-conversion';
 
 describe('resolveBillingResponseSnapshot', () => {
@@ -1739,3 +1740,37 @@ function createSseResponse(chunks: string[]): Response {
     }
   });
 }
+
+describe('relayConvertedStreamFromUpstreamResponse', () => {
+  it('forwards upstream quota headers without leaking body framing headers', () => {
+    const replyHeaders = new Map<string, string>();
+    const reply = {
+      code() {
+        return this;
+      },
+      header(name: string, value: string) {
+        replyHeaders.set(name.toLowerCase(), value);
+        return this;
+      },
+      send(payload: unknown) {
+        return payload;
+      }
+    };
+    const upstreamResponse = new Response(null, {
+      headers: {
+        'x-codex-primary-used-percent': '42',
+        'anthropic-ratelimit-unified-5h-utilization': '0.3',
+        'content-length': '1234',
+        'content-encoding': 'gzip'
+      }
+    });
+
+    relayConvertedStreamFromUpstreamResponse(reply as never, { adapterKey: 'anthropic_messages' } as never, upstreamResponse);
+
+    expect(replyHeaders.get('x-codex-primary-used-percent')).toBe('42');
+    expect(replyHeaders.get('anthropic-ratelimit-unified-5h-utilization')).toBe('0.3');
+    expect(replyHeaders.get('content-type')).toBe('text/event-stream; charset=utf-8');
+    expect(replyHeaders.has('content-length')).toBe(false);
+    expect(replyHeaders.has('content-encoding')).toBe(false);
+  });
+});

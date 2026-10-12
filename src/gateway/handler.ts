@@ -1641,7 +1641,7 @@ export async function handleGatewayRequest(
         }
       );
       attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
-      return relayConvertedStreamFromStandardResponse(reply, source, sourceStandardResponse);
+      return relayConvertedStreamFromStandardResponse(reply, source, sourceStandardResponse, upstreamResponse.headers);
     }
 
     if (!baseStandardRequest) {

@@ -1741,4 +1741,193 @@ describe('geminiGenerateContentTargetAdapter', () => {
       }
     ]);
   });
+  it('carries tool_result images as Gemini 3 functionResponse parts', () => {
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-3-pro-preview:generateContent'
+      } as never,
+      standardRequest: {
+        model: 'gemini-3-pro-preview',
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'toolu_shot', name: 'screenshot', input: {} }]
+          },
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_shot',
+                content: 'screenshot captured',
+                images: ['data:image/png;base64,c2hvdA==']
+              }
+            ]
+          }
+        ]
+      } as never,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const contents = (built.value.body as { contents: Array<Record<string, unknown>> }).contents;
+    expect(contents[1]).toEqual({
+      role: 'user',
+      parts: [
+        {
+          functionResponse: {
+            id: 'toolu_shot',
+            name: 'screenshot',
+            response: {
+              content: 'screenshot captured',
+              image_1: { $ref: 'toolu_shot_image_1.png' }
+            },
+            parts: [
+              {
+                inlineData: {
+                  mimeType: 'image/png',
+                  displayName: 'toolu_shot_image_1.png',
+                  data: 'c2hvdA=='
+                }
+              }
+            ]
+          }
+        }
+      ]
+    });
+  });
+
+  // Multimodal function responses are a Gemini 3 feature; older models have no
+  // image position in the functionResponse struct.
+  it('does not emit functionResponse parts for pre-Gemini 3 models', () => {
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-pro:generateContent'
+      } as never,
+      standardRequest: {
+        model: 'gemini-2.5-pro',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_shot',
+                content: 'screenshot captured',
+                images: ['data:image/png;base64,c2hvdA==']
+              }
+            ]
+          }
+        ]
+      } as never,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const serialized = JSON.stringify(built.value.body);
+    expect(serialized).not.toContain('c2hvdA==');
+    expect(serialized).not.toContain('"parts":[{"inlineData"');
+  });
+
+  it('keeps tool_result images inside the native Interactions function_result subcontent', () => {
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/interactions'
+      } as never,
+      standardRequest: {
+        model: 'gemini-3-pro-preview',
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', id: 'toolu_one', name: 'screenshot', input: {} },
+              { type: 'tool_use', id: 'toolu_two', name: 'screenshot', input: {} }
+            ]
+          },
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_one',
+                content: 'first',
+                images: ['data:image/png;base64,Zmlyc3Q=']
+              },
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_two',
+                content: 'second',
+                images: ['data:image/png;base64,c2Vjb25k']
+              }
+            ]
+          }
+        ]
+      } as never,
+      targetProviderConfig: {
+        type: 'gemini_interactions'
+      } as never,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const steps = (built.value.body as { input: Array<Record<string, unknown>> }).input;
+    // The batch stays contiguous and each image stays bound to its own call_id
+    // instead of being re-attributed to a trailing user turn.
+    expect(steps.map((step) => step.type)).toEqual([
+      'function_call',
+      'function_call',
+      'function_result',
+      'function_result'
+    ]);
+    expect(steps[2]).toEqual({
+      type: 'function_result',
+      call_id: 'toolu_one',
+      name: 'screenshot',
+      result: [
+        { type: 'text', text: 'first' },
+        { type: 'image', mime_type: 'image/png', data: 'Zmlyc3Q=' }
+      ]
+    });
+    expect(steps[3]).toEqual({
+      type: 'function_result',
+      call_id: 'toolu_two',
+      name: 'screenshot',
+      result: [
+        { type: 'text', text: 'second' },
+        { type: 'image', mime_type: 'image/png', data: 'c2Vjb25k' }
+      ]
+    });
+  });
 });

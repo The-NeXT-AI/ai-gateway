@@ -1060,6 +1060,75 @@ describe('virtual model multimodal reference rewriting', () => {
     expect(serializedInput).not.toContain(imageUrl);
   });
 
+  it('strips the tool_result images field when every image matched a reference', () => {
+    const imageUrl = `data:image/png;base64,${'e'.repeat(64)}`;
+    const rewrite = rewriteVirtualModelMultimodalInput(
+      {
+        model: 'gpt-5:cua',
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'call_cua',
+                name: 'computer_use',
+                input: {}
+              }
+            ]
+          },
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'call_cua',
+                content: 'Computer Use state',
+                images: [imageUrl]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        messages: [
+          {
+            role: 'assistant',
+            tool_calls: [
+              {
+                id: 'call_cua',
+                type: 'function',
+                function: { name: 'computer_use', arguments: '{}' }
+              }
+            ]
+          },
+          {
+            role: 'tool',
+            tool_call_id: 'call_cua',
+            content: [
+              { type: 'input_text', text: 'Computer Use state' },
+              { type: 'input_image', image_url: imageUrl }
+            ]
+          }
+        ]
+      },
+      'openai_chat'
+    );
+
+    expect(rewrite.references).toHaveLength(1);
+    // The whole point of the rewrite: the image must not reach the target
+    // alongside its own media reference. A conditional spread that only
+    // overrides `images` when the filtered array is non-empty leaves the
+    // original list in place exactly when every image matched.
+    expect(JSON.stringify(rewrite.request.input)).not.toContain(imageUrl);
+    const toolResult = (
+      rewrite.request.input as Array<{ content: Array<Record<string, unknown>> }>
+    )[1].content[0];
+    expect(toolResult).not.toHaveProperty('images');
+  });
+
   it('rewrites Anthropic tool_result multimodal output', () => {
     const base64 = 'd'.repeat(64);
     const toolContent = [

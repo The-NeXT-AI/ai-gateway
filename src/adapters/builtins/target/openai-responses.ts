@@ -211,7 +211,8 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
     input: standardInputToOpenAIResponsesInput(
       standardRequest.input,
       standardRequest.tools,
-      deferredToolSearch
+      deferredToolSearch,
+      targetProviderConfig?.openaiResponsesToolOutputFormat ?? 'native'
     ),
     temperature: standardRequest.temperature,
     top_p: standardRequest.top_p,
@@ -403,8 +404,47 @@ function standardInputToOpenAIChatMessages(
     });
   }
 
-  for (const message of collectStandardInputMessages(input)) {
+  const standardMessages = collectStandardInputMessages(input);
+  const batchContinues = computeToolBatchContinuation(standardMessages);
+  // A tool message's content only accepts text parts, so tool-result images
+  // ride in an adjacent user message. It must trail the *whole* parallel
+  // tool_calls batch: opening a user turn between two tool messages leaves the
+  // assistant's parallel group unanswered, which strict OpenAI-compatible
+  // targets reject. The batch also spans standard messages — a source parser
+  // that yields one message per function_call_output splits it — so both
+  // queues outlive a single loop iteration and drain once the batch closes.
+  const pendingToolImages: string[] = [];
+  // Content of the user messages held back with the batch, in order. The first
+  // one absorbs the images so a batch never ends in two adjacent user turns.
+  const pendingTrailingParts: Array<Array<Record<string, unknown>>> = [];
+  const pushUserMessage = (parts: Array<Record<string, unknown>>) => {
+    messages.push(
+      parts.length === 1 && parts[0].type === 'text'
+        ? { role: 'user', content: parts[0].text }
+        : { role: 'user', content: parts }
+    );
+  };
+  const flushToolBatch = () => {
+    if (pendingToolImages.length > 0) {
+      const imageParts = pendingToolImages.map((url) => ({
+        type: 'image_url',
+        image_url: { url }
+      }));
+      pendingToolImages.length = 0;
+      if (pendingTrailingParts.length > 0) {
+        pendingTrailingParts[0].unshift(...imageParts);
+      } else {
+        pushUserMessage(imageParts);
+      }
+    }
+    while (pendingTrailingParts.length > 0) {
+      pushUserMessage(pendingTrailingParts.shift() as Array<Record<string, unknown>>);
+    }
+  };
+
+  for (const [index, message] of standardMessages.entries()) {
     if (message.role === 'assistant') {
+      flushToolBatch();
       const text = extractStandardInputTextContent(message.content);
       const toolCalls = collectAssistantToolCalls(message.content, tools);
       const reasoning = includeReasoningFields ? collectAssistantReasoning(message.content) : undefined;
@@ -442,32 +482,35 @@ function standardInputToOpenAIChatMessages(
 
     const toolResults = collectUserToolResults(message.content, true);
     for (const toolResult of toolResults) {
+      const resultText =
+        toolResult.result_format === 'web_search'
+          ? formatWebSearchResultText(toolResult.content)
+          : appendToolReferencesToResultContent(
+              toolResult.content,
+              toolResult.tool_references,
+              tools
+            );
       messages.push({
         role: 'tool',
         tool_call_id: toolResult.tool_call_id,
-        content:
-          toolResult.result_format === 'web_search'
-            ? formatWebSearchResultText(toolResult.content)
-            : appendToolReferencesToResultContent(
-                toolResult.content,
-                toolResult.tool_references,
-                tools
-              )
+        content: resultText
       });
+      pendingToolImages.push(...(toolResult.images ?? []));
     }
+
     const contentParts = buildOrderedUserChatContentParts(message.content);
-    if (contentParts.length === 1 && contentParts[0].type === 'text') {
-      messages.push({
-        role: 'user',
-        content: contentParts[0].text
-      });
-    } else if (contentParts.length > 0) {
-      messages.push({
-        role: 'user',
-        content: contentParts
-      });
+    if (contentParts.length > 0) {
+      pendingTrailingParts.push(contentParts);
+    }
+
+    // Still inside the parallel group: hold this message's own content back so
+    // nothing opens a user turn before the remaining results arrive.
+    if (!batchContinues[index]) {
+      flushToolBatch();
     }
   }
+
+  flushToolBatch();
 
   return messages;
 }
@@ -475,17 +518,58 @@ function standardInputToOpenAIChatMessages(
 function standardInputToOpenAIResponsesInput(
   input: string | StandardRequestInputMessage[],
   tools?: unknown[],
-  deferredToolSearch?: DeferredToolSearchPlan
+  deferredToolSearch?: DeferredToolSearchPlan,
+  toolOutputFormat: NonNullable<ProviderConfig['openaiResponsesToolOutputFormat']> = 'native'
 ): string | Array<Record<string, unknown>> {
   if (typeof input === 'string') {
     return input;
   }
 
   const items: Array<Record<string, unknown>> = [];
-  for (const message of collectStandardInputMessages(input)) {
+  const standardMessages = collectStandardInputMessages(input);
+  const batchContinues = computeToolBatchContinuation(standardMessages);
+  // `text` mode has no image position inside `function_call_output`, so the
+  // images queue up and drain in one user message once the parallel tool batch
+  // closes — which spans standard messages, since a source parser emits one per
+  // function_call_output. Message content that would otherwise open a user turn
+  // inside the batch waits in the same queue.
+  const pendingToolImages: string[] = [];
+  const pendingTrailingMessages: Array<{ role: string; content: Array<Record<string, unknown>> }> = [];
+  // Whether the previous message left the batch open, i.e. this message is a
+  // continuation of it. The batch's *last* message has no successor to look
+  // ahead to, yet still sits inside the batch: its content must queue behind
+  // what earlier messages already deferred, not jump ahead of it.
+  let batchOpen = false;
+  const flushToolBatch = () => {
+    batchOpen = false;
+    if (pendingToolImages.length > 0) {
+      const imageParts = pendingToolImages.map((url) => ({
+        type: 'input_image',
+        image_url: url
+      }));
+      pendingToolImages.length = 0;
+      if (pendingTrailingMessages.length > 0) {
+        pendingTrailingMessages[0].content.unshift(...imageParts);
+      } else {
+        items.push({ type: 'message', role: 'user', content: imageParts });
+      }
+    }
+    while (pendingTrailingMessages.length > 0) {
+      const entry = pendingTrailingMessages.shift() as (typeof pendingTrailingMessages)[number];
+      items.push({ type: 'message', role: entry.role, content: entry.content });
+    }
+  };
+
+  for (const [index, message] of standardMessages.entries()) {
     const role = message.role === 'assistant' ? 'assistant' : 'user';
+    const stillInBatch = message.role !== 'assistant' && batchContinues[index];
+    // Inside a multi-message batch every flush is held back until it closes, so
+    // the batch's outputs stay contiguous and the deferred user content drains
+    // in its original order.
+    const holdBack = batchOpen || stillInBatch;
 
     if (message.role === 'assistant') {
+      flushToolBatch();
       const text = extractStandardInputTextContent(message.content);
       const reasoningItems = collectAssistantReasoningItemsForOpenAIResponses(message.content);
       for (const reasoning of reasoningItems) {
@@ -554,13 +638,17 @@ function standardInputToOpenAIResponsesInput(
     // top-level input item — text and images must share one user message in
     // their original order.
     let pendingContent: Array<Record<string, unknown>> | undefined;
-    const flushPendingUserMessage = () => {
+    const flushPendingUserMessage = (defer = false) => {
       if (pendingContent && pendingContent.length > 0) {
-        items.push({
-          type: 'message',
-          role,
-          content: pendingContent
-        });
+        if (defer) {
+          pendingTrailingMessages.push({ role, content: pendingContent });
+        } else {
+          items.push({
+            type: 'message',
+            role,
+            content: pendingContent
+          });
+        }
       }
       pendingContent = undefined;
     };
@@ -594,7 +682,7 @@ function standardInputToOpenAIResponsesInput(
       if (item.type !== 'tool_search_output') {
         continue;
       }
-      flushPendingUserMessage();
+      flushPendingUserMessage(holdBack);
       items.push({
         type: 'tool_search_output',
         execution: item.execution,
@@ -603,7 +691,7 @@ function standardInputToOpenAIResponsesInput(
         tools: item.tools
       });
     }
-    flushPendingUserMessage();
+    flushPendingUserMessage(holdBack);
 
     const toolResults = collectUserToolResults(message.content);
     for (const toolResult of toolResults) {
@@ -649,17 +737,49 @@ function standardInputToOpenAIResponsesInput(
         continue;
       }
 
+      const outputText = appendToolReferencesToResultContent(
+        toolResult.content,
+        toolResult.tool_references,
+        tools
+      );
+      const toolImages = toolResult.images ?? [];
+      if (toolImages.length > 0 && toolOutputFormat === 'native') {
+        // `function_call_output.output` accepts a content list, so the images
+        // stay attached to their call_id instead of being re-attributed to the
+        // user turn — which also keeps parallel calls unambiguous.
+        items.push({
+          type: 'function_call_output',
+          call_id: toolResult.tool_call_id,
+          output: [
+            ...(outputText ? [{ type: 'input_text', text: outputText }] : []),
+            ...toolImages.map((url) => ({
+              type: 'input_image',
+              image_url: url
+            }))
+          ]
+        });
+        continue;
+      }
+
       items.push({
         type: 'function_call_output',
         call_id: toolResult.tool_call_id,
-        output: appendToolReferencesToResultContent(
-          toolResult.content,
-          toolResult.tool_references,
-          tools
-        )
+        output: outputText
       });
+      // Text-only fallback for providers whose Responses implementation rejects
+      // a content list: the images ride in an adjacent user message, the same
+      // shape used for deferred-tool text, trailing the whole batch.
+      pendingToolImages.push(...toolImages);
+    }
+
+    if (stillInBatch) {
+      batchOpen = true;
+    } else {
+      flushToolBatch();
     }
   }
+
+  flushToolBatch();
 
   return items;
 }
@@ -927,12 +1047,67 @@ function collectAssistantReasoning(content: StandardRequestInputContent[]):
   };
 }
 
+/**
+ * Whether a message still carries tool output, i.e. the batch it belongs to is
+ * not closed yet. Cheap on purpose: it runs over every message, where the full
+ * `collectUserToolResults` extraction would only yield a boolean.
+ */
+function hasToolResultContent(content: StandardRequestInputContent[]): boolean {
+  return content.some(
+    (item) => item.type === 'tool_result' || item.type === 'tool_search_output'
+  );
+}
+
+/**
+ * For each message, whether it sits inside a parallel tool batch that a later
+ * message still answers. A batch opens at an assistant turn that issues tool
+ * calls (or, for orphan outputs with no such turn in the input, at the first
+ * tool output) and closes at the next assistant turn. Outputs of one batch need
+ * not be adjacent — a client may interleave plain user messages — so this looks
+ * for any tool output before the next assistant turn, not just in the immediate
+ * successor. A user message that precedes the batch is never held back.
+ */
+function computeToolBatchContinuation(messages: StandardRequestInputMessage[]): boolean[] {
+  const laterToolOutput: boolean[] = new Array(messages.length).fill(false);
+  let seen = false;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    laterToolOutput[index] = seen;
+    const message = messages[index];
+    if (message.role === 'assistant') {
+      seen = false;
+    } else if (hasToolResultContent(message.content)) {
+      seen = true;
+    }
+  }
+
+  const continues: boolean[] = new Array(messages.length).fill(false);
+  let batchOpen = false;
+  for (const [index, message] of messages.entries()) {
+    if (message.role === 'assistant') {
+      batchOpen = hasToolCallContent(message.content);
+      continue;
+    }
+    if (hasToolResultContent(message.content)) {
+      batchOpen = true;
+    }
+    continues[index] = batchOpen && laterToolOutput[index];
+  }
+  return continues;
+}
+
+function hasToolCallContent(content: StandardRequestInputContent[]): boolean {
+  return content.some(
+    (item) => item.type === 'tool_use' || item.type === 'tool_search_call'
+  );
+}
+
 function collectUserToolResults(
   content: StandardRequestInputContent[],
   includeToolSearchOutputs = false
 ): Array<{
   tool_call_id: string;
   content: string;
+  images?: string[];
   is_error?: boolean;
   result_format?: 'function' | 'web_search';
   tool_references?: string[];
@@ -940,6 +1115,7 @@ function collectUserToolResults(
   const toolResults: Array<{
     tool_call_id: string;
     content: string;
+    images?: string[];
     is_error?: boolean;
     result_format?: 'function' | 'web_search';
     tool_references?: string[];
@@ -962,6 +1138,7 @@ function collectUserToolResults(
     toolResults.push({
       tool_call_id: item.tool_use_id,
       content: item.content,
+      images: item.images,
       is_error: item.is_error,
       result_format: item.result_format,
       tool_references: item.tool_references

@@ -206,6 +206,60 @@ describe('geminiInteractionsSourceAdapter', () => {
     ]);
   });
 
+  // The native multimodal function result puts image subcontent next to the
+  // text one; replaying that history must not fold it back into the text.
+  it('recovers image subcontent from a function result', () => {
+    const parsed = geminiInteractionsSourceAdapter.toStandardRequest({
+      body: {
+        model: 'gemini-3-pro-preview',
+        input: [
+          {
+            type: 'function_call',
+            id: 'call_shot',
+            name: 'screenshot',
+            arguments: {}
+          },
+          {
+            type: 'function_result',
+            call_id: 'call_shot',
+            name: 'screenshot',
+            result: [
+              { type: 'text', text: 'desktop' },
+              { type: 'image', mime_type: 'image/png', data: 'c2hvdA==' },
+              { type: 'image', uri: 'https://example.test/full.png' }
+            ]
+          }
+        ]
+      },
+      request: {
+        url: '/v1beta/interactions'
+      } as never,
+      source: {
+        adapterKey: 'gemini_interactions'
+      },
+      config: {} as never
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok || typeof parsed.value.input === 'string') {
+      return;
+    }
+
+    const toolResult = parsed.value.input
+      .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+      .find((item) => item.type === 'tool_result');
+    expect(toolResult).toEqual({
+      type: 'tool_result',
+      tool_use_id: 'call_shot',
+      name: 'screenshot',
+      content: 'desktop',
+      images: [
+        'data:image/png;base64,c2hvdA==',
+        'https://example.test/full.png'
+      ]
+    });
+  });
+
   it('formats standard responses as Gemini Interaction objects', () => {
     const formatted = geminiInteractionsSourceAdapter.fromStandardResponse({
       response: {

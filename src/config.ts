@@ -185,6 +185,9 @@ interface ProviderJsonConfig {
   openaiChatReasoningOptions?: unknown;
   chatThinkingOptions?: unknown;
   thinkingOptions?: unknown;
+  openaiResponsesToolOutputFormat?: unknown;
+  responsesToolOutputFormat?: unknown;
+  toolOutputFormat?: unknown;
   modelMetadata?: unknown;
   extraHeaders?: unknown;
   extraBody?: unknown;
@@ -4300,6 +4303,11 @@ function parseProvidersConfig(value: unknown): ProviderConfig[] {
           item.chatThinkingOptions ??
           item.thinkingOptions
       ),
+      openaiResponsesToolOutputFormat: parseOpenAIResponsesToolOutputFormatToken(
+        readString(item.openaiResponsesToolOutputFormat) ||
+          readString(item.responsesToolOutputFormat) ||
+          readString(item.toolOutputFormat)
+      ),
       modelMetadata: parseProviderModelMetadata(item.modelMetadata, models),
       extraHeaders: parseModelScopedHeaders(item.extraHeaders, models),
       extraBody: parseModelScopedBody(item.extraBody, models),
@@ -5267,6 +5275,25 @@ function parseOpenAIChatToolsFormatToken(value: string | undefined): ProviderCon
     normalized === 'input_schema'
   ) {
     return 'anthropic';
+  }
+
+  return undefined;
+}
+
+function parseOpenAIResponsesToolOutputFormatToken(
+  value: string | undefined
+): ProviderConfig['openaiResponsesToolOutputFormat'] {
+  const normalized = value?.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (normalized === 'native' || normalized === 'content' || normalized === 'parts') {
+    return 'native';
+  }
+
+  if (normalized === 'text' || normalized === 'string' || normalized === 'legacy') {
+    return 'text';
   }
 
   return undefined;

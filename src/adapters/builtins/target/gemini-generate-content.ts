@@ -37,6 +37,7 @@ interface GeminiContentConversionState {
   pendingThoughtPart?: Record<string, unknown>;
   toolNamesById: Map<string, string>;
   thoughtSignatureCacheScope: string;
+  model: string;
 }
 
 export const geminiGenerateContentTargetAdapter: TargetAdapter = {
@@ -97,7 +98,8 @@ export const geminiGenerateContentTargetAdapter: TargetAdapter = {
       contents: standardInputToGeminiContents(
         input.standardRequest.input,
         input.standardRequest.tools,
-        buildGeminiThoughtSignatureCacheScope(input)
+        buildGeminiThoughtSignatureCacheScope(input),
+        model
       )
     };
 
@@ -215,11 +217,13 @@ function buildGeminiInteractionsRequestFromStandard(input: TargetAdapterRequestI
 function standardInputToGeminiContents(
   input: string | StandardRequestInputMessage[],
   tools: unknown[] | undefined,
-  thoughtSignatureCacheScope: string
+  thoughtSignatureCacheScope: string,
+  model: string
 ): Array<Record<string, unknown>> {
   const state: GeminiContentConversionState = {
     toolNamesById: new Map(),
-    thoughtSignatureCacheScope
+    thoughtSignatureCacheScope,
+    model
   };
 
   return collectStandardInputMessages(input).map((message) => ({
@@ -328,20 +332,32 @@ function standardInputToGeminiInteractionsInput(
 
       if (item.type === 'tool_result') {
         const name = item.name || toolNamesById.get(item.tool_use_id) || item.tool_use_id;
+        // `result` is a list of subcontent entries whose union is text or
+        // image, so the images ride inline here and each stays bound to its own
+        // call_id. Deferring them to a trailing user_input step would drop that
+        // attribution and re-open a user turn inside a parallel result batch.
+        const result: Array<Record<string, unknown>> = [
+          {
+            type: 'text',
+            text: appendToolReferencesToResultContent(
+              item.content,
+              item.tool_references,
+              tools
+            )
+          }
+        ];
+        for (const imageUrl of item.images ?? []) {
+          const imageContent = standardImageToGeminiInteractionContent(imageUrl);
+          if (imageContent) {
+            result.push(imageContent);
+          }
+        }
+
         steps.push({
           type: 'function_result',
           call_id: item.tool_use_id,
           name,
-          result: [
-            {
-              type: 'text',
-              text: appendToolReferencesToResultContent(
-                item.content,
-                item.tool_references,
-                tools
-              )
-            }
-          ]
+          result
         });
       }
     }
@@ -682,15 +698,26 @@ function standardContentToGeminiParts(
       response.is_error = item.is_error;
     }
 
-    parts.push({
-      functionResponse: {
-        id: item.tool_use_id,
-        name:
-          state.toolNamesById.get(item.tool_use_id) ??
-          mapStandardToolNameToTargetName(item.tool_use_id, tools),
-        response
+    const functionResponse: Record<string, unknown> = {
+      id: item.tool_use_id,
+      name:
+        state.toolNamesById.get(item.tool_use_id) ??
+        mapStandardToolNameToTargetName(item.tool_use_id, tools),
+      response
+    };
+    // Gemini 3 carries tool-result images as functionResponse parts, each
+    // referenced from the structured response by its displayName. Older models
+    // have no image position in the functionResponse struct, so their images
+    // still cannot be emitted here.
+    const multimodalParts = buildGeminiFunctionResponseParts(item.images, item.tool_use_id, state.model);
+    if (multimodalParts.length > 0) {
+      functionResponse.parts = multimodalParts.map((entry) => entry.part);
+      for (const entry of multimodalParts) {
+        response[entry.responseKey] = { $ref: entry.displayName };
       }
-    });
+    }
+
+    parts.push({ functionResponse });
   }
 
   flushText();
@@ -731,6 +758,56 @@ function standardImageToGeminiPart(imageUrl: string): Record<string, unknown> | 
           fileUri: image.url
         }
       };
+}
+
+/**
+ * Multimodal function responses are a Gemini 3 feature: the images live in
+ * `functionResponse.parts[].inlineData` and the structured `response` points at
+ * each one through its unique `displayName`. Only inline data is accepted
+ * there, so URL-backed images have no position and stay out.
+ */
+function buildGeminiFunctionResponseParts(
+  images: string[] | undefined,
+  toolUseId: string,
+  model: string
+): Array<{ responseKey: string; displayName: string; part: Record<string, unknown> }> {
+  if (!images || images.length === 0 || !supportsGeminiMultimodalFunctionResponse(model)) {
+    return [];
+  }
+
+  const entries: Array<{ responseKey: string; displayName: string; part: Record<string, unknown> }> = [];
+  images.forEach((imageUrl, index) => {
+    const image = parseStandardImageReference(imageUrl);
+    if (image?.type !== 'base64') {
+      return;
+    }
+
+    // Derived from the call id so the same conversation replays byte-identical
+    // and keeps the upstream prefix cache intact.
+    const displayName = `${toolUseId}_image_${index + 1}${geminiImageFileExtension(image.mediaType)}`;
+    entries.push({
+      responseKey: `image_${index + 1}`,
+      displayName,
+      part: {
+        inlineData: {
+          mimeType: image.mediaType,
+          displayName,
+          data: image.data
+        }
+      }
+    });
+  });
+
+  return entries;
+}
+
+function supportsGeminiMultimodalFunctionResponse(model: string): boolean {
+  return /(^|\/)gemini-3/i.test(model.trim());
+}
+
+function geminiImageFileExtension(mediaType: string): string {
+  const subtype = mediaType.split('/')[1]?.trim().toLowerCase();
+  return subtype ? `.${subtype === 'jpeg' ? 'jpg' : subtype}` : '';
 }
 
 function standardImageToGeminiInteractionContent(

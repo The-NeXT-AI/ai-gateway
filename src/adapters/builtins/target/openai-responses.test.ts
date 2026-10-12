@@ -3747,6 +3747,942 @@ describe('openAIResponsesTargetAdapter', () => {
       }
     ]);
   });
+
+  it('emits tool_result images in an adjacent user message for chat targets', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_shot',
+              content: 'screenshot captured',
+              images: ['data:image/png;base64,c2hvdA==']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { type: 'openai_chat_completions' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const chatBody = built.value.body as {
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    const toolIndex = chatBody.messages.findIndex((message) => message.role === 'tool');
+    expect(toolIndex).toBeGreaterThanOrEqual(0);
+    // A tool message's content must stay a plain string: the chat schema only
+    // accepts text parts there, so images go into the next user message.
+    expect(chatBody.messages[toolIndex].content).toBe('screenshot captured');
+    expect(chatBody.messages[toolIndex + 1]).toEqual({
+      role: 'user',
+      content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,c2hvdA==' } }]
+    });
+    // The base64 may only ever appear inside an image part, never as text.
+    for (const message of chatBody.messages) {
+      if (typeof message.content === 'string') {
+        expect(message.content).not.toContain('c2hvdA==');
+        continue;
+      }
+      const textParts = (message.content as Array<{ type: string }>).filter(
+        (part) => part.type !== 'image_url'
+      );
+      expect(JSON.stringify(textParts)).not.toContain('c2hvdA==');
+    }
+  });
+
+  it('keeps a parallel tool_result batch contiguous and trails their images in one user message', () => {
+    const firstImage = 'data:image/png;base64,Zmlyc3Q=';
+    const secondImage = 'data:image/png;base64,c2Vjb25k';
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'call_one', name: 'screenshot', input: {} },
+            { type: 'tool_use', id: 'call_two', name: 'screenshot', input: {} }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_one',
+              content: 'first shot',
+              images: [firstImage]
+            },
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_two',
+              content: 'second shot',
+              images: [secondImage]
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { type: 'openai_chat_completions' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const chatBody = built.value.body as {
+      messages: Array<{ role: string; content: unknown; tool_call_id?: string }>;
+    };
+    // Every tool message of the parallel batch has to answer before a user turn
+    // opens; an image message wedged between them leaves call_two unanswered.
+    expect(chatBody.messages.map((message) => message.role)).toEqual([
+      'assistant',
+      'tool',
+      'tool',
+      'user'
+    ]);
+    expect(chatBody.messages[1].tool_call_id).toBe('call_one');
+    expect(chatBody.messages[2].tool_call_id).toBe('call_two');
+    expect(chatBody.messages[3]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: firstImage } },
+        { type: 'image_url', image_url: { url: secondImage } }
+      ]
+    });
+  });
+
+  it('emits tool_result images inside the native function_call_output content list', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_shot',
+              content: 'screenshot captured',
+              images: ['data:image/png;base64,c2hvdA==']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const responsesBody = built.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    // The image stays attached to its call_id instead of being re-attributed
+    // to a user turn.
+    expect(responsesBody.input).toEqual([
+      {
+        type: 'function_call_output',
+        call_id: 'call_shot',
+        output: [
+          { type: 'input_text', text: 'screenshot captured' },
+          { type: 'input_image', image_url: 'data:image/png;base64,c2hvdA==' }
+        ]
+      }
+    ]);
+  });
+
+  it('keeps each parallel tool_result image with its own call_id', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'call_one', name: 'screenshot', input: {} },
+            { type: 'tool_use', id: 'call_two', name: 'screenshot', input: {} }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_one',
+              content: '',
+              images: ['data:image/png;base64,Zmlyc3Q=']
+            },
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_two',
+              content: '',
+              images: ['data:image/png;base64,c2Vjb25k']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const responsesBody = built.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    const outputs = responsesBody.input.filter((item) => item.type === 'function_call_output');
+    expect(outputs).toEqual([
+      {
+        type: 'function_call_output',
+        call_id: 'call_one',
+        output: [{ type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' }]
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'call_two',
+        output: [{ type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' }]
+      }
+    ]);
+  });
+
+  it('falls back to an adjacent user message when the provider is text-only', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_shot',
+              content: '',
+              images: ['data:image/png;base64,c2hvdA==']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { openaiResponsesToolOutputFormat: 'text' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const responsesBody = built.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    expect(responsesBody.input).toEqual([
+      {
+        type: 'function_call_output',
+        call_id: 'call_shot',
+        output: ''
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_image',
+            image_url: 'data:image/png;base64,c2hvdA=='
+          }
+        ]
+      }
+    ]);
+  });
+
+  // The Responses source parser emits one standard message per
+  // function_call_output, so a legitimate parallel batch arrives split. The
+  // trailing image message has to wait for the batch to actually close.
+  it('trails the images of a split parallel tool batch in chat conversion', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'target-model',
+      input: [
+        { type: 'function_call', call_id: 'call_one', name: 'screenshot', arguments: '{}' },
+        { type: 'function_call', call_id: 'call_two', name: 'screenshot', arguments: '{}' },
+        {
+          type: 'function_call_output',
+          call_id: 'call_one',
+          output: [
+            { type: 'input_text', text: 'first' },
+            { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' }
+          ]
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'call_two',
+          output: [
+            { type: 'input_text', text: 'second' },
+            { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' }
+          ]
+        }
+      ]
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { type: 'openai_chat_completions' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as { messages: Array<Record<string, unknown>> };
+    expect(body.messages.map((message) => message.role)).toEqual([
+      'assistant',
+      'tool',
+      'tool',
+      'user'
+    ]);
+    expect(body.messages[3]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,Zmlyc3Q=' } },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,c2Vjb25k' } }
+      ]
+    });
+  });
+
+  it('trails the images of a split parallel tool batch in text output mode', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'target-model',
+      input: [
+        { type: 'function_call', call_id: 'call_one', name: 'screenshot', arguments: '{}' },
+        { type: 'function_call', call_id: 'call_two', name: 'screenshot', arguments: '{}' },
+        {
+          type: 'function_call_output',
+          call_id: 'call_one',
+          output: [
+            { type: 'input_text', text: 'first' },
+            { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' }
+          ]
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'call_two',
+          output: [
+            { type: 'input_text', text: 'second' },
+            { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' }
+          ]
+        }
+      ]
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { openaiResponsesToolOutputFormat: 'text' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as { input: Array<Record<string, unknown>> };
+    expect(body.input.map((item) => item.type)).toEqual([
+      'function_call',
+      'function_call',
+      'function_call_output',
+      'function_call_output',
+      'message'
+    ]);
+    expect(body.input[4]).toEqual({
+      type: 'message',
+      role: 'user',
+      content: [
+        { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' },
+        { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' }
+      ]
+    });
+  });
+
+  // A batch message that also carries its own text must not open the user turn
+  // either: the text rides along with the images once the batch closes.
+  it('defers the batch message content alongside the images in chat conversion', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'call_one', name: 'screenshot', input: {} },
+            { type: 'tool_use', id: 'call_two', name: 'screenshot', input: {} }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_one',
+              content: 'first',
+              images: ['data:image/png;base64,Zmlyc3Q=']
+            },
+            { type: 'input_text', text: 'carry on' }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_two',
+              content: 'second',
+              images: ['data:image/png;base64,c2Vjb25k']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { type: 'openai_chat_completions' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as { messages: Array<Record<string, unknown>> };
+    expect(body.messages.map((message) => message.role)).toEqual([
+      'assistant',
+      'tool',
+      'tool',
+      'user'
+    ]);
+    expect(body.messages[3]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,Zmlyc3Q=' } },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,c2Vjb25k' } },
+        { type: 'text', text: 'carry on' }
+      ]
+    });
+  });
+
+  it('defers the batch message content alongside the images in text output mode', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'call_one', name: 'screenshot', input: {} }]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_one',
+              content: 'first',
+              images: ['data:image/png;base64,Zmlyc3Q=']
+            },
+            { type: 'input_text', text: 'carry on' }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_two',
+              content: 'second',
+              images: ['data:image/png;base64,c2Vjb25k']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { openaiResponsesToolOutputFormat: 'text' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as { input: Array<Record<string, unknown>> };
+    expect(body.input.map((item) => item.type)).toEqual([
+      'function_call',
+      'function_call_output',
+      'function_call_output',
+      'message'
+    ]);
+    expect(body.input[3]).toEqual({
+      type: 'message',
+      role: 'user',
+      content: [
+        { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' },
+        { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' },
+        { type: 'input_text', text: 'carry on' }
+      ]
+    });
+  });
+
+  // The batch's last message has no successor to look ahead to, yet it still
+  // belongs to the batch: its text has to queue behind what the earlier
+  // messages deferred instead of jumping ahead of it.
+  describe('keeps the user text of a split tool batch in order', () => {
+    const anthropicRequest = {
+      model: 'target-model',
+      max_tokens: 128,
+      messages: [
+        { role: 'user', content: 'take two screenshots' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'call_one', name: 'screenshot', input: {} },
+            { type: 'tool_use', id: 'call_two', name: 'screenshot', input: {} }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_one',
+              content: [
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'Zmlyc3Q=' } }
+              ]
+            },
+            { type: 'text', text: 'earlier note' }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_two',
+              content: [
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'c2Vjb25k' } }
+              ]
+            },
+            { type: 'text', text: 'later note' }
+          ]
+        }
+      ]
+    };
+
+    it('in native output mode', () => {
+      const body = buildAnthropicOpenAITargetBody(anthropicRequest, {}) as {
+        input: Array<Record<string, unknown>>;
+      };
+      expect(body.input.slice(1)).toEqual([
+        { type: 'function_call', call_id: 'call_one', name: 'screenshot', arguments: '{}' },
+        { type: 'function_call', call_id: 'call_two', name: 'screenshot', arguments: '{}' },
+        {
+          type: 'function_call_output',
+          call_id: 'call_one',
+          output: [{ type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' }]
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'call_two',
+          output: [{ type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' }]
+        },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'earlier note' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'later note' }] }
+      ]);
+    });
+
+    it('in text output mode', () => {
+      const body = buildAnthropicOpenAITargetBody(anthropicRequest, {
+        openaiResponsesToolOutputFormat: 'text'
+      }) as { input: Array<Record<string, unknown>> };
+      expect(body.input.slice(1)).toEqual([
+        { type: 'function_call', call_id: 'call_one', name: 'screenshot', arguments: '{}' },
+        { type: 'function_call', call_id: 'call_two', name: 'screenshot', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call_one', output: '' },
+        { type: 'function_call_output', call_id: 'call_two', output: '' },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' },
+            { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' },
+            { type: 'input_text', text: 'earlier note' }
+          ]
+        },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'later note' }] }
+      ]);
+    });
+
+    it('in chat conversion', () => {
+      const body = buildAnthropicOpenAITargetBody(anthropicRequest, {
+        type: 'openai_chat_completions'
+      }) as { messages: Array<Record<string, unknown>> };
+      expect(body.messages.slice(1)).toEqual([
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            { id: 'call_one', type: 'function', function: { name: 'screenshot', arguments: '{}' } },
+            { id: 'call_two', type: 'function', function: { name: 'screenshot', arguments: '{}' } }
+          ]
+        },
+        { role: 'tool', tool_call_id: 'call_one', content: '' },
+        { role: 'tool', tool_call_id: 'call_two', content: '' },
+        {
+          role: 'user',
+          content: [
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,Zmlyc3Q=' } },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,c2Vjb25k' } },
+            { type: 'text', text: 'earlier note' }
+          ]
+        },
+        { role: 'user', content: 'later note' }
+      ]);
+    });
+  });
+
+  // Outputs of one batch need not be adjacent: a client may put a plain user
+  // message between them. Looking only one message ahead would close the batch
+  // at that message and open a user turn while call_two is still unanswered.
+  describe('keeps a batch open across an interleaved plain user message', () => {
+    const responsesRequest = {
+      model: 'target-model',
+      input: [
+        { type: 'function_call', call_id: 'call_one', name: 'screenshot', arguments: '{}' },
+        { type: 'function_call', call_id: 'call_two', name: 'screenshot', arguments: '{}' },
+        {
+          type: 'function_call_output',
+          call_id: 'call_one',
+          output: [{ type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' }]
+        },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'between' }] },
+        {
+          type: 'function_call_output',
+          call_id: 'call_two',
+          output: [{ type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' }]
+        }
+      ]
+    };
+
+    function build(targetProviderConfig: Record<string, unknown>): Record<string, unknown> {
+      const parsed = parseOpenAIResponsesRequest(responsesRequest);
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) {
+        throw new Error(parsed.error);
+      }
+      const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+        request: { headers: {} } as never,
+        standardRequest: parsed.value,
+        config: { openaiApiKey: 'sk-test', openaiBaseUrl: 'https://mock.local/v1' } as never,
+        targetProviderConfig: targetProviderConfig as never
+      });
+      expect(built.ok).toBe(true);
+      if (!built.ok) {
+        throw new Error(built.error);
+      }
+      return built.value.body as Record<string, unknown>;
+    }
+
+    it('in native output mode', () => {
+      const body = build({}) as { input: Array<Record<string, unknown>> };
+      expect(body.input.map((item) => item.type)).toEqual([
+        'function_call',
+        'function_call',
+        'function_call_output',
+        'function_call_output',
+        'message'
+      ]);
+      expect(body.input[4]).toEqual({
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'between' }]
+      });
+    });
+
+    it('in text output mode', () => {
+      const body = build({ openaiResponsesToolOutputFormat: 'text' }) as {
+        input: Array<Record<string, unknown>>;
+      };
+      expect(body.input.map((item) => item.type)).toEqual([
+        'function_call',
+        'function_call',
+        'function_call_output',
+        'function_call_output',
+        'message'
+      ]);
+      expect(body.input[4]).toEqual({
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' },
+          { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' },
+          { type: 'input_text', text: 'between' }
+        ]
+      });
+    });
+
+    it('in chat conversion', () => {
+      const body = build({ type: 'openai_chat_completions' }) as {
+        messages: Array<Record<string, unknown>>;
+      };
+      expect(body.messages.map((message) => message.role)).toEqual([
+        'assistant',
+        'tool',
+        'tool',
+        'user'
+      ]);
+      expect(body.messages[3]).toEqual({
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,Zmlyc3Q=' } },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,c2Vjb25k' } },
+          { type: 'text', text: 'between' }
+        ]
+      });
+    });
+  });
+
+  // A tool_search_output answers the same batch as the function outputs, so the
+  // user text that precedes it inside an open batch has to wait for the batch
+  // to close rather than splitting the outputs.
+  describe('holds user text ahead of a tool_search_output inside an open batch', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'call_one', name: 'screenshot', input: {} },
+            {
+              type: 'tool_search_call',
+              execution: 'client',
+              call_id: 'search_one',
+              arguments: { query: 'calendar' }
+            },
+            { type: 'tool_use', id: 'call_two', name: 'screenshot', input: {} }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_one',
+              content: 'first',
+              images: ['data:image/png;base64,Zmlyc3Q=']
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'searching next' },
+            { type: 'tool_search_output', execution: 'client', call_id: 'search_one', tools: [] }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_two',
+              content: 'second',
+              images: ['data:image/png;base64,c2Vjb25k']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    function build(targetProviderConfig: Record<string, unknown>): Record<string, unknown> {
+      const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+        request: { headers: {} } as never,
+        standardRequest,
+        config: { openaiApiKey: 'sk-test', openaiBaseUrl: 'https://mock.local/v1' } as never,
+        targetProviderConfig: targetProviderConfig as never
+      });
+      expect(built.ok).toBe(true);
+      if (!built.ok) {
+        throw new Error(built.error);
+      }
+      return built.value.body as Record<string, unknown>;
+    }
+
+    it('in native output mode', () => {
+      const body = build({}) as { input: Array<Record<string, unknown>> };
+      expect(body.input.map((item) => item.type)).toEqual([
+        'function_call',
+        'tool_search_call',
+        'function_call',
+        'function_call_output',
+        'tool_search_output',
+        'function_call_output',
+        'message'
+      ]);
+      expect(body.input[6]).toEqual({
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'searching next' }]
+      });
+    });
+
+    it('in text output mode', () => {
+      const body = build({ openaiResponsesToolOutputFormat: 'text' }) as {
+        input: Array<Record<string, unknown>>;
+      };
+      expect(body.input.map((item) => item.type)).toEqual([
+        'function_call',
+        'tool_search_call',
+        'function_call',
+        'function_call_output',
+        'tool_search_output',
+        'function_call_output',
+        'message'
+      ]);
+      expect(body.input[6]).toEqual({
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' },
+          { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' },
+          { type: 'input_text', text: 'searching next' }
+        ]
+      });
+    });
+
+    it('in chat conversion', () => {
+      const body = build({ type: 'openai_chat_completions' }) as {
+        messages: Array<Record<string, unknown>>;
+      };
+      expect(body.messages.map((message) => message.role)).toEqual([
+        'assistant',
+        'tool',
+        'tool',
+        'tool',
+        'user'
+      ]);
+      expect(body.messages.slice(1, 4).map((message) => message.tool_call_id)).toEqual([
+        'call_one',
+        'search_one',
+        'call_two'
+      ]);
+      expect(body.messages[4]).toEqual({
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,Zmlyc3Q=' } },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,c2Vjb25k' } },
+          { type: 'text', text: 'searching next' }
+        ]
+      });
+    });
+  });
 });
 
 function buildAnthropicOpenAITargetBody(

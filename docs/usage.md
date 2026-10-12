@@ -271,7 +271,7 @@ docker compose --env-file .env.production -f docker-compose.prod.yml --profile r
 - 可通过 `GATEWAY_CONFIG_PATH` 指定 JSON 配置文件路径
 - 示例文件见 `gateway.config.example.json`
 - 推荐使用 `Providers` 数组配置供应商（数组顺序即默认 fallback 顺序）
-- `Providers` 单项字段：`name`、`type`、`apikey|apiKeyEnv`、`baseurl`、`models`、`openaiChatStreamUsage`、`openaiChatReasoningSplit`、`openaiChatThinkingOptions`、`extraHeaders`、`extraBody`、`billing`
+- `Providers` 单项字段：`name`、`type`、`apikey|apiKeyEnv`、`baseurl`、`models`、`openaiChatStreamUsage`、`openaiChatReasoningSplit`、`openaiChatThinkingOptions`、`openaiResponsesToolOutputFormat`、`extraHeaders`、`extraBody`、`billing`
 - `plugins` 是统一插件入口；可声明 `providerHooks`，也可通过 `modulePath` 加载本地模块插件注册 `targetAdapters` / `sourceAdapters` / `providerHooks` / `requestHooks` / `requestTransforms` / `routeResolvers` / `responseHooks` / `streamHooks` / `httpRoutes` / `eventHooks` / `billingPublishers` / `billingOutboxes` / `eventPublishers` / `eventOutboxes` / `deliveryStateStores`，并可通过 `plugins[].config` 给模块插件透传私有配置；`sourceAdapters[].routes` 用于 LLM 源协议动态分发，`httpRoutes` 用于普通插件 HTTP 端点，详见 [Gateway Plugins](plugins.md)
 - `providerPlugins` 仍兼容旧配置；新配置建议迁移到 `plugins[].providerHooks`
 - `type` 同时用于声明 provider 类别和上游协议，支持：
@@ -284,6 +284,8 @@ docker compose --env-file .env.production -f docker-compose.prod.yml --profile r
 - `openaiChatStreamUsage` 仅对 `openai_chat_completions` 生效，默认会在流式请求中添加 `stream_options.include_usage=true`；供应商不兼容时可设为 `false` 或 `disabled` 关闭。
 - `openaiChatReasoningSplit` 仅对 `openai_chat_completions` 生效，用于控制非官方兼容字段 `reasoning_split` 以及 message 级 `reasoning_content` / `reasoning_details`：默认 `auto` 只会对 Minimax、DeepSeek 等已知需要该字段的 provider/model 自动添加或保留；可设为 `true` / `enabled` 强制添加，或 `false` / `disabled` 强制移除。
 - `openaiChatThinkingOptions` 仅对 `openai_chat_completions` 生效，用于控制非官方兼容字段 `thinking` / `output_config`：默认 `auto` 只会对 Zhipu/BigModel 等已知需要该字段的 provider/model 自动添加；可设为 `true` / `enabled` 强制添加，或 `false` / `disabled` 强制移除。
+- `openaiResponsesToolOutputFormat` 仅对 `openai_responses` 生效，用于控制带图 tool_result 的投递形态：默认 `native` 把文本与图片放进 `function_call_output.output` 内容数组（图片保持与 `call_id` 的绑定）；上游只接受字符串 `output` 时可设为 `text`，图片改为紧随整批并行工具结果之后的单条 `user` 消息。
+- 带图 `tool_result` 一律先按目标协议拆分（图片不再折进文本，避免 base64 被上游当作文本 tokenize），再按目标协议的原生位置投递：`openai_responses` 见上一条；`openai_chat_completions` 及 `openai_responses` 的 `text` 模式放进整批工具结果之后的一条 `user` 消息；`anthropic_messages` 作为 `tool_result.content` 里的 image 块；`gemini_interactions` 作为 `function_result.result` 的 image 子内容（保留 `call_id` 归属）。已知限制：`gemini_generate_content` 仅对 `gemini-3*` 模型、且仅对内联 base64 图片生效，URL 图片与更早的 Gemini 模型仍会丢弃该图片。
 - `providerPlugins` 的 `auth/request/response` 支持声明式规则：`headers`、`query`、`bodySet`、`bodyMerge`、`bodyRemove`
 - `providerPlugins` 支持值引用：`{"from":"env.XXX"}`、`{"from":"request.headers.x-foo"}`、`{"from":"request.body.user.id"}`、`{"from":"upstreamPayload.data.id"}`、`{"from":"target.providerName"}`
 - `providerPlugins.codexOauth` 字段：`accessToken`、`refreshToken`、`tokenEndpoint`、`clientId`、`scope`、`requiredScopes`、`refreshIfMissingAccessToken`、`forceRefresh`、`required`、`timeoutMs`、`authHeader`、`authScheme`；`requiredScopes` 默认要求 Codex connector scopes，只有显式设为 `[]` 才会禁用 scope 预检，且不会放宽 `required`；无效的非空值会回退到默认要求

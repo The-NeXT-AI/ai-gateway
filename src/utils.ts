@@ -194,6 +194,68 @@ export function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+/**
+ * Pull the image URL out of a content part, across the source dialects that
+ * carry images: anthropic `{type:'image',source:{type:'base64'|'url',...}}`,
+ * OpenAI chat `{type:'image_url',image_url:{url}|string}`, Responses
+ * `{type:'input_image',image_url}` and Gemini Interactions
+ * `{type:'image',data|uri,mime_type}`. Returns an HTTP(S) URL or a data URL, or
+ * undefined when the part is not an image.
+ *
+ * An explicit protocol image `type` is required. Every dialect tags its content
+ * parts, while ordinary tool output routinely carries an `image_url` business
+ * field ({title, image_url, ...}) — treating those as image parts would swallow
+ * the object and drop its other fields. Requiring the tag also keeps anthropic
+ * document blocks ({type:'document',source:{type:'base64',...}}) out.
+ */
+export function extractImageUrlFromPart(part: unknown): string | undefined {
+  if (!isObject(part)) {
+    return undefined;
+  }
+
+  const type = asString(part.type);
+  if (type !== 'image' && type !== 'image_url' && type !== 'input_image') {
+    return undefined;
+  }
+
+  const source = isObject(part.source) ? part.source : undefined;
+  if (source) {
+    const url = asString(source.url);
+    if (url) {
+      return url;
+    }
+    const data = asString(source.data);
+    if (data) {
+      return `data:${asString(source.media_type) || 'image/png'};base64,${data}`;
+    }
+    return undefined;
+  }
+
+  if (type === 'image') {
+    // Gemini Interactions carries the bytes (or the URI) directly on the part
+    // rather than on a nested anthropic-style `source`.
+    const data = asString(part.data);
+    if (data) {
+      const mediaType = asString(part.mime_type) || asString(part.mimeType) || 'image/png';
+      return `data:${mediaType};base64,${data}`;
+    }
+    const uri = asString(part.uri);
+    if (uri) {
+      return uri;
+    }
+  }
+
+  const imageField = part.image_url ?? part.image;
+  if (typeof imageField === 'string') {
+    return imageField;
+  }
+  if (isObject(imageField)) {
+    return asString(imageField.url);
+  }
+
+  return undefined;
+}
+
 export function formatErrorWithCause(error: unknown): string {
   if (!(error instanceof Error)) {
     return String(error);
@@ -253,6 +315,35 @@ export function extractTextFromPart(part: unknown): string {
   }
 
   return '';
+}
+
+/**
+ * Whether a content part is a pure text part. It is the companion predicate to
+ * `extractTextFromPart`, which cannot answer the question on its own: an empty
+ * return value there means either "not text" or "text that is empty", and
+ * callers deciding whether a remainder is losslessly collapsible need those two
+ * apart.
+ *
+ * Unlike `extractTextFromPart`, an explicit protocol text `type` is required.
+ * Tool output routinely carries plain business objects, and a `text` field is
+ * far too generic a marker on its own: `{text:'product', price:123, sku:'ABC'}`
+ * would collapse to `'product'` and silently drop the remaining fields, where
+ * the pre-split JSON serialization kept them. Only an object tagged as a
+ * protocol text block (`text` / `input_text` / `output_text`, the tag of every
+ * dialect `extractTextFromPart` reads) is treated as text; anything else stays
+ * a structured value.
+ */
+export function isTextPart(part: unknown): boolean {
+  if (typeof part === 'string') {
+    return true;
+  }
+
+  if (!isObject(part)) {
+    return false;
+  }
+
+  const type = asString(part.type);
+  return type === 'text' || type === 'input_text' || type === 'output_text';
 }
 
 export function normalizeMessageRole(role: unknown): 'system' | 'user' | 'assistant' {

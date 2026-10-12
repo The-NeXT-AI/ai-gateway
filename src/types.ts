@@ -124,6 +124,7 @@ export interface ProviderConfig {
   openaiChatStreamUsage?: 'include_usage' | 'disabled';
   openaiChatReasoningSplit?: 'auto' | 'enabled' | 'disabled';
   openaiChatThinkingOptions?: 'auto' | 'enabled' | 'disabled';
+  openaiResponsesToolOutputFormat?: 'native' | 'text';
   modelMetadata?: Record<string, ProviderModelMetadata>;
   extraHeaders: ModelScopedHeadersConfig;
   extraBody: ModelScopedBodyConfig;
@@ -1103,6 +1104,13 @@ export type StandardRequestInputContent =
       tool_use_id: string;
       name?: string;
       content: string;
+      /**
+       * Images returned by the tool, as HTTP(S) URLs or data URLs. Source
+       * adapters pull these out of structured tool outputs so targets can
+       * emit them as image parts; serializing them into `content` instead
+       * makes upstreams tokenize the raw base64 as text.
+       */
+      images?: string[];
       is_error?: boolean;
       result_format?: 'function' | 'web_search';
       tool_references?: string[];

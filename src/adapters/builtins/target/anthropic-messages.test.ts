@@ -1064,4 +1064,67 @@ describe('anthropicMessagesTargetAdapter', () => {
       }
     ]);
   });
+  // Without native tool_reference blocks the references have to survive as
+  // text. The image branch used to take item.content raw and drop them.
+  it('keeps fallback tool references when the tool_result also carries an image', () => {
+    const built = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: {
+        model: 'claude-sonnet-4-5',
+        max_output_tokens: 128,
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_shot',
+                content: 'screenshot captured',
+                tool_references: ['calendar_create'],
+                images: ['data:image/png;base64,c2hvdA==']
+              }
+            ]
+          }
+        ]
+      } as never,
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_shot',
+            content: [
+              {
+                type: 'text',
+                text: 'screenshot captured\n[{"type":"tool_reference","tool_name":"calendar_create"}]'
+              },
+              {
+                type: 'image',
+                source: {
+                  type: 'base64',
+                  media_type: 'image/png',
+                  data: 'c2hvdA=='
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]);
+  });
 });

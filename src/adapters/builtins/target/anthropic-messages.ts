@@ -415,20 +415,33 @@ function standardContentToAnthropicBlocks(
           tool_name: toolName
         }))
       : [];
+    const imageBlocks = (item.images ?? []).map((url) => ({
+      type: 'image',
+      source: standardImageUrlToAnthropicSource(url)
+    }));
+    // Without native reference blocks the references have to ride in the text.
+    // That holds for the block-array branch too: taking `item.content` raw
+    // there dropped the fallback references whenever the result also carried
+    // an image.
+    const resultText =
+      referenceBlocks.length > 0
+        ? item.content
+        : appendToolReferencesToResultContent(
+            item.content,
+            item.tool_references,
+            toolContext.functionTools
+          );
     const toolResultBlock: Record<string, unknown> = {
       type: 'tool_result',
       tool_use_id: item.tool_use_id,
       content:
-        referenceBlocks.length > 0
+        referenceBlocks.length > 0 || imageBlocks.length > 0
           ? [
-              ...(item.content ? [{ type: 'text', text: item.content }] : []),
+              ...(resultText ? [{ type: 'text', text: resultText }] : []),
+              ...imageBlocks,
               ...referenceBlocks
             ]
-          : appendToolReferencesToResultContent(
-              item.content,
-              item.tool_references,
-              toolContext.functionTools
-            )
+          : resultText
     };
     if (item.is_error !== undefined) {
       toolResultBlock.is_error = item.is_error;
@@ -437,6 +450,22 @@ function standardContentToAnthropicBlocks(
   }
 
   return blocks;
+}
+
+/**
+ * Convert a standard image URL (HTTP(S) or data URL) into an anthropic image
+ * source. Data URLs are split into their media type and base64 payload because
+ * the anthropic schema has no data-URL form; extra MIME parameters before the
+ * base64 marker are tolerated. A non-base64 data URL cannot be represented in
+ * the anthropic shape and is passed through as-is (the upstream will reject
+ * it, matching pre-patch behavior for malformed input).
+ */
+function standardImageUrlToAnthropicSource(url: string): Record<string, unknown> {
+  const dataUrl = /^data:([^;,]+)(?:;[^,]*)*;base64,(.*)$/s.exec(url);
+  if (dataUrl) {
+    return { type: 'base64', media_type: dataUrl[1], data: dataUrl[2] };
+  }
+  return { type: 'url', url };
 }
 
 function normalizeAnthropicToolInput(value: unknown): Record<string, unknown> {

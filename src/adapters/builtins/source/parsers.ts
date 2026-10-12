@@ -11,8 +11,10 @@ import {
   asNumber,
   asStop,
   asString,
+  extractImageUrlFromPart,
   extractTextFromPart,
   isObject,
+  isTextPart,
   normalizeConversationRole,
   normalizeMessageRole
 } from '../../../utils';
@@ -495,12 +497,16 @@ function normalizeGeminiInteractionInputItem(
       return null;
     }
     const name = asString(item.name) || toolNamesById.get(callId);
+    const normalizedResult = normalizeGeminiInteractionResultContent(item.result);
     const toolResult: StandardRequestInputContent = {
       type: 'tool_result',
       tool_use_id: callId,
       ...(name ? { name } : {}),
-      content: normalizeGeminiInteractionResultContent(item.result)
+      content: normalizedResult.content
     };
+    if (normalizedResult.images && normalizedResult.images.length > 0) {
+      toolResult.images = normalizedResult.images;
+    }
     return {
       type: 'message',
       role: 'user',
@@ -704,22 +710,21 @@ function normalizeGeminiInteractionThoughtSummary(value: unknown): string {
     .trim();
 }
 
-function normalizeGeminiInteractionResultContent(result: unknown): string {
+/**
+ * A `function_result.result` is a list of subcontent entries whose union is
+ * text or image, so it splits into text plus images exactly like every other
+ * dialect's tool output. Folding it into a bare string would drop the images
+ * whenever the result also carries text.
+ */
+function normalizeGeminiInteractionResultContent(result: unknown): NormalizedToolResultContent {
   if (typeof result === 'string') {
-    return result;
+    return { content: result };
   }
 
-  if (Array.isArray(result)) {
-    const text = result.map(extractTextFromPart).filter(Boolean).join('\n').trim();
-    if (text) {
-      return text;
-    }
-  }
-
-  if (isObject(result)) {
+  if (isObject(result) && !Array.isArray(result)) {
     const text = extractTextFromPart(result);
     if (text) {
-      return text;
+      return { content: text };
     }
   }
 
@@ -1156,11 +1161,15 @@ function normalizeOpenAIResponsesFunctionCallOutputItem(item: Record<string, unk
     return null;
   }
 
+  const normalizedOutput = normalizeToolResultContent(item.output ?? item.content ?? item.result);
   const toolResult: StandardRequestInputContent = {
     type: 'tool_result',
     tool_use_id: toolUseId,
-    content: normalizeToolResultContent(item.output ?? item.content ?? item.result)
+    content: normalizedOutput.content
   };
+  if (normalizedOutput.images && normalizedOutput.images.length > 0) {
+    toolResult.images = normalizedOutput.images;
+  }
   const isError = asBoolean(item.is_error);
   if (isError !== undefined) {
     toolResult.is_error = isError;
@@ -1190,7 +1199,18 @@ function normalizeFunctionArgumentsInput(value: unknown): unknown {
   return value;
 }
 
-function normalizeToolResultContent(value: unknown): string {
+interface NormalizedToolResultContent {
+  content: string;
+  images?: string[];
+}
+
+/**
+ * Serialize a tool result payload that carries no images. Extracting images
+ * into `NormalizedToolResultContent.images` instead of folding them into
+ * `content` matters: serialized base64 tokenizes as raw text upstream and
+ * blows through the context window in a single turn.
+ */
+function serializeToolResultWithoutImages(value: unknown): string {
   if (typeof value === 'string') {
     return value;
   }
@@ -1208,6 +1228,59 @@ function normalizeToolResultContent(value: unknown): string {
   }
 
   return '';
+}
+
+/**
+ * Split a tool result payload into text plus images. Images are surfaced
+ * separately so targets can emit them as image parts; folding them into
+ * `content` would make upstreams tokenize the raw base64 as text, blowing
+ * through the context window in a single turn.
+ */
+function normalizeToolResultContent(value: unknown): NormalizedToolResultContent {
+  if (typeof value === 'string') {
+    return { content: value };
+  }
+
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return { content: String(value) };
+  }
+
+  if (Array.isArray(value)) {
+    const images: string[] = [];
+    const residual: unknown[] = [];
+    for (const item of value) {
+      const imageUrl = extractImageUrlFromPart(item);
+      if (imageUrl) {
+        images.push(imageUrl);
+        continue;
+      }
+      residual.push(item);
+    }
+
+    // Collapsing to the extracted text is only lossless when *every* remaining
+    // item is text-extractable. A mixed array — text plus a file block, say —
+    // has to keep the JSON serialization, otherwise the non-text blocks are
+    // silently dropped.
+    const text = residual.map((item) => extractTextFromPart(item)).filter(Boolean).join('\n').trim();
+    let content =
+      text && residual.every(isTextPart) ? text : serializeToolResultWithoutImages(residual);
+    if (images.length === 0) {
+      return { content };
+    }
+    // Images were pulled out; an image-less remainder serializing to an empty
+    // collection must not leak brackets into the tool text.
+    if (content === '[]' || content === '{}') {
+      content = '';
+    }
+    return { content, images };
+  }
+
+  const singleImage = extractImageUrlFromPart(value);
+  if (singleImage) {
+    return { content: '', images: [singleImage] };
+  }
+
+  return { content: serializeToolResultWithoutImages(value) };
 }
 
 function stringifyUnknownInputItem(item: Record<string, unknown>): string | undefined {
@@ -1431,16 +1504,19 @@ function normalizeOpenAIChatToolResultMessage(message: Record<string, unknown>):
     return [];
   }
 
-  const content = normalizeToolResultContent(message.content);
-  if (!content) {
+  const normalizedContent = normalizeToolResultContent(message.content);
+  if (!normalizedContent.content && !normalizedContent.images) {
     return [];
   }
 
   const toolResult: StandardRequestInputContent = {
     type: 'tool_result',
     tool_use_id: toolUseId,
-    content
+    content: normalizedContent.content
   };
+  if (normalizedContent.images && normalizedContent.images.length > 0) {
+    toolResult.images = normalizedContent.images;
+  }
   const isError = asBoolean(message.is_error);
   if (isError !== undefined) {
     toolResult.is_error = isError;
@@ -1571,11 +1647,15 @@ function extractAnthropicMessageContent(
         continue;
       }
 
+      const normalizedResult = normalizeAnthropicToolResultContent(block.content);
       const toolResult: StandardRequestInputContent = {
         type: 'tool_result',
         tool_use_id: toolUseId,
-        content: normalizeAnthropicToolResultContent(block.content)
+        content: normalizedResult.content
       };
+      if (normalizedResult.images && normalizedResult.images.length > 0) {
+        toolResult.images = normalizedResult.images;
+      }
       const toolReferences = extractAnthropicToolReferences(block.content);
       if (toolReferences.length > 0) {
         toolResult.tool_references = toolReferences;
@@ -1690,49 +1770,74 @@ function normalizeAnthropicThinkingBlock(
   return null;
 }
 
-function normalizeAnthropicToolResultContent(content: unknown): string {
+function normalizeAnthropicToolResultContent(content: unknown): NormalizedToolResultContent {
   if (typeof content === 'string') {
-    return content;
+    return { content };
   }
 
   if (Array.isArray(content)) {
     const residualContent = content.filter(
       (item) => !isObject(item) || asString(item.type) !== 'tool_reference'
     );
-    const text = residualContent.map(extractTextFromPart).filter(Boolean).join('\n').trim();
-    if (text) {
-      return text;
+    const images: string[] = [];
+    const remainder: unknown[] = [];
+    for (const item of residualContent) {
+      const imageUrl = extractImageUrlFromPart(item);
+      if (imageUrl) {
+        images.push(imageUrl);
+        continue;
+      }
+      remainder.push(item);
     }
 
-    if (residualContent.length === 0) {
-      return '';
+    // Same rule as the openai normalizer: collapsing to the extracted text is
+    // only lossless when every remaining block is text-extractable, otherwise
+    // a mixed array loses its non-text blocks.
+    const text = remainder.map((item) => extractTextFromPart(item)).filter(Boolean).join('\n').trim();
+    if (text && remainder.every(isTextPart)) {
+      return images.length > 0 ? { content: text, images } : { content: text };
     }
 
+    if (remainder.length === 0) {
+      return images.length > 0 ? { content: '', images } : { content: '' };
+    }
+
+    // A tool result the client sent as structured non-text data (no images,
+    // nothing text-extractable): keep the previous JSON fallback. Never fold
+    // images back in here — serialized base64 tokenizes as raw text upstream.
     try {
-      return JSON.stringify(residualContent);
+      return images.length > 0
+        ? { content: JSON.stringify(remainder), images }
+        : { content: JSON.stringify(remainder) };
     } catch {
-      return '';
+      return images.length > 0 ? { content: '', images } : { content: '' };
     }
   }
 
   if (isObject(content)) {
+    const singleImage = extractImageUrlFromPart(content);
     const text = extractTextFromPart(content);
+    if (singleImage) {
+      return text
+        ? { content: text, images: [singleImage] }
+        : { content: '', images: [singleImage] };
+    }
     if (text) {
-      return text;
+      return { content: text };
     }
 
     try {
-      return JSON.stringify(content);
+      return { content: JSON.stringify(content) };
     } catch {
-      return '';
+      return { content: '' };
     }
   }
 
   if (typeof content === 'number' || typeof content === 'boolean') {
-    return String(content);
+    return { content: String(content) };
   }
 
-  return '';
+  return { content: '' };
 }
 
 function extractAnthropicToolReferences(content: unknown): string[] {

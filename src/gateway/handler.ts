@@ -2944,17 +2944,57 @@ async function handleVirtualModelRequest(
         upstreamResponse.ok &&
         canTreatAsLiveStreamResponse(source, targetProvider, upstreamResponse)
       ) {
+        // Same protocol on both sides (e.g. anthropic_messages -> anthropic_messages):
+        // the upstream stream is already in the client's dialect, so relaying it
+        // through the protocol converter can only lose events the converter does not
+        // model (Anthropic content_block_*) — pipe it verbatim, exactly as the
+        // non-virtual path does before it ever reaches this branch.
+        const passthroughStream = canPassthroughWithoutProtocolConversion(
+          source.adapterKey,
+          sourceAdapter.provider,
+          targetProvider,
+          targetProviderConfig
+        );
         recordGatewayStreamConversion({
           sourceAdapter: source.adapterKey,
           targetProvider,
           targetProviderName: targetProviderConfig?.name,
-          mode: 'live'
+          mode: passthroughStream ? 'passthrough' : 'live'
         });
         if (shouldBlockLiveStreamingForStrictBilling(config)) {
           await cancelResponseBody(upstreamResponse);
           return sendBadRequest(reply, strictBillingLiveStreamingUnsupportedMessage);
         }
-        const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, upstreamResponse);
+        // Mirror the non-virtual passthrough ordering (normalize -> clone -> relay):
+        // an openai_responses passthrough stream is terminated before any consumer
+        // sees it, so the raw-trace clone and billing clone both observe the
+        // normalized stream. For openai_chat (and every other protocol) this is the
+        // raw upstream response.
+        const billingStreamResponse =
+          passthroughStream && source.adapterKey === 'openai_responses' && targetProvider === 'openai'
+            ? normalizeOpenAIResponsesPassthroughStreamTermination({
+                source,
+                targetProvider,
+                targetProviderConfig,
+                model,
+                response: upstreamResponse
+              })
+            : upstreamResponse;
+        const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, billingStreamResponse);
+        // Only tee the stream via clone() when the billing/raw-trace helper will
+        // actually consume it — it early-returns otherwise (see the guard at the
+        // top of tryPublishStreamingBillingEventFromUpstreamResponse). An unread
+        // tee branch keeps the upstream body from ever being canceled, which would
+        // stall terminateOpenAIChatStreamOnDone's cancel on [DONE]/client abort.
+        // When the clone is taken, that clone() tees the body: the upstream source
+        // is canceled only once both branches are canceled, so the terminator's
+        // reader.cancel() on the relay branch does not cancel the upstream while the
+        // billing/raw-trace branch is still being read — the connection and the
+        // background billing/raw-trace promise stay open until transport EOF. Not a
+        // regression (the pre-terminator relay held the upstream the same way), and
+        // the client now closes correctly on `data: [DONE]`; the residual upstream
+        // hold is accepted knowingly.
+        const shouldCloneForBilling = config.billing.enabled || config.rawTrace.enabled;
         void tryPublishStreamingBillingEventFromUpstreamResponse(
           request,
           reply,
@@ -2966,7 +3006,7 @@ async function handleVirtualModelRequest(
           lastAttemptSequence,
           targetAdapter,
           upstreamRequest,
-          upstreamResponse.clone(),
+          shouldCloneForBilling ? billingStreamResponse.clone() : billingStreamResponse,
           model,
           targetProviderConfig,
           rawTraceStreamResponse,
@@ -2981,6 +3021,26 @@ async function handleVirtualModelRequest(
           );
         });
         attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
+        if (passthroughStream) {
+          if (shouldForceEventStreamHeaders(source, isStreaming)) {
+            forceEventStreamHeaders(reply);
+          }
+          const relayResponse =
+            source.adapterKey === 'openai_responses' &&
+            targetProviderConfig?.type === 'openai_responses'
+              ? terminateOpenAIResponsesPassthroughOnDone({
+                  source,
+                  targetProvider,
+                  targetProviderConfig,
+                  response: billingStreamResponse
+                })
+              : terminateOpenAIChatStreamOnDone({
+                  source,
+                  targetProvider,
+                  response: billingStreamResponse
+                });
+          return relayUpstreamResponse(reply, relayResponse, clientAbortSignal);
+        }
         return relayConvertedStreamFromUpstreamResponse(
           reply,
           source,
@@ -10309,6 +10369,7 @@ interface OpenAIResponsesPassthroughStreamError {
 }
 
 interface OpenAIResponsesPassthroughStreamState {
+  canceled: boolean;
   completed: boolean;
   done: boolean;
   error?: OpenAIResponsesPassthroughStreamError;
@@ -10340,6 +10401,7 @@ function normalizeOpenAIResponsesPassthroughStreamTermination(input: {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const state: OpenAIResponsesPassthroughStreamState = {
+    canceled: false,
     completed: false,
     done: false,
     outputItems: [],
@@ -10353,6 +10415,7 @@ function normalizeOpenAIResponsesPassthroughStreamTermination(input: {
       void pumpOpenAIResponsesPassthroughStream(reader, decoder, encoder, controller, state);
     },
     cancel(reason) {
+      state.canceled = true;
       return reader.cancel(reason);
     }
   });
@@ -10380,6 +10443,13 @@ async function pumpOpenAIResponsesPassthroughStream(
       processOpenAIResponsesPassthroughSseText(decoder.decode(chunk.value, { stream: true }), encoder, controller, state);
     }
 
+    if (state.canceled) {
+      // The stream was canceled mid-flight (a downstream terminator acting on the
+      // already-relayed `[DONE]`, or a client disconnect): the controller is closed,
+      // so flushing or closing it here would throw on this void-pumped promise and
+      // surface as an unhandled rejection.
+      return;
+    }
     const remaining = decoder.decode();
     if (remaining) {
       processOpenAIResponsesPassthroughSseText(remaining, encoder, controller, state);
@@ -10391,6 +10461,9 @@ async function pumpOpenAIResponsesPassthroughStream(
     }
     controller.close();
   } catch (error) {
+    if (state.canceled) {
+      return;
+    }
     if (state.error && !state.completed) {
       appendOpenAIResponsesSyntheticErrorCompletionIfNeeded(encoder, controller, state);
       if (state.syntheticCompletionSent && !state.done) {
@@ -10628,6 +10701,169 @@ function appendOpenAIResponsesSyntheticErrorCompletionIfNeeded(
     response
   });
   controller.enqueue(encoder.encode(`event: response.completed\ndata: ${payload}\n\n`));
+}
+
+// Shared pull-based terminator for same-protocol passthrough streams: SSE blocks are
+// relayed verbatim and the downstream ends after the first block matching
+// isSentinelBlock, canceling the upstream body instead of waiting for transport EOF.
+// Abrupt EOF is relayed verbatim — no terminator is ever synthesized here (FR-4).
+// The relay is pull-based (see the pump below): a stalled client applies backpressure
+// instead of buffering the whole response in memory.
+function terminateEventStreamOnSentinel(input: {
+  response: Response;
+  isSentinelBlock: (block: string) => boolean;
+}): Response {
+  if (!input.response.body || !isEventStreamResponse(input.response)) {
+    return input.response;
+  }
+
+  const reader = input.response.body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let pending = '';
+  let settled = false;
+  const cancelReader = (reason?: unknown): Promise<void> => {
+    if (settled) {
+      return Promise.resolve();
+    }
+    settled = true;
+    return reader.cancel(reason).catch(() => undefined);
+  };
+
+  // Emits every complete SSE block already buffered, in order, verbatim. Returns true
+  // once at least one block has been emitted for this pull (a full block, or a
+  // sentinel — in which case the sentinel frame is emitted, the upstream body
+  // is canceled idempotently, and the downstream closes, dropping any trailing frames
+  // without waiting for transport EOF, FR-5). Returns false when only a partial block
+  // is buffered.
+  const emitBufferedBlocks = (controller: ReadableStreamDefaultController<Uint8Array>): boolean => {
+    let emitted = false;
+    while (true) {
+      const delimiter = findSseBlockDelimiter(pending);
+      if (!delimiter) {
+        return emitted;
+      }
+      const block = pending.slice(0, delimiter.index);
+      const rawBlock = pending.slice(0, delimiter.index + delimiter.length);
+      pending = pending.slice(delimiter.index + delimiter.length);
+      if (input.isSentinelBlock(block)) {
+        controller.enqueue(encoder.encode(rawBlock));
+        void cancelReader();
+        controller.close();
+        return true;
+      }
+      controller.enqueue(encoder.encode(rawBlock));
+      emitted = true;
+    }
+  };
+
+  // A conformant SSE stream delimits every block, so the buffer above drains as soon
+  // as a block completes. A non-conformant upstream may never emit a delimiter at all:
+  // without a bound a single `pull` would read the whole — possibly endless — body into
+  // `pending`, the very eager read this pull-based pump exists to avoid. Past the cap
+  // the flushable prefix is relayed verbatim and only a small tail is retained: enough
+  // to reassemble a delimiter or a split sentinel frame (`[DONE]` is 12 chars, the
+  // longest delimiter 4), well below the cap, so any conformant block that fits under
+  // the cap is never split. A terminal block larger than the cap stays byte-exact but
+  // no longer parses as a whole block, so its termination degrades to transport EOF —
+  // the relayed bytes are still correct, only the early upstream cancel is lost.
+  const maxBufferedChars = 262_144;
+  const retainedTailChars = 64;
+  const flushOverflowedPending = (controller: ReadableStreamDefaultController<Uint8Array>): boolean => {
+    if (pending.length <= maxBufferedChars) {
+      return false;
+    }
+    let cut = pending.length - retainedTailChars;
+    const preceding = pending.charCodeAt(cut - 1);
+    if (preceding >= 0xd800 && preceding <= 0xdbff) {
+      // Keep a surrogate pair whole so the verbatim replay stays exact.
+      cut -= 1;
+    }
+    controller.enqueue(encoder.encode(pending.slice(0, cut)));
+    pending = pending.slice(cut);
+    return true;
+  };
+
+  const stream = new ReadableStream<Uint8Array>({
+    // Pull-based pump: with the default queuing strategy the downstream's outstanding
+    // demand drives every `pull`, so a stalled client applies backpressure instead of
+    // letting the whole upstream body accumulate in the controller queue. One `pull`
+    // drains every block already buffered (stopping once at least one is emitted) and,
+    // while no complete block is buffered, keeps reading one upstream chunk at a time
+    // so a block split across chunk boundaries never stalls the stream. It stops as
+    // soon as it can emit — or once the buffer overflows — so no more than a single
+    // block (or the cap) is ever read ahead of the downstream's demand.
+    async pull(controller) {
+      try {
+        while (!emitBufferedBlocks(controller)) {
+          if (flushOverflowedPending(controller)) {
+            return;
+          }
+          const chunk = await reader.read();
+          if (chunk.done) {
+            // Abrupt EOF: flush the decoder remainder and any partial block verbatim.
+            // Never synthesize a terminator here (FR-4).
+            pending += decoder.decode();
+            if (pending) {
+              controller.enqueue(encoder.encode(pending));
+            }
+            controller.close();
+            return;
+          }
+          pending += decoder.decode(chunk.value, { stream: true });
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      return cancelReader(reason);
+    }
+  });
+
+  return new Response(stream, {
+    status: input.response.status,
+    statusText: input.response.statusText,
+    headers: input.response.headers
+  });
+}
+
+function terminateOpenAIChatStreamOnDone(input: {
+  source: GatewaySourceContext;
+  targetProvider: Provider;
+  response: Response;
+}): Response {
+  if (input.source.adapterKey !== 'openai_chat' || input.targetProvider !== 'openai') {
+    return input.response;
+  }
+
+  return terminateEventStreamOnSentinel({
+    response: input.response,
+    isSentinelBlock: (block) => parseSseBlock(block).data === '[DONE]'
+  });
+}
+
+function terminateOpenAIResponsesPassthroughOnDone(input: {
+  source: GatewaySourceContext;
+  targetProvider: Provider;
+  targetProviderConfig?: ProviderConfig;
+  response: Response;
+}): Response {
+  if (
+    input.source.adapterKey !== 'openai_responses' ||
+    input.targetProvider !== 'openai' ||
+    input.targetProviderConfig?.type !== 'openai_responses'
+  ) {
+    return input.response;
+  }
+
+  return terminateEventStreamOnSentinel({
+    response: input.response,
+    // Mirror normalizeOpenAIResponsesPassthroughStreamTermination: the logical
+    // terminal of a clean Responses passthrough stream is the `[DONE]` sentinel —
+    // relay it, then end (`response.completed` alone is not the terminal).
+    isSentinelBlock: (block) => parseSseBlock(block).data === '[DONE]'
+  });
 }
 
 async function normalizeOpenAIPayloadForResponseParseRecovery(

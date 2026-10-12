@@ -158,6 +158,63 @@ describe('openai sdk responses integration', () => {
       await app.close();
     }
   });
+
+  it('observes a synthetic terminal response.completed for a virtual-alias Responses stream that errors upstream', async () => {
+    // Upstream answers a virtual-alias Responses request with created -> error and then
+    // closes the transport (abrupt EOF): no `response.completed`, no `data: [DONE]`.
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_virtual_error","object":"response","status":"in_progress","model":"gpt-5.6","output":[]}}\n\n',
+        'event: error\ndata: {"code":"context_too_large","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","sequence_number":0,"type":"error"}\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_responses', ['gpt-5.6'])],
+        [createFixedAliasProfile('alias-responses', 'virtual-responses-alias', 'openai-main/gpt-5.6')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const client = new OpenAI({
+        apiKey: 'sk-test',
+        baseURL: 'http://gateway.local/v1',
+        fetch: createInjectFetch(app)
+      });
+
+      const observedEventTypes: string[] = [];
+      let completedStatus: string | undefined;
+      const stream = client.responses.stream({
+        model: 'virtual-responses-alias',
+        input: 'trigger an upstream context_too_large error'
+      });
+
+      stream.on('event', (event) => {
+        observedEventTypes.push(event.type);
+        if (event.type === 'response.completed') {
+          completedStatus = event.response.status;
+        }
+      });
+
+      // finalResponse() rejects if the stream ends without a terminal Response, so
+      // resolving here proves the gateway synthesised a proper terminal event.
+      const response = await stream.finalResponse();
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(observedEventTypes).toContain('response.completed');
+      expect(observedEventTypes).not.toContain('error');
+      expect(completedStatus).toBe('completed');
+      expect(response.status).toBe('completed');
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 function createInjectFetch(app: ReturnType<typeof Fastify>) {
@@ -203,9 +260,13 @@ function createInjectFetch(app: ReturnType<typeof Fastify>) {
   };
 }
 
-function createConfig(providers: ProviderConfig[]): GatewayConfig {
+function createConfig(
+  providers: ProviderConfig[],
+  virtualModelProfiles?: GatewayConfig['virtualModelProfiles']
+): GatewayConfig {
   return {
     providers,
+    virtualModelProfiles,
     defaultTargetProvider: 'openai',
     defaultTargetProviders: ['openai'],
     openaiApiKey: 'openai-test-key',
@@ -323,6 +384,40 @@ function createProviderConfig(
     },
     billing: {
       byModel: {}
+    }
+  };
+}
+
+function createFixedAliasProfile(
+  key: string,
+  alias: string,
+  fixedModel: string
+): NonNullable<GatewayConfig['virtualModelProfiles']>[number] {
+  return {
+    id: `virtual-${key}`,
+    key,
+    displayName: key,
+    enabled: true,
+    match: {
+      exactAliases: [alias],
+      prefixes: [],
+      suffixes: []
+    },
+    baseModel: {
+      mode: 'fixed',
+      fixedModel
+    },
+    tools: [],
+    execution: {
+      mode: 'tool_loop',
+      maxTurns: 6,
+      maxToolCalls: 8,
+      clientToolsPolicy: 'allow',
+      streamMode: 'buffered'
+    },
+    materialization: {
+      enabled: true,
+      includeInGatewayModels: true
     }
   };
 }

@@ -13245,6 +13245,1148 @@ export function createGatewayPlugin() {
       await app.close();
     }
   });
+
+  it('relays an Anthropic-native stream verbatim when a virtual model keeps the protocol', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_native","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n\n',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Considering"}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-native"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello there"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":7}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('anthropic-main', 'anthropic_messages', [
+      'claude-sonnet-4-5-20250929'
+    ]);
+    provider.baseurl = 'https://api.anthropic.com';
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([provider], undefined, [
+        createFixedAliasProfile(
+          'alias-main',
+          'claude-sonnet-4-5-20250929',
+          'anthropic-main/claude-sonnet-4-5-20250929'
+        )
+      ]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'claude-sonnet-4-5-20250929',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(JSON.parse(String(upstreamInit.body)).model).toBe('claude-sonnet-4-5-20250929');
+
+      const events = parseJsonSseEvents(response.body);
+      expect(events.map((event) => event.event)).toEqual([
+        'message_start',
+        'content_block_start',
+        'content_block_delta',
+        'content_block_delta',
+        'content_block_stop',
+        'content_block_start',
+        'content_block_delta',
+        'content_block_stop',
+        'message_delta',
+        'message_stop'
+      ]);
+      expect(events[0]?.data.message).toMatchObject({
+        model: 'claude-sonnet-4-5-20250929',
+        content: []
+      });
+      expect(events[2]?.data.delta).toEqual({ type: 'thinking_delta', thinking: 'Considering' });
+      expect(events[3]?.data.delta).toEqual({ type: 'signature_delta', signature: 'sig-native' });
+      expect(events[6]?.data.delta).toEqual({ type: 'text_delta', text: 'Hello there' });
+      expect(events[8]?.data.usage).toMatchObject({ output_tokens: 7 });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('still converts an OpenAI-chat upstream for a virtual model on the Anthropic route', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'data: {"id":"chatcmpl_virtual_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+        'data: {"id":"chatcmpl_virtual_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"Hello there"}}]}\n\n',
+        'data: {"id":"chatcmpl_virtual_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n',
+        'data: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+        undefined,
+        [
+          createFixedAliasProfile(
+            'alias-chat',
+            'claude-haiku-4-5-20251001',
+            'openai-main/glm-5'
+          )
+        ]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+
+      const events = parseJsonSseEvents(response.body);
+      expect(events[0]?.event).toBe('message_start');
+      expect(response.body).toContain('"type":"text_delta","text":"Hello there"');
+      expect(response.body).not.toContain('event: error');
+      expect(response.body.endsWith('event: message_stop\ndata: {"type":"message_stop"}\n\n')).toBe(
+        true
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('terminates a virtual openai_chat passthrough stream on [DONE] without waiting for transport EOF (FR-1)', async () => {
+    let canceled = false;
+    const fetchMock = vi.fn(async () => {
+      return createOpenEndedSseResponse(
+        [
+          'data: {"id":"chatcmpl_virtual_chat_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+          'data: {"id":"chatcmpl_virtual_chat_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n',
+          'data: [DONE]\n\n'
+        ],
+        () => {
+          canceled = true;
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+        undefined,
+        [createFixedAliasProfile('alias-chat', 'glm-5-virtual', 'openai-main/glm-5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      // The upstream never closes the transport, so if the terminator did not act
+      // this await would hang until the test times out.
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'glm-5-virtual',
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain('data: [DONE]');
+      const upstreamCanceled = await waitForCondition(() => canceled).then(
+        () => true,
+        () => false
+      );
+      expect(
+        upstreamCanceled,
+        'the upstream virtual openai_chat body should be canceled once [DONE] is relayed'
+      ).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('terminates a virtual openai_chat passthrough stream when [DONE] is split across chunk boundaries (FR-2)', async () => {
+    const finishChunk =
+      'data: {"id":"chatcmpl_virtual_chat_split","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n';
+
+    // Both split layouts keep the transport open (createOpenEndedSseResponse never
+    // closes), so the gateway can only finish if the terminator reassembles the
+    // `data: [DONE]` sentinel across the chunk boundary and acts on it. A closed
+    // stream here would make the test vacuous: a plain verbatim relay would pass.
+    const variants: Array<{ label: string; chunks: string[] }> = [
+      { label: 'delimiter split', chunks: [finishChunk, 'data: [DON', 'E]\n\n'] },
+      { label: 'sentinel split', chunks: [finishChunk, 'data: [D', 'ONE]', '\n\n'] }
+    ];
+
+    for (const variant of variants) {
+      let canceled = false;
+      const fetchMock = vi.fn(async () => {
+        return createOpenEndedSseResponse(variant.chunks, () => {
+          canceled = true;
+        });
+      });
+      vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+      const app = Fastify({ logger: false });
+      registerGatewayRoutes(
+        app,
+        createConfig(
+          [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+          undefined,
+          [createFixedAliasProfile('alias-chat', 'glm-5-virtual', 'openai-main/glm-5')]
+        ),
+        createGatewayRuntime()
+      );
+      await app.ready();
+
+      try {
+        // No timeout wrapper: the upstream never closes the transport, so this can
+        // only resolve if the terminator ends the stream on the reassembled sentinel.
+        const response = await app.inject({
+          method: 'POST',
+          url: '/v1/chat/completions',
+          headers: {
+            'content-type': 'application/json'
+          },
+          payload: {
+            model: 'glm-5-virtual',
+            stream: true,
+            messages: [{ role: 'user', content: 'hello' }]
+          }
+        });
+
+        expect(response.statusCode, variant.label).toBe(200);
+        const doneCount = (response.body.match(/data: \[DONE\]/g) ?? []).length;
+        expect(doneCount, variant.label).toBe(1);
+        expect(response.body, variant.label).toContain('"finish_reason":"stop"');
+
+        const upstreamCanceled = await waitForCondition(() => canceled).then(
+          () => true,
+          () => false
+        );
+        expect(
+          upstreamCanceled,
+          `${variant.label}: upstream body should be canceled once the split [DONE] is relayed`
+        ).toBe(true);
+      } finally {
+        await app.close();
+      }
+    }
+  });
+
+  it('emits exactly one [DONE] when the upstream closes normally after the sentinel (FR-3)', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'data: {"id":"chatcmpl_virtual_chat_close","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n',
+        'data: {"id":"chatcmpl_virtual_chat_close","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+        'data: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+        undefined,
+        [createFixedAliasProfile('alias-chat', 'glm-5-virtual', 'openai-main/glm-5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'glm-5-virtual',
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const doneCount = (response.body.match(/data: \[DONE\]/g) ?? []).length;
+      expect(doneCount).toBe(1);
+      expect(response.body).not.toContain('event: error');
+      expect(parseJsonSseEvents(response.body)).toHaveLength(2);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('relays an abrupt-EOF virtual openai_chat stream verbatim without synthesizing [DONE] (FR-4)', async () => {
+    const finishChunk =
+      'data: {"id":"chatcmpl_virtual_chat_eof","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n';
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'data: {"id":"chatcmpl_virtual_chat_eof","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n',
+        finishChunk
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+        undefined,
+        [createFixedAliasProfile('alias-chat', 'glm-5-virtual', 'openai-main/glm-5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'glm-5-virtual',
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('"content":"partial"');
+      expect(response.body).toContain(finishChunk.trimEnd());
+      expect(response.body).not.toContain('data: [DONE]');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('drops trailing frames after the virtual openai_chat stream sentinel (FR-5)', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'data: {"id":"chatcmpl_virtual_chat_trailing","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+        'data: [DONE]\n\n',
+        'data: {"trailing":true}\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+        undefined,
+        [createFixedAliasProfile('alias-chat', 'glm-5-virtual', 'openai-main/glm-5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'glm-5-virtual',
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('data: [DONE]');
+      expect(response.body).not.toContain('"trailing"');
+      expect(response.body.endsWith('data: [DONE]\n\n')).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('cancels the upstream virtual openai_chat stream when the client disconnects (FR-6)', async () => {
+    let canceled = false;
+    const fetchMock = vi.fn(async () => {
+      return createOpenEndedSseResponse(
+        [
+          'data: {"id":"chatcmpl_virtual_chat_abort","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n'
+        ],
+        () => {
+          canceled = true;
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+        undefined,
+        [createFixedAliasProfile('alias-chat', 'glm-5-virtual', 'openai-main/glm-5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.listen({ host: '127.0.0.1', port: 0 });
+
+    const address = app.server.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('Expected Fastify to listen on a TCP port.');
+    }
+
+    try {
+      const payload = JSON.stringify({
+        model: 'glm-5-virtual',
+        stream: true,
+        messages: [{ role: 'user', content: 'hello' }]
+      });
+      const clientRequest = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: address.port,
+          path: '/v1/chat/completions',
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'content-length': Buffer.byteLength(payload)
+          }
+        },
+        (response) => {
+          response.on('data', () => undefined);
+          response.on('error', () => undefined);
+        }
+      );
+      clientRequest.on('error', () => undefined);
+      clientRequest.end(payload);
+
+      await waitForCondition(() => fetchMock.mock.calls.length === 1);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      // Simulate the browser navigating away: tear down the client socket so the
+      // server observes a real disconnect (request.raw 'aborted').
+      clientRequest.destroy();
+
+      const upstreamCanceled = await waitForCondition(() => canceled).then(
+        () => true,
+        () => false
+      );
+      expect(
+        upstreamCanceled,
+        'a client disconnect should cancel the upstream virtual openai_chat body'
+      ).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not read the whole upstream virtual openai_chat stream into memory while the client is stalled (backpressure)', async () => {
+    // Invariants already pinned by FR-1..FR-6 that this pull-based refactor must not
+    // change: frames relayed verbatim (FR-1), termination on the reassembled `data: [DONE]`
+    // sentinel (FR-1/FR-2), post-sentinel tail dropped (FR-5), abrupt EOF relayed without
+    // synthesizing `[DONE]` (FR-4), and a client disconnect canceling the upstream body
+    // (FR-6). This test only adds the new backpressure contract: while the client socket
+    // is stalled, the gateway must consume the upstream with `pull`-driven demand instead
+    // of eagerly draining the entire (multi-megabyte, never-closing) body into the queue.
+    const pad = 'x'.repeat(4096); // ~4 KiB of content per frame
+    const chunks: string[] = [];
+    for (let i = 0; i < 4096; i += 1) {
+      chunks.push(
+        `data: {"id":"chatcmpl_bp_${i}","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"${pad}"}}]}\n\n`
+      );
+    }
+
+    // Upstream that only produces a frame when the consumer pulls, never sends the
+    // `data: [DONE]` sentinel and never closes (a live transport that keeps the
+    // connection open). `pulled` counts how many frames the gateway actually read.
+    let pulled = 0;
+    let canceled = false;
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn(async () => {
+      let index = 0;
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (index < chunks.length) {
+            pulled += 1;
+            controller.enqueue(encoder.encode(chunks[index]));
+            index += 1;
+          }
+          // Intentionally never call controller.close().
+        },
+        cancel() {
+          canceled = true;
+        }
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          'content-type': 'text/event-stream; charset=utf-8'
+        }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+        undefined,
+        [createFixedAliasProfile('alias-chat', 'glm-5-virtual', 'openai-main/glm-5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.listen({ host: '127.0.0.1', port: 0 });
+
+    const address = app.server.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('Expected Fastify to listen on a TCP port.');
+    }
+
+    try {
+      const payload = JSON.stringify({
+        model: 'glm-5-virtual',
+        stream: true,
+        messages: [{ role: 'user', content: 'hello' }]
+      });
+      const clientRequest = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: address.port,
+          path: '/v1/chat/completions',
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'content-length': Buffer.byteLength(payload)
+          }
+        },
+        () => {
+          // Deliberately do NOT attach a `data` handler and do NOT call resume(): the
+          // client never reads the response body, so the gateway must apply
+          // backpressure instead of buffering the whole upstream body in memory.
+        }
+      );
+      clientRequest.on('error', () => undefined);
+      clientRequest.end(payload);
+
+      await waitForCondition(() => fetchMock.mock.calls.length === 1);
+      // Let the request settle across several macrotasks: an eager, backpressure-ignoring
+      // terminator finishes draining the upstream within these turns, while a pull-based
+      // one stalls as soon as the (unread) client socket applies backpressure.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(
+        pulled,
+        'the gateway must not read the whole upstream stream into memory while the client is not reading'
+      ).toBeLessThan(chunks.length);
+
+      // Tearing down the client socket must still cancel the upstream body (FR-6).
+      clientRequest.destroy();
+      const upstreamCanceled = await waitForCondition(() => canceled).then(
+        () => true,
+        () => false
+      );
+      expect(
+        upstreamCanceled,
+        'a client disconnect should cancel the upstream virtual openai_chat body'
+      ).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('normalizes a virtual openai_responses passthrough error stream into a synthetic terminal (FR-7)', async () => {
+    const upstreamFrames = [
+      'event: response.created\n' +
+        'data: {"type":"response.created","response":{"id":"resp_context_error","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}\n\n',
+      'event: error\n' +
+        'data: {"code":"context_too_large","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","sequence_number":0,"type":"error"}\n\n'
+    ];
+    const fetchMock = vi.fn(async () => createSseResponse(upstreamFrames));
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_responses', ['gpt-5.5'])],
+        undefined,
+        [createFixedAliasProfile('alias-resp', 'gpt-5.5-virtual', 'openai-main/gpt-5.5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          accept: 'text/event-stream',
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'gpt-5.5-virtual',
+          input: 'trigger an upstream context_too_large error',
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      // The virtual arm must reuse the same normalization the non-virtual passthrough
+      // uses: an upstream error framing with no terminal becomes a synthetic
+      // response.completed (+ data: [DONE]) the client can rely on.
+      expect(response.body).toContain('"type":"response.completed"');
+      expect(response.body).toContain('"status":"completed"');
+      expect(response.body).toContain('"error":null');
+      expect(response.body).toContain('Upstream error context_too_large:');
+      expect(response.body).toContain('data: [DONE]');
+      expect(response.body).not.toContain('event: error');
+
+      const events = parseJsonSseEvents(response.body);
+      expect(events[events.length - 1]?.event).toBe('response.completed');
+      expect(events[events.length - 1]?.data.response).toMatchObject({
+        status: 'completed',
+        error: null,
+        output_text:
+          'Upstream error context_too_large: Your input exceeds the context window of this model. Please adjust your input and try again.'
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('produces the same synthetic terminal for a virtual openai_responses passthrough error stream as the non-virtual path (FR-8)', async () => {
+    const upstreamFrames = [
+      'event: response.created\n' +
+        'data: {"type":"response.created","response":{"id":"resp_context_error","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}\n\n',
+      'event: response.in_progress\n' +
+        'data: {"type":"response.in_progress","response":{"id":"resp_context_error","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}\n\n',
+      'event: error\n' +
+        'data: {"code":"context_too_large","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","sequence_number":0,"type":"error"}\n\n'
+    ];
+
+    // Run the identical upstream error sequence once through a virtual alias and once
+    // through the plain provider path, then compare structurally (event names/order and
+    // the synthetic terminal's fields). Byte comparison is impossible: the synthetic
+    // message id and created_at are generated per request.
+    const runResponses = async (options: {
+      model: string;
+      profiles?: GatewayConfig['virtualModelProfiles'];
+    }) => {
+      const fetchMock = vi.fn(async () => createSseResponse(upstreamFrames));
+      vi.stubGlobal('fetch', fetchMock as typeof fetch);
+      const app = Fastify({ logger: false });
+      registerGatewayRoutes(
+        app,
+        createConfig(
+          [createProviderConfig('openai-main', 'openai_responses', ['gpt-5.5'])],
+          undefined,
+          options.profiles
+        ),
+        createGatewayRuntime()
+      );
+      await app.ready();
+      try {
+        return await app.inject({
+          method: 'POST',
+          url: '/v1/responses',
+          headers: {
+            accept: 'text/event-stream',
+            'content-type': 'application/json'
+          },
+          payload: {
+            model: options.model,
+            input: 'hello native stream',
+            stream: true
+          }
+        });
+      } finally {
+        await app.close();
+      }
+    };
+
+    const virtual = await runResponses({
+      model: 'gpt-5.5-virtual',
+      profiles: [createFixedAliasProfile('alias-resp', 'gpt-5.5-virtual', 'openai-main/gpt-5.5')]
+    });
+    const nonVirtual = await runResponses({ model: 'gpt-5.5' });
+
+    for (const [label, response] of [
+      ['virtual', virtual],
+      ['non-virtual', nonVirtual]
+    ] as const) {
+      expect(response.statusCode, label).toBe(200);
+      expect(response.body, label).toContain('"type":"response.completed"');
+      expect(response.body, label).toContain('"status":"completed"');
+      expect(response.body, label).toContain('"error":null');
+      expect(response.body, label).toContain('Upstream error context_too_large:');
+      expect(response.body, label).toContain('data: [DONE]');
+      expect(response.body, label).not.toContain('event: error');
+      expect(response.body.indexOf('event: response.completed'), label).toBeLessThan(
+        response.body.indexOf('data: [DONE]')
+      );
+    }
+
+    const eventShape = (body: string) =>
+      parseJsonSseEvents(body).map((event) => ({ event: event.event, type: event.data.type }));
+    expect(eventShape(virtual.body)).toEqual(eventShape(nonVirtual.body));
+
+    const terminal = (body: string) => {
+      const events = parseJsonSseEvents(body);
+      const completed = events.find((event) => event.data.type === 'response.completed');
+      return completed?.data.response;
+    };
+    const virtualTerminal = terminal(virtual.body);
+    const nonVirtualTerminal = terminal(nonVirtual.body);
+    expect(virtualTerminal).toMatchObject({
+      id: 'resp_context_error',
+      status: 'completed',
+      model: 'gpt-5.5',
+      error: null,
+      output_text: nonVirtualTerminal.output_text
+    });
+    expect(virtualTerminal.output_text).toBe(nonVirtualTerminal.output_text);
+  });
+
+  it('does not double-terminate a virtual openai_responses stream that already ends cleanly (FR-9)', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: response.created\n' +
+          'data: {"type":"response.created","response":{"id":"resp_virtual_clean","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}\n\n',
+        'event: response.completed\n' +
+          'data: {"type":"response.completed","response":{"id":"resp_virtual_clean","object":"response","status":"completed","model":"gpt-5.5","output":[{"id":"msg_virtual_clean","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"all good"}]}]}}\n\n',
+        'data: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_responses', ['gpt-5.5'])],
+        undefined,
+        [createFixedAliasProfile('alias-resp', 'gpt-5.5-virtual', 'openai-main/gpt-5.5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          accept: 'text/event-stream',
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'gpt-5.5-virtual',
+          input: 'hello native stream',
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      // The guard (`syntheticCompletionSent && !state.done`) must leave a stream that
+      // already carries a real terminal untouched: exactly one completed + one [DONE].
+      expect((response.body.match(/"type":"response\.completed"/g) ?? []).length).toBe(1);
+      expect((response.body.match(/data: \[DONE\]/g) ?? []).length).toBe(1);
+      expect(response.body).not.toContain('event: error');
+      // The real upstream terminal is relayed as-is (not replaced by a synthetic one).
+      expect(response.body).toContain('"id":"resp_virtual_clean"');
+      expect(response.body).toContain('"text":"all good"');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('converts a virtual openai_responses JSON error into the gateway fallback error without SSE framing (FR-11)', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({ error: { message: 'bad request', type: 'invalid_request_error' } }),
+        {
+          status: 400,
+          headers: { 'content-type': 'application/json' }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_responses', ['gpt-5.5'])],
+        undefined,
+        [createFixedAliasProfile('alias-resp', 'gpt-5.5-virtual', 'openai-main/gpt-5.5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          accept: 'text/event-stream',
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'gpt-5.5-virtual',
+          input: 'hello native stream',
+          stream: true
+        }
+      });
+
+      // The non-2xx upstream answer is converted into the gateway's own fallback error
+      // envelope (not relayed raw): it must stay a JSON body, must not be wrapped in SSE,
+      // must not gain a synthetic response.completed, and must not gain a [DONE].
+      expect(response.statusCode).toBe(400);
+      expect(response.headers['content-type']).toContain('application/json');
+      const body = JSON.parse(response.body) as { error: { message: string; attempts: unknown[] } };
+      expect(body.error.message).toBe('All target providers failed.');
+      expect(JSON.stringify(body.error.attempts)).toContain('bad request');
+      expect(response.body).not.toContain('data: [DONE]');
+      expect(response.body).not.toContain('event: response.completed');
+      expect(response.body).not.toMatch(/^data: /m);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('relays a Gemini-native stream verbatim for a virtual model that keeps the protocol (FR-13d)', async () => {
+    const upstreamFrame =
+      'data: {"candidates":[{"content":{"parts":[{"text":"hello"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1,"totalTokenCount":3},"modelVersion":"gemini-3.5-flash"}\n\n';
+    const fetchMock = vi.fn(async () => createSseResponse([upstreamFrame]));
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('gemini-main', 'gemini_generate_content', ['gemini-3.5-flash'])],
+        undefined,
+        [createFixedAliasProfile('alias-gemini', 'gemini-virtual', 'gemini-main/gemini-3.5-flash')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/models/gemini-virtual:streamGenerateContent?alt=sse',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          contents: [{ role: 'user', parts: [{ text: 'hello' }] }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toContain('gemini-3.5-flash:generateContent?alt=sse');
+      // Coarse check that the pipeline did not break same-protocol Gemini passthrough: the
+      // openai_responses/openai_chat guards must leave the frame byte-for-byte untouched (no
+      // framing, no injected sentinel). A single Gemini frame carries no [DONE], so this
+      // byte-equality assertion would also hold without a terminator and would not catch a
+      // self-gate regression — it is a smoke check, not an exhaustive one.
+      expect(response.body).toBe(upstreamFrame);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('terminates a virtual openai_responses passthrough stream on the [DONE] sentinel without waiting for transport EOF (FR-14)', async () => {
+    let canceled = false;
+    const fetchMock = vi.fn(async () => {
+      return createOpenEndedSseResponse(
+        [
+          'event: response.created\n' +
+            'data: {"type":"response.created","response":{"id":"resp_virtual_open_transport","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}\n\n',
+          'event: response.completed\n' +
+            'data: {"type":"response.completed","response":{"id":"resp_virtual_open_transport","object":"response","status":"completed","model":"gpt-5.5","output":[{"id":"msg_virtual_open_transport","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"all good"}]}]}}\n\n',
+          'data: [DONE]\n\n',
+          'event: response.output_text.delta\n' +
+            'data: {"type":"response.output_text.delta","item_id":"msg_open_transport","output_index":0,"content_index":0,"delta":"tail-drop-marker"}\n\n'
+        ],
+        () => {
+          canceled = true;
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_responses', ['gpt-5.5'])],
+        undefined,
+        [createFixedAliasProfile('alias-resp', 'gpt-5.5-virtual', 'openai-main/gpt-5.5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      // The upstream never closes the transport, so if the terminator did not act on
+      // the logical terminal this await would hang until the test times out.
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          accept: 'text/event-stream',
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'gpt-5.5-virtual',
+          input: 'hello native stream',
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain('"type":"response.completed"');
+      expect(response.body).toContain('data: [DONE]');
+      // The [DONE] sentinel is the logical terminal: the transport is canceled instead
+      // of being drained to EOF, so the trailing frame past it is never relayed
+      // (FR-5 analog for the responses arm).
+      expect(response.body).not.toContain('tail-drop-marker');
+      const upstreamCanceled = await waitForCondition(() => canceled).then(
+        () => true,
+        () => false
+      );
+      expect(
+        upstreamCanceled,
+        'the upstream virtual openai_responses body should be canceled once [DONE] is relayed'
+      ).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('terminates a virtual openai_responses passthrough stream when the [DONE] sentinel is split across chunk boundaries and drops the tail (FR-15)', async () => {
+    const createdFrame =
+      'event: response.created\n' +
+      'data: {"type":"response.created","response":{"id":"resp_virtual_split_completed","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}\n\n';
+    const completedFrame =
+      'event: response.completed\n' +
+      'data: {"type":"response.completed","response":{"id":"resp_virtual_split_completed","object":"response","status":"completed","model":"gpt-5.5","output":[]}}\n\n';
+    const doneFrame = 'data: [DONE]\n\n';
+    const trailingFrame =
+      'event: response.output_text.delta\n' +
+      'data: {"type":"response.output_text.delta","item_id":"msg_tail","output_index":0,"content_index":0,"delta":"tail-drop-marker"}\n\n';
+
+    // Both split layouts keep the transport open (createOpenEndedSseResponse never
+    // closes), so the chain can only finish if the block reassembly survives the
+    // fragmenting and the terminator acts on the reassembled logical terminal. A
+    // closed stream here would make the test vacuous: a plain verbatim relay would
+    // still fail (the transport stays open), but the reassembly itself would be
+    // untested.
+    const variants: Array<{ label: string; chunks: string[] }> = [
+      {
+        label: 'delimiter split',
+        chunks: [createdFrame, completedFrame, doneFrame.slice(0, -2), '\n\n', trailingFrame]
+      },
+      {
+        label: 'payload split',
+        chunks: [createdFrame, completedFrame, doneFrame.slice(0, 6), doneFrame.slice(6), trailingFrame]
+      }
+    ];
+
+    for (const variant of variants) {
+      let canceled = false;
+      const fetchMock = vi.fn(async () => {
+        return createOpenEndedSseResponse(variant.chunks, () => {
+          canceled = true;
+        });
+      });
+      vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+      const app = Fastify({ logger: false });
+      registerGatewayRoutes(
+        app,
+        createConfig(
+          [createProviderConfig('openai-main', 'openai_responses', ['gpt-5.5'])],
+          undefined,
+          [createFixedAliasProfile('alias-resp', 'gpt-5.5-virtual', 'openai-main/gpt-5.5')]
+        ),
+        createGatewayRuntime()
+      );
+      await app.ready();
+
+      try {
+        const response = await app.inject({
+          method: 'POST',
+          url: '/v1/responses',
+          headers: {
+            accept: 'text/event-stream',
+            'content-type': 'application/json'
+          },
+          payload: {
+            model: 'gpt-5.5-virtual',
+            input: `hello native stream (${variant.label})`,
+            stream: true
+          }
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(
+          response.body.match(/"type":"response\.completed"/g) ?? [],
+          `${variant.label}: exactly the reassembled logical terminal is relayed`
+        ).toHaveLength(1);
+        // The terminator closes at the logical terminal: the reassembled upstream
+        // [DONE] is relayed exactly once and the trailing frame past it is dropped,
+        // not relayed (FR-5 analog).
+        expect(
+          response.body.match(/data: \[DONE\]/g) ?? [],
+          `${variant.label}: the split [DONE] sentinel is reassembled and relayed exactly once`
+        ).toHaveLength(1);
+        expect(response.body, `${variant.label}: tail past the terminal is dropped`).not.toContain(
+          'tail-drop-marker'
+        );
+        const upstreamCanceled = await waitForCondition(() => canceled).then(
+          () => true,
+          () => false
+        );
+        expect(
+          upstreamCanceled,
+          `${variant.label}: the upstream body should be canceled once [DONE] is relayed`
+        ).toBe(true);
+      } finally {
+        await app.close();
+      }
+    }
+  });
+
+  it('ends a virtual openai_responses passthrough stream after an upstream error frame and [DONE] on an open transport without surfacing an unhandled rejection (FR-16)', async () => {
+    let canceled = false;
+    const fetchMock = vi.fn(async () => {
+      return createOpenEndedSseResponse(
+        [
+          'event: response.created\n' +
+            'data: {"type":"response.created","response":{"id":"resp_virtual_error_done","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}\n\n',
+          'event: error\n' +
+            'data: {"code":"context_too_large","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","sequence_number":0,"type":"error"}\n\n',
+          'data: [DONE]\n\n',
+          'event: response.output_text.delta\n' +
+            'data: {"type":"response.output_text.delta","item_id":"msg_error_done","output_index":0,"content_index":0,"delta":"tail-drop-marker"}\n\n'
+        ],
+        () => {
+          canceled = true;
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_responses', ['gpt-5.5'])],
+        undefined,
+        [createFixedAliasProfile('alias-resp', 'gpt-5.5-virtual', 'openai-main/gpt-5.5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      // The synthetic completion is flushed by the normalization when [DONE] is
+      // relayed (an error frame was seen first), then the [DONE] terminator ends the
+      // stream and cancels the normalization pump mid-read. Without a cancellation
+      // guard the pump resumed on the canceled controller and threw an unhandled
+      // rejection, which terminates the whole process on Node >= 20.
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          accept: 'text/event-stream',
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'gpt-5.5-virtual',
+          input: 'trigger an upstream context_too_large error',
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('"type":"response.completed"');
+      expect(response.body).toContain('Upstream error context_too_large:');
+      expect(response.body).toContain('data: [DONE]');
+      expect(response.body).not.toContain('event: error');
+      expect(response.body).not.toContain('tail-drop-marker');
+      const upstreamCanceled = await waitForCondition(() => canceled).then(
+        () => true,
+        () => false
+      );
+      expect(
+        upstreamCanceled,
+        'the upstream body should be canceled once [DONE] is relayed'
+      ).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 function restoreEnvValue(name: string, value: string | undefined): void {
@@ -13560,6 +14702,40 @@ function createVirtualSuffixProfile(
   };
 }
 
+function createFixedAliasProfile(
+  key: string,
+  alias: string,
+  fixedModel: string
+): NonNullable<GatewayConfig['virtualModelProfiles']>[number] {
+  return {
+    id: `virtual-${key}`,
+    key,
+    displayName: key,
+    enabled: true,
+    match: {
+      exactAliases: [alias],
+      prefixes: [],
+      suffixes: []
+    },
+    baseModel: {
+      mode: 'fixed',
+      fixedModel
+    },
+    tools: [],
+    execution: {
+      mode: 'tool_loop',
+      maxTurns: 6,
+      maxToolCalls: 8,
+      clientToolsPolicy: 'allow',
+      streamMode: 'buffered'
+    },
+    materialization: {
+      enabled: true,
+      includeInGatewayModels: true
+    }
+  };
+}
+
 async function waitForCondition(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 1000;
   while (Date.now() < deadline) {
@@ -13579,6 +14755,35 @@ function createSseResponse(chunks: string[]): Response {
         controller.enqueue(new TextEncoder().encode(chunk));
       }
       controller.close();
+    }
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8'
+    }
+  });
+}
+
+// Upstream stream that enqueues every chunk but never closes: the transport stays
+// open past the logical `data: [DONE]` sentinel, exactly like a provider that keeps
+// the connection alive. The constructor `cancel` callback (not a `body.cancel`
+// override) is the hook the terminator triggers via `reader.cancel()`.
+function createOpenEndedSseResponse(chunks: string[], onCancel?: () => void): Response {
+  let canceled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(new TextEncoder().encode(chunk));
+      }
+      // Intentionally never call controller.close().
+    },
+    cancel() {
+      if (!canceled) {
+        canceled = true;
+        onCancel?.();
+      }
     }
   });
 

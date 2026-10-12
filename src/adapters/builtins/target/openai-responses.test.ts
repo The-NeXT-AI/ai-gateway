@@ -307,7 +307,7 @@ describe('openAIResponsesTargetAdapter', () => {
     ]);
   });
 
-  it('splits the user message around tool_search_output items in content order', () => {
+  it('emits tool_search_output before the user message text', () => {
     const standardRequest = {
       model: 'target-model',
       max_output_tokens: 128,
@@ -341,11 +341,6 @@ describe('openAIResponsesTargetAdapter', () => {
     };
     expect(responsesBody.input).toEqual([
       {
-        type: 'message',
-        role: 'user',
-        content: [{ type: 'input_text', text: 'before' }]
-      },
-      {
         type: 'tool_search_output',
         execution: 'client',
         call_id: 'c1',
@@ -354,9 +349,208 @@ describe('openAIResponsesTargetAdapter', () => {
       {
         type: 'message',
         role: 'user',
-        content: [{ type: 'input_text', text: 'after' }]
+        content: [{ type: 'input_text', text: 'before\nafter' }]
       }
     ]);
+  });
+
+  describe('keeps tool outputs adjacent to their calls when the user turn also carries text', () => {
+    const buildResponsesInputFromAnthropic = (body: Record<string, unknown>) => {
+      const parsed = parseAnthropicMessagesRequest({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 256,
+        ...body
+      });
+      if (!parsed.ok) {
+        throw new Error('anthropic request did not parse');
+      }
+      const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+        request: { headers: {} } as never,
+        standardRequest: parsed.value,
+        config: {
+          openaiApiKey: 'sk-test',
+          openaiBaseUrl: 'https://mock.local/v1'
+        } as never
+      });
+      if (!built.ok) {
+        throw new Error('responses request was not built');
+      }
+      return (built.value.body as { input: Array<Record<string, unknown>> }).input;
+    };
+
+    const bashCalls = {
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', id: 'toolu_a', name: 'Bash', input: { command: 'ls' } },
+        { type: 'tool_use', id: 'toolu_b', name: 'Bash', input: { command: 'pwd' } }
+      ]
+    };
+    const expectedBashCalls = [
+      { type: 'function_call', call_id: 'toolu_a', name: 'Bash', arguments: '{"command":"ls"}' },
+      { type: 'function_call', call_id: 'toolu_b', name: 'Bash', arguments: '{"command":"pwd"}' }
+    ];
+    const expectedBashOutputs = [
+      { type: 'function_call_output', call_id: 'toolu_a', output: 'a.txt' },
+      { type: 'function_call_output', call_id: 'toolu_b', output: '/repo' }
+    ];
+
+    it('emits text that follows the tool results after the function_call_output items', () => {
+      const input = buildResponsesInputFromAnthropic({
+        messages: [
+          bashCalls,
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_use_id: 'toolu_a', content: 'a.txt' },
+              { type: 'tool_result', tool_use_id: 'toolu_b', content: '/repo' },
+              { type: 'text', text: 'Describe your most recent action in 3-5 words' }
+            ]
+          }
+        ]
+      });
+
+      expect(input).toEqual([
+        ...expectedBashCalls,
+        ...expectedBashOutputs,
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'Describe your most recent action in 3-5 words' }]
+        }
+      ]);
+    });
+
+    it('emits text that precedes the tool results after the function_call_output items', () => {
+      const input = buildResponsesInputFromAnthropic({
+        messages: [
+          bashCalls,
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'The coordinator sent a message while you were working' },
+              { type: 'tool_result', tool_use_id: 'toolu_a', content: 'a.txt' },
+              { type: 'tool_result', tool_use_id: 'toolu_b', content: '/repo' }
+            ]
+          }
+        ]
+      });
+
+      expect(input).toEqual([
+        ...expectedBashCalls,
+        ...expectedBashOutputs,
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'The coordinator sent a message while you were working' }
+          ]
+        }
+      ]);
+    });
+
+    it('emits deferred tool discovery text after every tool output of the turn', () => {
+      const input = buildResponsesInputFromAnthropic({
+        tools: [
+          {
+            name: 'ToolSearch',
+            description: 'Find tools needed for the current task.',
+            input_schema: { type: 'object', properties: { query: { type: 'string' } } }
+          },
+          {
+            name: 'calendar_create',
+            description: 'Create a calendar event.',
+            defer_loading: true,
+            input_schema: { type: 'object', properties: { title: { type: 'string' } } }
+          },
+          {
+            name: 'Bash',
+            description: 'Run a shell command.',
+            input_schema: { type: 'object', properties: { command: { type: 'string' } } }
+          }
+        ],
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', id: 'toolu_search', name: 'ToolSearch', input: { query: 'calendar' } },
+              { type: 'tool_use', id: 'toolu_a', name: 'Bash', input: { command: 'ls' } }
+            ]
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_search',
+                content: [
+                  { type: 'tool_reference', tool_name: 'calendar_create' },
+                  { type: 'text', text: 'tool loaded' }
+                ]
+              },
+              { type: 'tool_result', tool_use_id: 'toolu_a', content: 'a.txt' },
+              { type: 'text', text: 'keep going' }
+            ]
+          }
+        ]
+      });
+
+      expect(input.map((item) => item.type)).toEqual([
+        'tool_search_call',
+        'function_call',
+        'tool_search_output',
+        'function_call_output',
+        'message',
+        'message'
+      ]);
+      expect(input.slice(-2)).toEqual([
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'tool loaded' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'keep going' }] }
+      ]);
+    });
+
+    it('emits web search result text after every tool output of the turn', () => {
+      const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+        request: { headers: {} } as never,
+        standardRequest: {
+          model: 'target-model',
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_search',
+                  content: '{"query":"weather"}',
+                  result_format: 'web_search'
+                },
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_time',
+                  content: '10:00',
+                  result_format: 'function'
+                }
+              ]
+            }
+          ]
+        } as never,
+        config: {
+          openaiApiKey: 'sk-test',
+          openaiBaseUrl: 'https://mock.local/v1'
+        } as never
+      });
+      expect(built.ok).toBe(true);
+      if (!built.ok) {
+        return;
+      }
+
+      const input = (built.value.body as { input: Array<Record<string, unknown>> }).input;
+      expect(input.map((item) => item.type)).toEqual([
+        'web_search_call',
+        'function_call_output',
+        'message'
+      ]);
+    });
   });
 
   it('preserves OpenAI server tool usage counters in standard responses', () => {

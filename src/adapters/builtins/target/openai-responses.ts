@@ -553,17 +553,7 @@ function standardInputToOpenAIResponsesInput(
     // `input_image` is a message content part in the Responses schema, not a
     // top-level input item — text and images must share one user message in
     // their original order.
-    let pendingContent: Array<Record<string, unknown>> | undefined;
-    const flushPendingUserMessage = () => {
-      if (pendingContent && pendingContent.length > 0) {
-        items.push({
-          type: 'message',
-          role,
-          content: pendingContent
-        });
-      }
-      pendingContent = undefined;
-    };
+    const userMessageContent: Array<Record<string, unknown>> = [];
 
     for (const item of message.content) {
       if (item.type === 'input_text') {
@@ -571,21 +561,19 @@ function standardInputToOpenAIResponsesInput(
         if (!text) {
           continue;
         }
-        const previous = pendingContent?.at(-1);
+        const previous = userMessageContent.at(-1);
         if (previous?.type === 'input_text') {
           previous.text = `${previous.text}\n${text}`;
           continue;
         }
-        pendingContent ??= [];
-        pendingContent.push({
+        userMessageContent.push({
           type: 'input_text',
           text
         });
         continue;
       }
       if (item.type === 'input_image') {
-        pendingContent ??= [];
-        pendingContent.push({
+        userMessageContent.push({
           type: 'input_image',
           image_url: item.image_url
         });
@@ -594,7 +582,6 @@ function standardInputToOpenAIResponsesInput(
       if (item.type !== 'tool_search_output') {
         continue;
       }
-      flushPendingUserMessage();
       items.push({
         type: 'tool_search_output',
         execution: item.execution,
@@ -603,8 +590,8 @@ function standardInputToOpenAIResponsesInput(
         tools: item.tools
       });
     }
-    flushPendingUserMessage();
 
+    const toolResultMessages: Array<Record<string, unknown>> = [];
     const toolResults = collectUserToolResults(message.content);
     for (const toolResult of toolResults) {
       const discovery = deferredToolSearch?.discoveries.get(toolResult.tool_call_id);
@@ -620,7 +607,7 @@ function standardInputToOpenAIResponsesInput(
             .filter((tool): tool is Record<string, unknown> => Boolean(tool))
         });
         if (toolResult.content) {
-          items.push({
+          toolResultMessages.push({
             type: 'message',
             role: 'user',
             content: [{ type: 'input_text', text: toolResult.content }]
@@ -636,7 +623,7 @@ function standardInputToOpenAIResponsesInput(
           status: 'completed',
           action: normalizeWebSearchAction(toolResult.content)
         });
-        items.push({
+        toolResultMessages.push({
           type: 'message',
           role: 'user',
           content: [
@@ -657,6 +644,14 @@ function standardInputToOpenAIResponsesInput(
           toolResult.tool_references,
           tools
         )
+      });
+    }
+    items.push(...toolResultMessages);
+    if (userMessageContent.length > 0) {
+      items.push({
+        type: 'message',
+        role,
+        content: userMessageContent
       });
     }
   }

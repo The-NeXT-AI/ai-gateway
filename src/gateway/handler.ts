@@ -77,6 +77,10 @@ import {
   relayConvertedStreamFromUpstreamResponse
 } from './streaming-conversion';
 import {
+  buildStreamTerminalErrorFrames,
+  guardStreamTerminalError
+} from './stream-terminal-error';
+import {
   addNamespaceFieldsToStandardResponse,
   isHostedWebSearchTool
 } from '../adapters/builtins/target/tools';
@@ -1070,7 +1074,14 @@ export async function handleGatewayRequest(
         if (shouldForceEventStreamHeaders(source, isStreaming)) {
           forceEventStreamHeaders(reply);
         }
-        return relayUpstreamResponse(reply, upstreamResponse, clientAbortSignal);
+        return relayUpstreamResponse(
+          reply,
+          guardStreamTerminalError(upstreamResponse, {
+            adapterKey: source.adapterKey,
+            signal: clientAbortSignal
+          }),
+          clientAbortSignal
+        );
       } else {
         const streamHookResult = await applyGatewayPluginStreamResponseHooks(runtime.streamHooks.list(), {
           request,
@@ -1160,7 +1171,14 @@ export async function handleGatewayRequest(
       if (shouldForceEventStreamHeaders(source, isStreaming)) {
         forceEventStreamHeaders(reply);
       }
-      return relayUpstreamResponse(reply, passthroughStreamResponse, clientAbortSignal);
+      return relayUpstreamResponse(
+        reply,
+        guardStreamTerminalError(passthroughStreamResponse, {
+          adapterKey: source.adapterKey,
+          signal: clientAbortSignal
+        }),
+        clientAbortSignal
+      );
     }
 
     if (isStreaming) {
@@ -4734,17 +4752,13 @@ function buildOptimisticVirtualModelStreamErrorFrames(
   source: GatewaySourceContext,
   message: string
 ): string[] {
-  const payload = JSON.stringify({
-    type: 'error',
-    error: {
-      message
-    }
-  });
-
-  if (source.adapterKey === 'openai_responses') {
-    return [`data: ${payload}\n\n`, 'data: [DONE]\n\n'];
+  const frames = buildStreamTerminalErrorFrames({ adapterKey: source.adapterKey, message });
+  if (frames.length > 0) {
+    return frames;
   }
 
+  // Adapters without a protocol-native error event keep the generic shape.
+  const payload = JSON.stringify({ type: 'error', error: { message } });
   return [`event: error\ndata: ${payload}\n\n`];
 }
 

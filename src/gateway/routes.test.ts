@@ -12539,6 +12539,150 @@ export function createGatewayPlugin() {
     }
   });
 
+  it('reports a truncated Anthropic upstream stream as a terminal error event', async () => {
+    const fetchMock = vi.fn(async () =>
+      createTruncatedSseResponse(
+        [
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_cut","type":"message","role":"assistant","model":"claude-sonnet-4","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"live"}}\n\n'
+        ],
+        new Error('terminated')
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([
+        createProviderConfig('anthropic-main', 'anthropic_messages', ['claude-sonnet-4'])
+      ]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'anthropic-main'
+        },
+        payload: {
+          model: 'claude-sonnet-4',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'Think about it' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // The chunk that was mid-flight when the body failed is lost with the
+      // destroyed source stream, so assert on the bytes the client did get.
+      expect(response.body).toContain('"type":"message_start"');
+      expect(response.body.match(/^event: error$/gm)).toHaveLength(1);
+      expect(response.body).toContain('"type":"api_error"');
+      expect(response.body).toContain('Upstream stream failed before the response completed.');
+      expect(response.body).not.toContain('event: message_stop');
+      expect(response.body.indexOf('event: error')).toBeGreaterThan(
+        response.body.indexOf('event: message_start')
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('reports a truncated OpenAI chat upstream stream as an error chunk and done sentinel', async () => {
+    const fetchMock = vi.fn(async () =>
+      createTruncatedSseResponse(
+        [
+          'data: {"id":"chatcmpl_cut","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n',
+          'data: {"id":"chatcmpl_cut","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":" there"}}]}\n\n'
+        ],
+        new Error('terminated')
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          stream: true,
+          messages: [{ role: 'user', content: 'Say hi' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('"delta":{"content":"hi"}');
+      expect(response.body).toContain('"code":"upstream_stream_error"');
+      expect(response.body.endsWith('data: [DONE]\n\n')).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('reports a truncated OpenAI Responses upstream stream as a failed response event', async () => {
+    const fetchMock = vi.fn(async () =>
+      createTruncatedSseResponse(
+        [
+          'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_cut","object":"response","status":"in_progress","model":"gpt-5","output":[]}}\n\n'
+        ],
+        new Error('terminated')
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('responses-main', 'openai_responses', ['gpt-5'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'responses-main'
+        },
+        payload: {
+          model: 'gpt-5',
+          stream: true,
+          input: 'Say hi'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('event: response.created');
+      expect(response.body.match(/^event: response\.failed$/gm)).toHaveLength(1);
+      expect(response.body).toContain('"status":"failed"');
+      expect(response.body.endsWith('data: [DONE]\n\n')).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('streams buffered virtual model responses as OpenAI Responses events', async () => {
     const fetchMock = vi
       .fn()
@@ -13579,6 +13723,27 @@ function createSseResponse(chunks: string[]): Response {
         controller.enqueue(new TextEncoder().encode(chunk));
       }
       controller.close();
+    }
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8'
+    }
+  });
+}
+
+function createTruncatedSseResponse(chunks: string[], error: Error): Response {
+  let index = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(new TextEncoder().encode(chunks[index]));
+        index += 1;
+        return;
+      }
+      controller.error(error);
     }
   });
 

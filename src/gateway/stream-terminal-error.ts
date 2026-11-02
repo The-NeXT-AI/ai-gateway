@@ -1,3 +1,6 @@
+import { createSseEventTracker, type SseEvent, type SseEventTracker } from './stream-terminal-events';
+import { asString, isObject } from '../utils';
+
 const defaultTerminalErrorMessage = 'Upstream stream failed before the response completed.';
 const upstreamStreamErrorCode = 'upstream_stream_error';
 const defaultTerminalErrorType = 'api_error';
@@ -33,10 +36,18 @@ const terminalSseEventNames: Record<string, true> = {
   'response.incomplete': true
 };
 
-// A quoted `type` can only appear at the JSON structure level: text carried by a
-// model is escaped, so a delta that merely contains the word cannot match here.
-const terminalSsePayloadPattern =
-  /"type"\s*:\s*"(?:error|message_stop|response\.(?:completed|error|failed|incomplete))"/;
+// A terminal `type` is only meaningful on the payload's own top level. Nested
+// objects carry provider or tool data - an Anthropic tool input can hold
+// `{"type":"error"}` quite legitimately - so a nested occurrence says nothing
+// about the stream.
+const terminalSsePayloadTypes: Record<string, true> = {
+  error: true,
+  message_stop: true,
+  'response.completed': true,
+  'response.error': true,
+  'response.failed': true,
+  'response.incomplete': true
+};
 
 export interface StreamTerminalErrorFrameInput {
   adapterKey: string;
@@ -97,9 +108,9 @@ export function buildStreamTerminalErrorFrames(input: StreamTerminalErrorFrameIn
   }
 }
 
-export function createSseTerminalEventDetector(): SseTerminalEventDetector {
-  const decoder = new TextDecoder();
-  let buffer = '';
+export function createSseTerminalEventDetector(
+  tracker: SseEventTracker = createSseEventTracker()
+): SseTerminalEventDetector {
   let terminalEventSeen = false;
 
   return {
@@ -109,16 +120,14 @@ export function createSseTerminalEventDetector(): SseTerminalEventDetector {
         return;
       }
 
-      buffer += decoder.decode(chunk, { stream: true });
-      let newlineIndex = buffer.indexOf('\n');
-      while (newlineIndex >= 0) {
-        const line = buffer.slice(0, newlineIndex);
-        buffer = buffer.slice(newlineIndex + 1);
-        if (isTerminalSseLine(line)) {
+      // Only events a blank line dispatched can suppress a terminal frame: a
+      // field line still being written, or the tail the transport cut off, was
+      // never delivered, so the stream still needs its error.
+      for (const event of tracker.push(chunk)) {
+        if (isTerminalSseEvent(event)) {
           terminalEventSeen = true;
           return;
         }
-        newlineIndex = buffer.indexOf('\n');
       }
     }
   };
@@ -145,9 +154,10 @@ export function guardStreamTerminalError(
   }
 
   const reader = body.getReader();
+  const tracker = createSseEventTracker();
   const state: TerminalErrorPumpState = {
     cancelled: false,
-    detector: createSseTerminalEventDetector(),
+    detector: createSseTerminalEventDetector(tracker),
     encoder: new TextEncoder(),
     // Built only when the stream actually fails, because only then is the
     // transport failure known - and only then can its identity be reported.
@@ -158,15 +168,7 @@ export function guardStreamTerminalError(
       }),
     isClientAbort: () => Boolean(input.signal?.aborted)
   };
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      void pumpStreamWithTerminalError(reader, controller, state);
-    },
-    cancel(reason) {
-      state.cancelled = true;
-      return reader.cancel(reason);
-    }
-  });
+  const stream = createTerminalErrorBody(reader, tracker, state);
 
   const headers = new Headers(response.headers);
   // The terminal frame changes the body length, so the upstream value cannot stand.
@@ -230,54 +232,146 @@ function readTransportCode(error: unknown): string | undefined {
   return undefined;
 }
 
-async function pumpStreamWithTerminalError(
+/**
+ * The relayed body, read only as fast as the client asks for it. A pull-driven
+ * stream keeps the upstream socket under the client's own backpressure: the
+ * queue holds at most one chunk, so a slow consumer cannot make the gateway
+ * buffer a fast provider in memory.
+ *
+ * That single chunk is required rather than zero: the relay hands the body to
+ * `Readable.fromWeb`, which discards the bytes already read when the source
+ * errors unless one chunk is queued, so a zero bound silently loses the last
+ * event before a terminal frame.
+ */
+function createTerminalErrorBody(
   reader: ReadableStreamDefaultReader<Uint8Array>,
-  controller: ReadableStreamDefaultController<Uint8Array>,
+  tracker: SseEventTracker,
   state: TerminalErrorPumpState
-): Promise<void> {
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) {
-        break;
+): ReadableStream<Uint8Array> {
+  let sourceFinished = false;
+
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller): Promise<void> {
+        if (sourceFinished) {
+          return;
+        }
+
+        let read: { done: false; value: Uint8Array } | { done: true };
+        try {
+          read = await reader.read();
+        } catch (error) {
+          sourceFinished = true;
+          failWithTerminalError(controller, tracker, state, error);
+          return;
+        }
+
+        // A consumer that cancelled while this read was in flight has nobody
+        // left to receive the bytes, and the controller can no longer accept them.
+        if (state.cancelled) {
+          return;
+        }
+
+        if (read.done) {
+          sourceFinished = true;
+          controller.close();
+          return;
+        }
+
+        state.detector.push(read.value);
+        controller.enqueue(read.value);
+      },
+      async cancel(reason): Promise<void> {
+        state.cancelled = true;
+        sourceFinished = true;
+        await reader.cancel(reason);
       }
-      state.detector.push(chunk.value);
-      controller.enqueue(chunk.value);
-    }
-    controller.close();
-  } catch (error) {
-    if (state.cancelled) {
-      return;
-    }
-    // A terminal event already reached the client: a second one would be a
-    // protocol violation, so let the stream fail as before. The same holds once
-    // the client is gone - there is nobody left to read a frame.
-    if (state.isClientAbort() || state.detector.hasTerminalEvent()) {
-      controller.error(error);
-      return;
-    }
-    const frames = state.buildFrames(error);
-    if (frames.length === 0) {
-      controller.error(error);
-      return;
-    }
-    for (const frame of frames) {
-      controller.enqueue(state.encoder.encode(frame));
-    }
-    controller.close();
-  }
+    },
+    // One chunk of slack is what `Readable.fromWeb` and Fastify need to flush
+    // bytes that already arrived before the source errors; holding strictly
+    // nothing makes them discard that in-flight chunk. Anything above one is
+    // unbounded read-ahead again, so the bound stays here.
+    { highWaterMark: 1 }
+  );
 }
 
-function isTerminalSseLine(rawLine: string): boolean {
-  const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
-  if (line.startsWith('event:')) {
-    return terminalSseEventNames[line.slice('event:'.length).trim()] === true;
+function failWithTerminalError(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  tracker: SseEventTracker,
+  state: TerminalErrorPumpState,
+  error: unknown
+): void {
+  if (state.cancelled) {
+    return;
   }
-  if (line.startsWith('data:')) {
-    const data = line.slice('data:'.length).trim();
-    return data === '[DONE]' || terminalSsePayloadPattern.test(data);
+  // A terminal event already reached the client: a second one would be a
+  // protocol violation, so let the stream fail as before. The same holds once
+  // the client is gone - there is nobody left to read a frame.
+  if (state.isClientAbort() || state.detector.hasTerminalEvent()) {
+    controller.error(error);
+    return;
   }
-  return false;
+  const frames = state.buildFrames(error);
+  if (frames.length === 0) {
+    controller.error(error);
+    return;
+  }
+  // Bytes the transport cut off were never delivered as an event; ending that
+  // event first keeps the frame separate instead of appending it to the last
+  // partial line the client is still holding.
+  const boundary = tracker.closeRetainedEvent();
+  if (boundary.length > 0) {
+    controller.enqueue(boundary);
+  }
+  for (const frame of frames) {
+    controller.enqueue(state.encoder.encode(frame));
+  }
+  controller.close();
+}
+
+/**
+ * A dispatched event is terminal when the protocol itself says the stream is
+ * over, read from the event name or from the payload's own top level. Nothing
+ * below the top level counts: a tool input or provider metadata can repeat a
+ * terminal word without the stream ending.
+ */
+function isTerminalSseEvent(event: SseEvent): boolean {
+  const eventName = event.event?.trim().toLowerCase();
+  if (eventName && terminalSseEventNames[eventName] === true) {
+    return true;
+  }
+
+  const data = event.data.trim();
+  if (data.length === 0) {
+    return false;
+  }
+  if (data === '[DONE]') {
+    return true;
+  }
+
+  const payload = parseSsePayload(data);
+  if (!payload) {
+    return false;
+  }
+
+  // An error chunk carries its signal in the `error` key itself - OpenAI chat
+  // sends `{"error":{"message":"..."}}` with no `type` at all - so the key
+  // presence is the evidence, not a value inside it.
+  if (isObject(payload.error)) {
+    return true;
+  }
+
+  const type = asString(payload.type)?.toLowerCase();
+  return type !== undefined && terminalSsePayloadTypes[type] === true;
+}
+
+function parseSsePayload(data: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(data);
+    return isObject(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function isEventStreamContentType(contentType: string | null): boolean {

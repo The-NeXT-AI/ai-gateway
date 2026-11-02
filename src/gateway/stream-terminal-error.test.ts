@@ -4,6 +4,7 @@ import {
   createSseTerminalEventDetector,
   guardStreamTerminalError
 } from './stream-terminal-error';
+import { parseSseChunks } from '../sse';
 
 const encoder = new TextEncoder();
 
@@ -30,6 +31,96 @@ function createEventStream(chunks: string[], errorAfter?: unknown): Response {
   });
 }
 
+function createByteStream(chunks: Uint8Array[], errorAfter?: unknown): Response {
+  let index = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(chunks[index]);
+        index += 1;
+        return;
+      }
+      if (errorAfter) {
+        controller.error(errorAfter);
+        return;
+      }
+      controller.close();
+    }
+  });
+
+  return new Response(stream, {
+    headers: { 'content-type': 'text/event-stream' },
+    status: 200
+  });
+}
+
+/**
+ * A source that only hands out a chunk when the consumer's read actually asks for
+ * one, so a read that happens ahead of demand is visible as an extra `pull`.
+ */
+function createDemandStream(): {
+  response: Response;
+  pullCount: () => number;
+  cancelReason: () => unknown;
+  grant: () => void;
+} {
+  let permits = 1;
+  let pulls = 0;
+  let cancelled = false;
+  let cancelledWith: unknown;
+  const waiters: Array<() => void> = [];
+
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        pulls += 1;
+        while (permits === 0 && !cancelled) {
+          await new Promise<void>((resolve) => {
+            waiters.push(resolve);
+          });
+        }
+        if (cancelled || permits === 0) {
+          return;
+        }
+        permits -= 1;
+        controller.enqueue(encoder.encode(`data: {"n":${pulls}}\n\n`));
+      },
+      cancel(reason) {
+        cancelled = true;
+        cancelledWith = reason;
+        for (const resolve of waiters.splice(0)) {
+          resolve();
+        }
+      }
+    },
+    { highWaterMark: 0 }
+  );
+
+  return {
+    response: new Response(stream, {
+      headers: { 'content-type': 'text/event-stream' },
+      status: 200
+    }),
+    pullCount: () => pulls,
+    cancelReason: () => cancelledWith,
+    grant: () => {
+      permits += 1;
+      for (const resolve of waiters.splice(0)) {
+        resolve();
+      }
+    }
+  };
+}
+
+/** Parses the guarded bytes with the gateway's own SSE consumer, not with the detector. */
+async function dispatchedEvents(body: Uint8Array): Promise<Array<{ event?: string; data: string }>> {
+  const events: Array<{ event?: string; data: string }> = [];
+  for await (const parsed of parseSseChunks(new Response(body))) {
+    events.push({ event: parsed.event, data: parsed.data });
+  }
+  return events;
+}
+
 function transportError(code: string, message = 'transport detail that must not leak'): Error {
   const error = new Error(message);
   (error as Error & { code?: string }).code = code;
@@ -39,6 +130,9 @@ function transportError(code: string, message = 'transport detail that must not 
 const truncatedThinkingChunk =
   'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"live"}}\n\n';
 
+const anthropicTerminalFrame =
+  'event: error\ndata: {"error":{"code":"upstream_stream_error","message":"Upstream stream failed.","type":"api_error"},"type":"error"}\n\n';
+
 describe('buildStreamTerminalErrorFrames', () => {
   it('emits an Anthropic error event carrying a typed api error', () => {
     const frames = buildStreamTerminalErrorFrames({
@@ -47,9 +141,7 @@ describe('buildStreamTerminalErrorFrames', () => {
     });
 
     expect(frames).toHaveLength(1);
-    expect(frames[0]).toBe(
-      'event: error\ndata: {"error":{"code":"upstream_stream_error","message":"Upstream stream failed.","type":"api_error"},"type":"error"}\n\n'
-    );
+    expect(frames[0]).toBe(anthropicTerminalFrame);
   });
 
   it('emits an OpenAI chat error chunk followed by the done sentinel', () => {
@@ -110,6 +202,65 @@ describe('createSseTerminalEventDetector', () => {
 
     expect(detector.hasTerminalEvent()).toBe(false);
   });
+
+  it('reads a terminal payload assembled from several data lines', () => {
+    const detector = createSseTerminalEventDetector();
+    detector.push(encoder.encode('data: {"type":\ndata: "error"}\n\n'));
+
+    expect(detector.hasTerminalEvent()).toBe(true);
+  });
+
+  it('accepts CRLF line endings', () => {
+    const detector = createSseTerminalEventDetector();
+    detector.push(encoder.encode('event: message_stop\r\ndata: {"type":"message_stop"}\r\n\r\n'));
+
+    expect(detector.hasTerminalEvent()).toBe(true);
+  });
+
+  it('does not count a field line that no blank line delivered', () => {
+    const detector = createSseTerminalEventDetector();
+    detector.push(encoder.encode('event: message_stop\ndata: {"type":"message_stop"}\n'));
+
+    expect(detector.hasTerminalEvent()).toBe(false);
+  });
+
+  it('does not count an event name that carries no payload yet', () => {
+    const detector = createSseTerminalEventDetector();
+    detector.push(encoder.encode('event: error\n'));
+    expect(detector.hasTerminalEvent()).toBe(false);
+
+    detector.push(encoder.encode('\n'));
+    expect(detector.hasTerminalEvent()).toBe(true);
+  });
+
+  it('does not count a terminal word below the payload top level', () => {
+    const nested = [
+      { type: 'response.output_item.added', item: { type: 'function_call', nested: { type: 'error' } } },
+      { type: 'content_block_start', content_block: { type: 'tool_use', input: { kind: 'error', type: 'error' } } },
+      { type: 'content_block_delta', delta: { partial_json: '{"type":"error"}' } },
+      { type: 'message_delta', delta: { stop_reason: null }, metadata: { type: 'error' } }
+    ];
+
+    for (const payload of nested) {
+      const detector = createSseTerminalEventDetector();
+      detector.push(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+      expect(detector.hasTerminalEvent()).toBe(false);
+    }
+  });
+
+  it('treats an OpenAI chat error chunk as terminal, with or without an inner type', () => {
+    // The gateway's own fixtures send `{"error":{"message":"invalid key"}}` with
+    // no `type` at either level, so the `error` key is the whole signal.
+    for (const payload of [
+      { error: { message: 'invalid key' } },
+      { error: { message: 'x', type: 'api_error' } },
+      { error: { message: 'x', type: 'error' } }
+    ]) {
+      const detector = createSseTerminalEventDetector();
+      detector.push(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+      expect(detector.hasTerminalEvent()).toBe(true);
+    }
+  });
 });
 
 describe('guardStreamTerminalError', () => {
@@ -125,7 +276,7 @@ describe('guardStreamTerminalError', () => {
     const body = await guarded.text();
 
     expect(body).toContain('"type":"thinking_delta"');
-    expect(body.endsWith('event: error\ndata: {"error":{"code":"upstream_stream_error","message":"Upstream stream failed.","type":"api_error"},"type":"error"}\n\n')).toBe(true);
+    expect(body.endsWith(anthropicTerminalFrame)).toBe(true);
   });
 
   it('never writes a second terminal event', async () => {
@@ -251,9 +402,7 @@ describe('guardStreamTerminalError transport identity', () => {
 
     const body = await guarded.text();
 
-    expect(body.endsWith(
-      'event: error\ndata: {"error":{"code":"upstream_stream_error","message":"Upstream stream failed.","type":"api_error"},"type":"error"}\n\n'
-    )).toBe(true);
+    expect(body.endsWith(anthropicTerminalFrame)).toBe(true);
     expect(body).not.toContain('ERR_SOMETHING_PRIVATE');
     expect(body).not.toContain('secret upstream body');
     expect(body).not.toContain('internal/route');
@@ -267,9 +416,7 @@ describe('guardStreamTerminalError transport identity', () => {
 
     const body = await guarded.text();
 
-    expect(body.endsWith(
-      'event: error\ndata: {"error":{"code":"upstream_stream_error","message":"Upstream stream failed.","type":"api_error"},"type":"error"}\n\n'
-    )).toBe(true);
+    expect(body.endsWith(anthropicTerminalFrame)).toBe(true);
     expect(body).not.toContain('(transport:');
   });
 
@@ -334,5 +481,207 @@ describe('guardStreamTerminalError frame accounting', () => {
     expect(guardStreamTerminalError(response, { adapterKey: 'gemini_generate_content' })).toBe(
       response
     );
+  });
+});
+
+describe('guardStreamTerminalError event boundaries', () => {
+  it('keeps a cut-off UTF-8 line out of the terminal frame', async () => {
+    // A line the transport stopped inside: `data: {"t":"` plus the first two bytes
+    // of a three-byte code point.
+    const cutOff = Uint8Array.from([...encoder.encode('data: {"t":"'), 0xe2, 0x85]);
+
+    const guarded = guardStreamTerminalError(
+      createByteStream([cutOff], transportError('ECONNRESET')),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    const body = new Uint8Array(await guarded.arrayBuffer());
+    const text = new TextDecoder().decode(body);
+
+    // Not the old behaviour, which appended the frame to the partial line.
+    expect(text).not.toContain('"t":event: error');
+    expect(text).toContain('\n\nevent: error\n');
+
+    const events = await dispatchedEvents(body);
+    const last = events[events.length - 1];
+    expect(last?.event).toBe('error');
+    expect(JSON.parse(last?.data ?? '{}')).toMatchObject({
+      type: 'error',
+      error: { code: 'upstream_stream_error' }
+    });
+  });
+
+  it('delivers the frame as its own event after a field line with no blank line', async () => {
+    const guarded = guardStreamTerminalError(
+      createEventStream(['data: {"type":"message_start"}\n'], transportError('ECONNRESET')),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    const body = new Uint8Array(await guarded.arrayBuffer());
+
+    expect(new TextDecoder().decode(body)).toContain('\n\nevent: error\n');
+    const events = await dispatchedEvents(body);
+    expect(events[events.length - 1]?.event).toBe('error');
+  });
+
+  it('treats an undelivered terminal event as missing, not as an already-delivered one', async () => {
+    const guarded = guardStreamTerminalError(
+      createEventStream(
+        ['event: message_stop\ndata: {"type":"message_stop"}\n'],
+        transportError('ECONNRESET')
+      ),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body.endsWith(
+      'event: error\ndata: {"error":{"code":"upstream_stream_error","message":"Upstream stream failed. (transport: ECONNRESET)","type":"api_error"},"type":"error"}\n\n'
+    )).toBe(true);
+  });
+
+  it('treats an event name with no data as undelivered', async () => {
+    const guarded = guardStreamTerminalError(
+      createEventStream(['event: error\n'], new Error('terminated')),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body.endsWith(anthropicTerminalFrame)).toBe(true);
+  });
+
+  it('does not let a nested terminal word suppress the frame', async () => {
+    const toolInput = JSON.stringify({
+      type: 'content_block_start',
+      index: 1,
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'report', input: { kind: 'error', type: 'error' } }
+    });
+
+    const guarded = guardStreamTerminalError(
+      createEventStream([`data: ${toolInput}\n\n`], transportError('ECONNRESET')),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body).toContain(toolInput);
+    expect(body.endsWith(
+      'event: error\ndata: {"error":{"code":"upstream_stream_error","message":"Upstream stream failed. (transport: ECONNRESET)","type":"api_error"},"type":"error"}\n\n'
+    )).toBe(true);
+  });
+
+  it('relays ordinary chunk bytes unchanged and in order', async () => {
+    const chunks = [
+      'event: message_start\ndata: {"type":"message_start"}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"h\u00e9llo \u4e16\u754c"}}\n\n'
+    ];
+
+    const guarded = guardStreamTerminalError(
+      createByteStream(chunks.map((chunk) => encoder.encode(chunk))),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    const body = new Uint8Array(await guarded.arrayBuffer());
+
+    expect(body).toEqual(encoder.encode(chunks.join('')));
+  });
+
+  it('keeps the done sentinel last for both OpenAI protocols', async () => {
+    for (const adapterKey of ['openai_chat', 'openai_responses']) {
+      const guarded = guardStreamTerminalError(
+        createEventStream(['data: {"partial":true}\n'], transportError('ECONNRESET')),
+        { adapterKey, message: 'Upstream stream failed.' }
+      );
+
+      const body = await guarded.text();
+
+      expect(body).toContain('\n\ndata: ');
+      expect(body.endsWith('data: [DONE]\n\n')).toBe(true);
+      const events = await dispatchedEvents(encoder.encode(body));
+      expect(events[events.length - 1]?.data).toBe('[DONE]');
+    }
+  });
+});
+
+describe('guardStreamTerminalError backpressure', () => {
+  it('leaves the upstream stream unread until the client asks', async () => {
+    // A source with no gate at all: an eager pump drains it immediately, while a
+    // pull-driven stream leaves every chunk where it is.
+    const chunks = Array.from({ length: 32 }, (_, index) => `data: {"n":${index}}\n\n`);
+    let served = 0;
+    const upstream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (served < chunks.length) {
+          controller.enqueue(encoder.encode(chunks[served]));
+          served += 1;
+          return;
+        }
+        controller.close();
+      }
+    });
+    const guarded = guardStreamTerminalError(
+      new Response(upstream, { headers: { 'content-type': 'text/event-stream' } }),
+      { adapterKey: 'anthropic_messages' }
+    );
+
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // One queued chunk is the transport's slack; the eager pump served all 32.
+    expect(served).toBeLessThanOrEqual(2);
+    await guarded.body!.cancel();
+  });
+
+  it('keeps upstream read-ahead bounded as the client reads', async () => {
+    const source = createDemandStream();
+    const guarded = guardStreamTerminalError(source.response, {
+      adapterKey: 'anthropic_messages'
+    });
+    const reader = guarded.body!.getReader();
+
+    // Read-ahead stays at one chunk; it must not grow with the number of reads.
+    for (let read = 1; read <= 4; read += 1) {
+      await reader.read();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(source.pullCount()).toBe(read + 1);
+      source.grant();
+    }
+
+    await reader.cancel();
+  });
+
+  it('cancels the upstream body when the client goes away', async () => {
+    const source = createDemandStream();
+    const guarded = guardStreamTerminalError(source.response, {
+      adapterKey: 'anthropic_messages'
+    });
+    const reader = guarded.body!.getReader();
+
+    await reader.read();
+    await Promise.resolve();
+    await reader.cancel(new Error('client gone'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(source.cancelReason()).toEqual(new Error('client gone'));
+    // One served chunk plus the single queued one; no further reads after cancel.
+    expect(source.pullCount()).toBe(2);
+  });
+
+  it('never buffers more than one chunk for a client that never asks', async () => {
+    const source = createDemandStream();
+    const guarded = guardStreamTerminalError(source.response, {
+      adapterKey: 'anthropic_messages'
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // At most the single queued chunk; never the whole stream.
+    expect(source.pullCount()).toBeLessThanOrEqual(1);
+    await guarded.body!.cancel();
   });
 });

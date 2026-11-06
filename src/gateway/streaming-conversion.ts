@@ -143,6 +143,9 @@ interface OpenAIChatRelayState {
   emittedTextDelta: boolean;
   nextToolCallIndex: number;
   activeAnthropicToolCall?: PendingOpenAIChatAnthropicToolCall;
+  responsesToolCalls?: Map<number, PendingOpenAIChatAnthropicToolCall>;
+  responsesEmittedArgs?: Set<number>;
+  responsesUsage?: boolean;
   finishReason?: string;
   usage: {
     promptTokens?: number;
@@ -3441,6 +3444,62 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
     return frames;
   }
 
+  if (eventType === 'response.reasoning_text.delta' || eventType === 'response.reasoning_summary_text.delta') {
+    const text = asString(payload.delta) || '';
+    if (!text) {
+      return [];
+    }
+
+    const frames = ensureOpenAIChatRelayStarted(state);
+    frames.push(buildOpenAIChatRelayDeltaFrame(state, { reasoning_content: text }));
+    return frames;
+  }
+
+  if (eventType === 'response.output_item.added' || eventType === 'response.output_item.done') {
+    const item = isObject(payload.item) ? payload.item : undefined;
+    const outputIndex = asNumber(payload.output_index);
+    if (!item || asString(item.type) !== 'function_call' || outputIndex === undefined) {
+      return [];
+    }
+
+    const frames: string[] = [];
+    let toolCall = state.responsesToolCalls?.get(outputIndex);
+    if (!toolCall) {
+      toolCall = registerOpenAIChatResponsesToolCall(state, outputIndex, item);
+    }
+    if (!toolCall.started) {
+      frames.push(...ensureOpenAIChatRelayStarted(state));
+      frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, ''));
+      toolCall.started = true;
+    }
+
+    const args = asString(item.arguments) || '';
+    if (eventType === 'response.output_item.done' && args && !state.responsesEmittedArgs?.has(outputIndex)) {
+      frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, args, false));
+      (state.responsesEmittedArgs ??= new Set()).add(outputIndex);
+    }
+    return frames;
+  }
+
+  if (eventType === 'response.function_call_arguments.delta' || eventType === 'response.function_call_arguments.done') {
+    const outputIndex = asNumber(payload.output_index);
+    const toolCall = outputIndex === undefined ? undefined : state.responsesToolCalls?.get(outputIndex);
+    const args = asString(eventType === 'response.function_call_arguments.delta' ? payload.delta : payload.arguments) || '';
+    if (
+      outputIndex === undefined ||
+      !toolCall ||
+      !args ||
+      (eventType === 'response.function_call_arguments.done' && state.responsesEmittedArgs?.has(outputIndex))
+    ) {
+      return [];
+    }
+
+    (state.responsesEmittedArgs ??= new Set()).add(outputIndex);
+    const frame = buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, args, !toolCall.started);
+    toolCall.started = true;
+    return [frame];
+  }
+
   if (eventType === 'response.completed') {
     const response = isObject(payload.response) ? payload.response : undefined;
     updateOpenAIChatRelayIdentityFromOpenAIResponses(state, response);
@@ -3456,11 +3515,50 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
       }
     }
 
+    if (Array.isArray(response?.output)) {
+      for (const [outputIndex, item] of response.output.entries()) {
+        if (!isObject(item) || asString(item.type) !== 'function_call') {
+          continue;
+        }
+
+        let toolCall = state.responsesToolCalls?.get(outputIndex);
+        const registeredAtCompletion = !toolCall;
+        if (!toolCall) {
+          toolCall = registerOpenAIChatResponsesToolCall(state, outputIndex, item);
+        }
+        if (!toolCall.started) {
+          frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, ''));
+          toolCall.started = true;
+        }
+        const args = asString(item.arguments) || '';
+        if (registeredAtCompletion && args) {
+          frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, args, false));
+          (state.responsesEmittedArgs ??= new Set()).add(outputIndex);
+        }
+      }
+    }
+
     frames.push(...finalizeOpenAIChatRelay(state));
     return frames;
   }
 
   return [];
+}
+
+function registerOpenAIChatResponsesToolCall(
+  state: OpenAIChatRelayState,
+  outputIndex: number,
+  item: Record<string, unknown>
+): PendingOpenAIChatAnthropicToolCall {
+  const toolCall: PendingOpenAIChatAnthropicToolCall = {
+    blockIndex: outputIndex,
+    toolIndex: state.nextToolCallIndex++,
+    id: asString(item.call_id) || asString(item.id) || `call_${randomUUID().replace(/-/g, '')}`,
+    name: asString(item.name) || '',
+    started: false
+  };
+  (state.responsesToolCalls ??= new Map()).set(outputIndex, toolCall);
+  return toolCall;
 }
 
 function ensureOpenAIChatRelayStarted(state: OpenAIChatRelayState): string[] {
@@ -3508,8 +3606,15 @@ function buildOpenAIChatRelayDeltaFrame(
 function buildOpenAIChatAnthropicToolDeltaFrame(
   state: OpenAIChatRelayState,
   toolCall: PendingOpenAIChatAnthropicToolCall,
-  argumentsChunk: string
+  argumentsChunk: string,
+  includeMetadata = true
 ): string {
+  if (!includeMetadata) {
+    return buildOpenAIChatRelayDeltaFrame(state, {
+      tool_calls: [{ index: toolCall.toolIndex, function: { arguments: argumentsChunk } }]
+    });
+  }
+
   return buildOpenAIChatRelayDeltaFrame(state, {
     tool_calls: [
       {
@@ -3550,8 +3655,8 @@ function finalizeOpenAIChatRelay(state: OpenAIChatRelayState): string[] {
   }
 
   if (
-    state.usage.cachedPromptTokens !== undefined ||
-    state.usage.cacheCreationPromptTokens !== undefined
+    (!state.responsesUsage || (state.usage.cachedPromptTokens ?? 0) > 0) &&
+    (state.usage.cachedPromptTokens !== undefined || state.usage.cacheCreationPromptTokens !== undefined)
   ) {
     const promptTokenDetails: Record<string, unknown> = {};
     if (state.usage.cachedPromptTokens !== undefined) {
@@ -3656,6 +3761,7 @@ function updateOpenAIChatRelayUsageFromOpenAIResponses(
   if (!usage) {
     return;
   }
+  state.responsesUsage = true;
 
   const promptTokens = asNumber(usage.input_tokens) ?? asNumber(usage.prompt_tokens);
   if (promptTokens !== undefined) {

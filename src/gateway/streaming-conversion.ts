@@ -143,6 +143,8 @@ interface OpenAIChatRelayState {
   emittedTextDelta: boolean;
   nextToolCallIndex: number;
   activeAnthropicToolCall?: PendingOpenAIChatAnthropicToolCall;
+  responsesToolCalls?: Map<number, PendingOpenAIChatAnthropicToolCall>;
+  responsesEmittedArgs?: Set<number>;
   finishReason?: string;
   usage: {
     promptTokens?: number;
@@ -3441,6 +3443,57 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
     return frames;
   }
 
+  if (eventType === 'response.reasoning_text.delta' || eventType === 'response.reasoning_summary_text.delta') {
+    const text = asString(payload.delta) || '';
+    if (!text) {
+      return [];
+    }
+
+    const frames = ensureOpenAIChatRelayStarted(state);
+    frames.push(buildOpenAIChatRelayDeltaFrame(state, { reasoning_content: text }));
+    return frames;
+  }
+
+  if (eventType === 'response.output_item.added' || eventType === 'response.output_item.done') {
+    const item = isObject(payload.item) ? payload.item : undefined;
+    const outputIndex = asNumber(payload.output_index);
+    if (!item || asString(item.type) !== 'function_call' || outputIndex === undefined) {
+      return [];
+    }
+
+    const frames: string[] = [];
+    let toolCall = state.responsesToolCalls?.get(outputIndex);
+    if (!toolCall) {
+      toolCall = registerOpenAIChatResponsesToolCall(state, outputIndex, item);
+      frames.push(...ensureOpenAIChatRelayStarted(state));
+      frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, ''));
+    }
+
+    const args = asString(item.arguments) || '';
+    if (eventType === 'response.output_item.done' && args && !state.responsesEmittedArgs?.has(outputIndex)) {
+      frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, args));
+      (state.responsesEmittedArgs ??= new Set()).add(outputIndex);
+    }
+    return frames;
+  }
+
+  if (eventType === 'response.function_call_arguments.delta' || eventType === 'response.function_call_arguments.done') {
+    const outputIndex = asNumber(payload.output_index);
+    const toolCall = outputIndex === undefined ? undefined : state.responsesToolCalls?.get(outputIndex);
+    const args = asString(eventType === 'response.function_call_arguments.delta' ? payload.delta : payload.arguments) || '';
+    if (
+      outputIndex === undefined ||
+      !toolCall ||
+      !args ||
+      (eventType === 'response.function_call_arguments.done' && state.responsesEmittedArgs?.has(outputIndex))
+    ) {
+      return [];
+    }
+
+    (state.responsesEmittedArgs ??= new Set()).add(outputIndex);
+    return [buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, args)];
+  }
+
   if (eventType === 'response.completed') {
     const response = isObject(payload.response) ? payload.response : undefined;
     updateOpenAIChatRelayIdentityFromOpenAIResponses(state, response);
@@ -3456,11 +3509,43 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
       }
     }
 
+    if (Array.isArray(response?.output)) {
+      for (const [outputIndex, item] of response.output.entries()) {
+        if (!isObject(item) || asString(item.type) !== 'function_call' || state.responsesToolCalls?.has(outputIndex)) {
+          continue;
+        }
+
+        const toolCall = registerOpenAIChatResponsesToolCall(state, outputIndex, item);
+        frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, ''));
+        const args = asString(item.arguments) || '';
+        if (args) {
+          frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, args));
+          (state.responsesEmittedArgs ??= new Set()).add(outputIndex);
+        }
+      }
+    }
+
     frames.push(...finalizeOpenAIChatRelay(state));
     return frames;
   }
 
   return [];
+}
+
+function registerOpenAIChatResponsesToolCall(
+  state: OpenAIChatRelayState,
+  outputIndex: number,
+  item: Record<string, unknown>
+): PendingOpenAIChatAnthropicToolCall {
+  const toolCall: PendingOpenAIChatAnthropicToolCall = {
+    blockIndex: outputIndex,
+    toolIndex: state.nextToolCallIndex++,
+    id: asString(item.call_id) || asString(item.id) || `call_${randomUUID().replace(/-/g, '')}`,
+    name: asString(item.name) || '',
+    started: true
+  };
+  (state.responsesToolCalls ??= new Map()).set(outputIndex, toolCall);
+  return toolCall;
 }
 
 function ensureOpenAIChatRelayStarted(state: OpenAIChatRelayState): string[] {

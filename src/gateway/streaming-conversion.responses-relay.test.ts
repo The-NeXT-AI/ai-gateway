@@ -5,9 +5,9 @@ import { relayConvertedStreamFromUpstreamResponse } from './streaming-conversion
 
 type ToolDelta = {
   index: number;
-  id: string;
-  type: string;
-  function: { name: string; arguments: string };
+  id?: string;
+  type?: string;
+  function: { name?: string; arguments: string };
 };
 
 type ChatFrame = {
@@ -40,6 +40,10 @@ function toolCall(id: string, args: string) {
 
 function expectedToolDelta(index: number, id: string, args: string): ToolDelta {
   return { index, id, type: 'function', function: { name: 'run_cmd', arguments: args } };
+}
+
+function expectedToolArguments(index: number, args: string): ToolDelta {
+  return { index, function: { arguments: args } };
 }
 
 async function relay(events: unknown[]): Promise<ChatFrame[]> {
@@ -94,6 +98,29 @@ describe('Responses to chat streaming relay', () => {
     expect(frames[3].usage).toEqual({ prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 });
   });
 
+  it.each([0, -1, undefined])('omits cache details for nonpositive or absent cached tokens (%s)', async (cachedTokens) => {
+    const frames = await relay([
+      created,
+      completed([], { usage: { ...usage, input_tokens_details: { cached_tokens: cachedTokens, cache_write_tokens: 5 } } })
+    ]);
+
+    expect(frames[frames.length - 1].usage).toEqual({ prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 });
+  });
+
+  it('includes positive cached-token details from Responses usage', async () => {
+    const frames = await relay([
+      created,
+      completed([], { usage: { ...usage, input_tokens_details: { cached_tokens: 3, cache_write_tokens: 5 } } })
+    ]);
+
+    expect(frames[frames.length - 1].usage).toEqual({
+      prompt_tokens: 12,
+      completion_tokens: 7,
+      total_tokens: 19,
+      prompt_tokens_details: { cached_tokens: 3, cache_write_tokens: 5, cache_creation_tokens: 5 }
+    });
+  });
+
   it('streams a tool call and does not repeat completed arguments', async () => {
     const item = toolCall('call_test1', '{"cmd":"ls"}');
     const frames = await relay([
@@ -109,8 +136,8 @@ describe('Responses to chat streaming relay', () => {
     expect(frames[0].choices[0].delta).toEqual({ role: 'assistant' });
     expect(toolDeltas(frames)).toEqual([
       expectedToolDelta(0, 'call_test1', ''),
-      expectedToolDelta(0, 'call_test1', '{"cmd":'),
-      expectedToolDelta(0, 'call_test1', '"ls"}')
+      expectedToolArguments(0, '{"cmd":'),
+      expectedToolArguments(0, '"ls"}')
     ]);
     expect(frames[frames.length - 1].choices[0].finish_reason).toBe('tool_calls');
     expect(frames[frames.length - 1].usage).toEqual({ prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 });
@@ -134,9 +161,9 @@ describe('Responses to chat streaming relay', () => {
     expect(toolDeltas(frames)).toEqual([
       expectedToolDelta(0, 'call_test1', ''),
       expectedToolDelta(1, 'call_test2', ''),
-      expectedToolDelta(1, 'call_test2', '{"y":'),
-      expectedToolDelta(0, 'call_test1', '{"x":1}'),
-      expectedToolDelta(1, 'call_test2', '2}')
+      expectedToolArguments(1, '{"y":'),
+      expectedToolArguments(0, '{"x":1}'),
+      expectedToolArguments(1, '2}')
     ]);
     expect(frames[frames.length - 1].choices[0].finish_reason).toBe('tool_calls');
   });
@@ -153,7 +180,7 @@ describe('Responses to chat streaming relay', () => {
 
     expect(toolDeltas(frames)).toEqual([
       expectedToolDelta(0, 'call_test1', ''),
-      expectedToolDelta(0, 'call_test1', item.arguments)
+      expectedToolArguments(0, item.arguments)
     ]);
   });
 
@@ -168,8 +195,20 @@ describe('Responses to chat streaming relay', () => {
 
     expect(toolDeltas(frames)).toEqual([
       expectedToolDelta(0, 'call_test1', ''),
-      expectedToolDelta(0, 'call_test1', item.arguments)
+      expectedToolArguments(0, item.arguments)
     ]);
+  });
+
+  it('keeps exactly one tool introduction when no argument or done events arrive', async () => {
+    const item = toolCall('call_test1', '{"cmd":"pwd"}');
+    const frames = await relay([
+      created,
+      { type: 'response.output_item.added', output_index: 0, item: { ...item, arguments: '' } },
+      completed([item])
+    ]);
+
+    expect(toolDeltas(frames)).toEqual([expectedToolDelta(0, 'call_test1', '')]);
+    expect(frames[frames.length - 1].choices[0].finish_reason).toBe('tool_calls');
   });
 
   it('registers a call first seen in output_item.done without replaying it on completion', async () => {
@@ -182,7 +221,7 @@ describe('Responses to chat streaming relay', () => {
 
     expect(toolDeltas(frames)).toEqual([
       expectedToolDelta(0, 'call_test1', ''),
-      expectedToolDelta(0, 'call_test1', item.arguments)
+      expectedToolArguments(0, item.arguments)
     ]);
     expect(frames[frames.length - 1].choices[0].finish_reason).toBe('tool_calls');
   });
@@ -193,15 +232,15 @@ describe('Responses to chat streaming relay', () => {
     const frames = await relay([
       created,
       { type: 'response.output_item.added', output_index: 1, item: { ...known, arguments: '' } },
-      { type: 'response.function_call_arguments.delta', output_index: 1, delta: known.arguments },
+      { type: 'response.function_call_arguments.delta', output_index: 1, delta: '{"cmd":' },
       completed([{ type: 'message' }, known, missed])
     ]);
 
     expect(toolDeltas(frames)).toEqual([
       expectedToolDelta(0, 'call_test1', ''),
-      expectedToolDelta(0, 'call_test1', known.arguments),
+      expectedToolArguments(0, '{"cmd":'),
       expectedToolDelta(1, 'call_test2', ''),
-      expectedToolDelta(1, 'call_test2', missed.arguments)
+      expectedToolArguments(1, missed.arguments)
     ]);
     expect(frames[frames.length - 1].choices[0].finish_reason).toBe('tool_calls');
   });
@@ -241,9 +280,9 @@ describe('Responses to chat streaming relay', () => {
 
     expect(calls).toHaveLength(4);
     expect(calls[0]).toEqual({ index: 0, id: 'item_test1', type: 'function', function: { name: '', arguments: '' } });
-    expect(calls[1].function.arguments).toBe('{}');
+    expect(calls[1]).toEqual(expectedToolArguments(0, '{}'));
     expect(calls[2].id).toMatch(/^call_[0-9a-f]{32}$/);
     expect(calls[2].function).toEqual({ name: '', arguments: '' });
-    expect(calls[3]).toEqual({ ...calls[2], function: { name: '', arguments: '{}' } });
+    expect(calls[3]).toEqual(expectedToolArguments(1, '{}'));
   });
 });

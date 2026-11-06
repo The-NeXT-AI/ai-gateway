@@ -145,6 +145,7 @@ interface OpenAIChatRelayState {
   activeAnthropicToolCall?: PendingOpenAIChatAnthropicToolCall;
   responsesToolCalls?: Map<number, PendingOpenAIChatAnthropicToolCall>;
   responsesEmittedArgs?: Set<number>;
+  responsesUsage?: boolean;
   finishReason?: string;
   usage: {
     promptTokens?: number;
@@ -3465,13 +3466,16 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
     let toolCall = state.responsesToolCalls?.get(outputIndex);
     if (!toolCall) {
       toolCall = registerOpenAIChatResponsesToolCall(state, outputIndex, item);
+    }
+    if (!toolCall.started) {
       frames.push(...ensureOpenAIChatRelayStarted(state));
       frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, ''));
+      toolCall.started = true;
     }
 
     const args = asString(item.arguments) || '';
     if (eventType === 'response.output_item.done' && args && !state.responsesEmittedArgs?.has(outputIndex)) {
-      frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, args));
+      frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, args, false));
       (state.responsesEmittedArgs ??= new Set()).add(outputIndex);
     }
     return frames;
@@ -3491,7 +3495,9 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
     }
 
     (state.responsesEmittedArgs ??= new Set()).add(outputIndex);
-    return [buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, args)];
+    const frame = buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, args, !toolCall.started);
+    toolCall.started = true;
+    return [frame];
   }
 
   if (eventType === 'response.completed') {
@@ -3511,15 +3517,22 @@ function emitOpenAIChatFramesFromOpenAIResponsesEvent(
 
     if (Array.isArray(response?.output)) {
       for (const [outputIndex, item] of response.output.entries()) {
-        if (!isObject(item) || asString(item.type) !== 'function_call' || state.responsesToolCalls?.has(outputIndex)) {
+        if (!isObject(item) || asString(item.type) !== 'function_call') {
           continue;
         }
 
-        const toolCall = registerOpenAIChatResponsesToolCall(state, outputIndex, item);
-        frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, ''));
+        let toolCall = state.responsesToolCalls?.get(outputIndex);
+        const registeredAtCompletion = !toolCall;
+        if (!toolCall) {
+          toolCall = registerOpenAIChatResponsesToolCall(state, outputIndex, item);
+        }
+        if (!toolCall.started) {
+          frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, ''));
+          toolCall.started = true;
+        }
         const args = asString(item.arguments) || '';
-        if (args) {
-          frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, args));
+        if (registeredAtCompletion && args) {
+          frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, args, false));
           (state.responsesEmittedArgs ??= new Set()).add(outputIndex);
         }
       }
@@ -3542,7 +3555,7 @@ function registerOpenAIChatResponsesToolCall(
     toolIndex: state.nextToolCallIndex++,
     id: asString(item.call_id) || asString(item.id) || `call_${randomUUID().replace(/-/g, '')}`,
     name: asString(item.name) || '',
-    started: true
+    started: false
   };
   (state.responsesToolCalls ??= new Map()).set(outputIndex, toolCall);
   return toolCall;
@@ -3593,8 +3606,15 @@ function buildOpenAIChatRelayDeltaFrame(
 function buildOpenAIChatAnthropicToolDeltaFrame(
   state: OpenAIChatRelayState,
   toolCall: PendingOpenAIChatAnthropicToolCall,
-  argumentsChunk: string
+  argumentsChunk: string,
+  includeMetadata = true
 ): string {
+  if (!includeMetadata) {
+    return buildOpenAIChatRelayDeltaFrame(state, {
+      tool_calls: [{ index: toolCall.toolIndex, function: { arguments: argumentsChunk } }]
+    });
+  }
+
   return buildOpenAIChatRelayDeltaFrame(state, {
     tool_calls: [
       {
@@ -3635,8 +3655,8 @@ function finalizeOpenAIChatRelay(state: OpenAIChatRelayState): string[] {
   }
 
   if (
-    state.usage.cachedPromptTokens !== undefined ||
-    state.usage.cacheCreationPromptTokens !== undefined
+    (!state.responsesUsage || (state.usage.cachedPromptTokens ?? 0) > 0) &&
+    (state.usage.cachedPromptTokens !== undefined || state.usage.cacheCreationPromptTokens !== undefined)
   ) {
     const promptTokenDetails: Record<string, unknown> = {};
     if (state.usage.cachedPromptTokens !== undefined) {
@@ -3741,6 +3761,7 @@ function updateOpenAIChatRelayUsageFromOpenAIResponses(
   if (!usage) {
     return;
   }
+  state.responsesUsage = true;
 
   const promptTokens = asNumber(usage.input_tokens) ?? asNumber(usage.prompt_tokens);
   if (promptTokens !== undefined) {

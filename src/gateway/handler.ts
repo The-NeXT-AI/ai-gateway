@@ -80,6 +80,7 @@ import {
   buildStreamTerminalErrorFrames,
   guardStreamTerminalError
 } from './stream-terminal-error';
+import { guardRelayedStreamIdle, withUpstreamStreamIdleTimeout } from './stream-idle-watchdog';
 import {
   addNamespaceFieldsToStandardResponse,
   isHostedWebSearchTool
@@ -1076,10 +1077,16 @@ export async function handleGatewayRequest(
         }
         return relayUpstreamResponse(
           reply,
-          guardStreamTerminalError(upstreamResponse, {
-            adapterKey: source.adapterKey,
-            signal: clientAbortSignal
-          }),
+          guardStreamTerminalError(
+            guardRelayedStreamIdle(upstreamResponse, {
+              adapterKey: source.adapterKey,
+              signal: clientAbortSignal
+            }),
+            {
+              adapterKey: source.adapterKey,
+              signal: clientAbortSignal
+            }
+          ),
           clientAbortSignal
         );
       } else {
@@ -1173,10 +1180,16 @@ export async function handleGatewayRequest(
       }
       return relayUpstreamResponse(
         reply,
-        guardStreamTerminalError(passthroughStreamResponse, {
-          adapterKey: source.adapterKey,
-          signal: clientAbortSignal
-        }),
+        guardStreamTerminalError(
+          guardRelayedStreamIdle(passthroughStreamResponse, {
+            adapterKey: source.adapterKey,
+            signal: clientAbortSignal
+          }),
+          {
+            adapterKey: source.adapterKey,
+            signal: clientAbortSignal
+          }
+        ),
         clientAbortSignal
       );
     }
@@ -8087,9 +8100,16 @@ async function callUpstreamWithFailureCapture(
       model: context.model,
       statusCode: response.status
     });
+    // Watched here, before any billing or trace clone tees the body: cancelling
+    // one tee branch leaves the source open, so only a reader in front of the
+    // tee can release a stalled provider socket.
     return {
       ok: true,
-      value: response
+      value: withUpstreamStreamIdleTimeout(
+        response,
+        context.config.upstreamStreamIdleTimeoutMs,
+        context.clientAbortSignal
+      )
     };
   } catch (error) {
     if (!context.clientAbortSignal?.aborted) {

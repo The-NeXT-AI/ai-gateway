@@ -105,6 +105,7 @@ const defaultCodexOauthScope = 'openid profile email offline_access';
 const requiredCodexOauthScopes = ['api.connectors.read', 'api.connectors.invoke'];
 const defaultBodyLimitBytes = 50 * 1024 * 1024;
 const defaultUpstreamTimeoutMs = 60_000;
+const defaultUpstreamStreamIdleTimeoutMs = 120_000;
 const defaultCorsAllowedHeaders = [
   'Content-Type',
   'Authorization',
@@ -684,6 +685,7 @@ interface GatewayJsonConfig {
   bodyLimitBytes?: unknown;
   bodyLimit?: unknown;
   upstreamTimeoutMs?: unknown;
+  upstreamStreamIdleTimeoutMs?: unknown;
   defaultOpenAIModel?: unknown;
   defaultAnthropicModel?: unknown;
   defaultGeminiModel?: unknown;
@@ -1200,6 +1202,10 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
       readNonNegativeNumber(process.env.UPSTREAM_TIMEOUT_MS) ??
       readNonNegativeNumber(jsonConfig.upstreamTimeoutMs) ??
       defaultUpstreamTimeoutMs,
+    upstreamStreamIdleTimeoutMs:
+      readNonNegativeNumber(process.env.UPSTREAM_STREAM_IDLE_TIMEOUT_MS) ??
+      readNonNegativeNumber(jsonConfig.upstreamStreamIdleTimeoutMs) ??
+      defaultUpstreamStreamIdleTimeoutMs,
     defaultOpenAIModel:
       readString(process.env.DEFAULT_OPENAI_MODEL) ||
       readString(jsonConfig.defaultOpenAIModel) ||

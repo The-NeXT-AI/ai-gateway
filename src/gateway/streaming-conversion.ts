@@ -17,6 +17,7 @@ import {
 import { encodeOpenAIResponsesReasoningEnvelope } from '../adapters/builtins/reasoning-envelope';
 import { splitNamespacedToolCallName } from '../adapters/builtins/target/tools';
 import { parseSseChunks } from '../sse';
+import { endConvertedStreamOnIdle } from './stream-idle-watchdog';
 import { bindAbortSignalToReadable } from '../upstream/client';
 import type {
   GatewaySourceContext,
@@ -318,20 +319,22 @@ export function relayConvertedStreamFromUpstreamResponse(
     return reply.send('');
   }
 
-  let stream: Readable;
+  let frames: AsyncIterable<string> | undefined;
   if (source.adapterKey === 'anthropic_messages') {
-    stream = Readable.from(relayAnthropicMessagesFromOpenAIStream(upstreamResponse));
+    frames = relayAnthropicMessagesFromOpenAIStream(upstreamResponse);
   } else if (source.adapterKey === 'openai_responses') {
-    stream = Readable.from(relayOpenAIResponsesFromOpenAIStream(upstreamResponse, standardRequest?.tools));
+    frames = relayOpenAIResponsesFromOpenAIStream(upstreamResponse, standardRequest?.tools);
   } else if (source.adapterKey === 'gemini_stream') {
-    stream = Readable.from(relayGeminiStreamFromOpenAIStream(upstreamResponse));
+    frames = relayGeminiStreamFromOpenAIStream(upstreamResponse);
   } else if (source.adapterKey === 'gemini_interactions') {
-    stream = Readable.from(relayGeminiInteractionsFromUpstreamStream(upstreamResponse));
+    frames = relayGeminiInteractionsFromUpstreamStream(upstreamResponse);
   } else if (source.adapterKey === 'openai_chat') {
-    stream = Readable.from(relayOpenAIChatFromUpstreamStream(upstreamResponse));
-  } else {
-    stream = Readable.fromWeb(upstreamResponse.body as unknown as ReadableStream<Uint8Array>);
+    frames = relayOpenAIChatFromUpstreamStream(upstreamResponse);
   }
+
+  const stream = frames
+    ? Readable.from(endConvertedStreamOnIdle(frames, source.adapterKey))
+    : Readable.fromWeb(upstreamResponse.body as unknown as ReadableStream<Uint8Array>);
 
   bindAbortSignalToReadable(stream, abortSignal, () => {
     upstreamResponse.body?.cancel(abortSignal?.reason).catch(() => undefined);

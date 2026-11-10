@@ -157,6 +157,7 @@ export function guardStreamTerminalError(
   const tracker = createSseEventTracker();
   const state: TerminalErrorPumpState = {
     cancelled: false,
+    relayedBytes: false,
     detector: createSseTerminalEventDetector(tracker),
     encoder: new TextEncoder(),
     // Built only when the stream actually fails, because only then is the
@@ -183,6 +184,7 @@ export function guardStreamTerminalError(
 
 interface TerminalErrorPumpState {
   cancelled: boolean;
+  relayedBytes: boolean;
   detector: SseTerminalEventDetector;
   encoder: TextEncoder;
   buildFrames: (cause: unknown) => string[];
@@ -279,6 +281,7 @@ function createTerminalErrorBody(
         }
 
         state.detector.push(read.value);
+        state.relayedBytes = state.relayedBytes || read.value.byteLength > 0;
         controller.enqueue(read.value);
       },
       async cancel(reason): Promise<void> {
@@ -295,6 +298,14 @@ function createTerminalErrorBody(
   );
 }
 
+function hasHttpStatusCode(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+  const statusCode = (error as { statusCode?: unknown }).statusCode;
+  return typeof statusCode === 'number' && statusCode >= 400 && statusCode <= 599;
+}
+
 function failWithTerminalError(
   controller: ReadableStreamDefaultController<Uint8Array>,
   tracker: SseEventTracker,
@@ -308,6 +319,12 @@ function failWithTerminalError(
   // protocol violation, so let the stream fail as before. The same holds once
   // the client is gone - there is nobody left to read a frame.
   if (state.isClientAbort() || state.detector.hasTerminalEvent()) {
+    controller.error(error);
+    return;
+  }
+  // Before the first byte the response headers are still unsent, so an error
+  // that names its own HTTP status is better answered with that status.
+  if (!state.relayedBytes && hasHttpStatusCode(error)) {
     controller.error(error);
     return;
   }

@@ -317,6 +317,28 @@ describe('guardStreamTerminalError', () => {
 
     await expect(guarded.text()).rejects.toThrow('aborted');
   });
+
+  it('lets an error with its own HTTP status fail the body before the first byte', async () => {
+    const error = Object.assign(new Error('Upstream stream sent no data for 50ms.'), { statusCode: 504 });
+    const guarded = guardStreamTerminalError(createEventStream([], error), {
+      adapterKey: 'anthropic_messages',
+      message: 'Upstream stream failed.'
+    });
+
+    await expect(guarded.text()).rejects.toBe(error);
+  });
+
+  it('still frames an error with its own HTTP status once bytes were relayed', async () => {
+    const error = Object.assign(new Error('Upstream stream sent no data for 50ms.'), { statusCode: 504 });
+    const guarded = guardStreamTerminalError(
+      createEventStream(['event: ping\ndata: {"type":"ping"}\n\n'], error),
+      { adapterKey: 'anthropic_messages', message: 'Upstream stream failed.' }
+    );
+
+    const body = await guarded.text();
+
+    expect(body.endsWith(anthropicTerminalFrame)).toBe(true);
+  });
 });
 
 describe('guardStreamTerminalError transport identity', () => {

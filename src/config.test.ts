@@ -290,6 +290,8 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.PROVIDER_EXTERNAL_STDIO_ARGS;
     delete process.env.PROVIDER_EXTERNAL_STDIO_CWD;
     delete process.env.UPSTREAM_TIMEOUT_MS;
+    delete process.env.UPSTREAM_HEADERS_TIMEOUT_MS;
+    delete process.env.UPSTREAM_BODY_IDLE_TIMEOUT_MS;
   });
 
   it('parses the production Docker gateway config', () => {
@@ -378,6 +380,62 @@ describe('Gateway config providerPlugins', () => {
 
     process.env.UPSTREAM_TIMEOUT_MS = '0';
     expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: 5000 }).upstreamTimeoutMs).toBe(0);
+  });
+
+  it('parses upstream headers and body idle timeouts', () => {
+    const defaults = parseGatewayConfigFromRaw({ upstreamTimeoutMs: 600000 });
+    expect(defaults.upstreamHeadersTimeoutMs).toBe(120000);
+    expect(defaults.upstreamBodyIdleTimeoutMs).toBe(120000);
+
+    const fromJson = parseGatewayConfigFromRaw({
+      upstreamTimeoutMs: 600000,
+      upstreamHeadersTimeoutMs: 90000,
+      upstreamBodyIdleTimeoutMs: 45000
+    });
+    expect(fromJson.upstreamHeadersTimeoutMs).toBe(90000);
+    expect(fromJson.upstreamBodyIdleTimeoutMs).toBe(45000);
+
+    const invalid = parseGatewayConfigFromRaw({
+      upstreamTimeoutMs: 600000,
+      upstreamHeadersTimeoutMs: -1,
+      upstreamBodyIdleTimeoutMs: 'soon'
+    });
+    expect(invalid.upstreamHeadersTimeoutMs).toBe(120000);
+    expect(invalid.upstreamBodyIdleTimeoutMs).toBe(120000);
+
+    const disabled = parseGatewayConfigFromRaw({
+      upstreamTimeoutMs: 600000,
+      upstreamHeadersTimeoutMs: 0,
+      upstreamBodyIdleTimeoutMs: 0
+    });
+    expect(disabled.upstreamHeadersTimeoutMs).toBe(0);
+    expect(disabled.upstreamBodyIdleTimeoutMs).toBe(0);
+
+    process.env.UPSTREAM_HEADERS_TIMEOUT_MS = '30000';
+    process.env.UPSTREAM_BODY_IDLE_TIMEOUT_MS = '15000';
+    const fromEnv = parseGatewayConfigFromRaw({
+      upstreamTimeoutMs: 600000,
+      upstreamHeadersTimeoutMs: 90000,
+      upstreamBodyIdleTimeoutMs: 45000
+    });
+    expect(fromEnv.upstreamHeadersTimeoutMs).toBe(30000);
+    expect(fromEnv.upstreamBodyIdleTimeoutMs).toBe(15000);
+  });
+
+  it('clamps the upstream headers timeout to the overall timeout', () => {
+    expect(
+      parseGatewayConfigFromRaw({ upstreamTimeoutMs: 60000, upstreamHeadersTimeoutMs: 120000 })
+        .upstreamHeadersTimeoutMs
+    ).toBe(60000);
+    expect(parseGatewayConfigFromRaw({}).upstreamHeadersTimeoutMs).toBe(60000);
+    expect(
+      parseGatewayConfigFromRaw({ upstreamTimeoutMs: 0, upstreamHeadersTimeoutMs: 120000 })
+        .upstreamHeadersTimeoutMs
+    ).toBe(120000);
+    expect(
+      parseGatewayConfigFromRaw({ upstreamTimeoutMs: 60000, upstreamBodyIdleTimeoutMs: 120000 })
+        .upstreamBodyIdleTimeoutMs
+    ).toBe(120000);
   });
 
   it('defaults billing trace request body capture to disabled', () => {

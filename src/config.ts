@@ -105,6 +105,8 @@ const defaultCodexOauthScope = 'openid profile email offline_access';
 const requiredCodexOauthScopes = ['api.connectors.read', 'api.connectors.invoke'];
 const defaultBodyLimitBytes = 50 * 1024 * 1024;
 const defaultUpstreamTimeoutMs = 60_000;
+const defaultUpstreamHeadersTimeoutMs = 120_000;
+const defaultUpstreamBodyIdleTimeoutMs = 120_000;
 const defaultCorsAllowedHeaders = [
   'Content-Type',
   'Authorization',
@@ -684,6 +686,8 @@ interface GatewayJsonConfig {
   bodyLimitBytes?: unknown;
   bodyLimit?: unknown;
   upstreamTimeoutMs?: unknown;
+  upstreamHeadersTimeoutMs?: unknown;
+  upstreamBodyIdleTimeoutMs?: unknown;
   defaultOpenAIModel?: unknown;
   defaultAnthropicModel?: unknown;
   defaultGeminiModel?: unknown;
@@ -1117,6 +1121,16 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
   const openAIVideoPerSecondUsdBySize =
     openAITopLevelBillingRate?.videoPerSecondUsdBySize ||
     openAIProviderConfig?.billing.default?.videoPerSecondUsdBySize;
+  const upstreamTimeoutMs =
+    readNonNegativeNumber(process.env.UPSTREAM_TIMEOUT_MS) ??
+    readNonNegativeNumber(jsonConfig.upstreamTimeoutMs) ??
+    defaultUpstreamTimeoutMs;
+  const upstreamHeadersTimeoutMs = clampToOverallTimeout(
+    readNonNegativeNumber(process.env.UPSTREAM_HEADERS_TIMEOUT_MS) ??
+      readNonNegativeNumber(jsonConfig.upstreamHeadersTimeoutMs) ??
+      defaultUpstreamHeadersTimeoutMs,
+    upstreamTimeoutMs
+  );
 
   return {
     host: readString(process.env.HOST) || readString(jsonConfig.host) || '0.0.0.0',
@@ -1196,10 +1210,12 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
         defaultBodyLimitBytes,
         1
       ),
-    upstreamTimeoutMs:
-      readNonNegativeNumber(process.env.UPSTREAM_TIMEOUT_MS) ??
-      readNonNegativeNumber(jsonConfig.upstreamTimeoutMs) ??
-      defaultUpstreamTimeoutMs,
+    upstreamTimeoutMs,
+    upstreamHeadersTimeoutMs,
+    upstreamBodyIdleTimeoutMs:
+      readNonNegativeNumber(process.env.UPSTREAM_BODY_IDLE_TIMEOUT_MS) ??
+      readNonNegativeNumber(jsonConfig.upstreamBodyIdleTimeoutMs) ??
+      defaultUpstreamBodyIdleTimeoutMs,
     defaultOpenAIModel:
       readString(process.env.DEFAULT_OPENAI_MODEL) ||
       readString(jsonConfig.defaultOpenAIModel) ||
@@ -5865,6 +5881,10 @@ function readNonNegativeNumber(value: unknown): number | undefined {
   }
 
   return parsed;
+}
+
+function clampToOverallTimeout(timeoutMs: number, overallTimeoutMs: number): number {
+  return overallTimeoutMs > 0 && timeoutMs > overallTimeoutMs ? overallTimeoutMs : timeoutMs;
 }
 
 function readBoolean(value: unknown): boolean | undefined {

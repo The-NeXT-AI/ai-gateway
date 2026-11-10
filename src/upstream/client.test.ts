@@ -250,6 +250,209 @@ describe('callUpstream', () => {
     }
   });
 
+  it('applies separate headers and body idle timeouts to the dispatcher', async () => {
+    const originalFetch = global.fetch;
+    const globalDispatcher = { dispatch: undiciMock.dispatch };
+    undiciMock.getGlobalDispatcher.mockReturnValue(globalDispatcher);
+
+    try {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response('{}', { status: 200 })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      await callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        600000,
+        undefined,
+        undefined,
+        undefined,
+        { headersTimeoutMs: 1000, bodyIdleTimeoutMs: 2000 }
+      );
+
+      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+      const handler = {};
+      (fetchInit?.dispatcher as TestDispatcher | undefined)?.dispatch(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST'
+        },
+        handler
+      );
+
+      expect(undiciMock.dispatch).toHaveBeenCalledWith(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST',
+          bodyTimeout: 2000,
+          headersTimeout: 1000
+        },
+        handler
+      );
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('retries an attempt whose response headers miss the headers deadline', async () => {
+    vi.useFakeTimers();
+    const originalFetch = global.fetch;
+
+    try {
+      const firstSignals: AbortSignal[] = [];
+      const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+        if (fetchMock.mock.calls.length === 1) {
+          const attemptSignal = init?.signal as AbortSignal;
+          firstSignals.push(attemptSignal);
+          return new Promise<Response>((_resolve, reject) => {
+            attemptSignal.addEventListener(
+              'abort',
+              () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+              { once: true }
+            );
+          });
+        }
+
+        return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
+      });
+      global.fetch = fetchMock as typeof fetch;
+
+      const pending = callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        10000,
+        undefined,
+        undefined,
+        undefined,
+        { headersTimeoutMs: 1000 }
+      );
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(firstSignals[0]?.aborted).toBe(true);
+      await vi.advanceTimersByTimeAsync(150);
+      const response = await pending;
+
+      expect(response.status).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      global.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not let headers timeout retries outlive the overall deadline', async () => {
+    vi.useFakeTimers();
+    const originalFetch = global.fetch;
+
+    try {
+      const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+            { once: true }
+          );
+        })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      const pending = callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        1200,
+        undefined,
+        undefined,
+        { maxAttempts: 5 },
+        { headersTimeoutMs: 1000 }
+      ).catch((error) => error);
+
+      await vi.advanceTimersByTimeAsync(1200);
+      const error = await pending;
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toBe('Upstream request timed out after 1200ms.');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      global.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports a headers timeout once retries are exhausted', async () => {
+    vi.useFakeTimers();
+    const originalFetch = global.fetch;
+
+    try {
+      const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+            { once: true }
+          );
+        })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      const pending = callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        60000,
+        undefined,
+        undefined,
+        undefined,
+        { headersTimeoutMs: 1000 }
+      ).catch((error) => error);
+
+      await vi.advanceTimersByTimeAsync(1000 + 150 + 1000);
+      const error = await pending;
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toBe('Upstream response headers timed out after 1000ms.');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      global.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it('classifies undici headers timeouts wrapped by fetch', async () => {
+    const originalFetch = global.fetch;
+
+    try {
+      const fetchMock = vi.fn(async () => {
+        throw new TypeError('fetch failed', {
+          cause: Object.assign(new Error('Headers Timeout Error'), { code: 'UND_ERR_HEADERS_TIMEOUT' })
+        });
+      });
+      global.fetch = fetchMock as typeof fetch;
+
+      const error = await callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        60000,
+        undefined,
+        undefined,
+        { enabled: false },
+        { headersTimeoutMs: 1000 }
+      ).catch((caught) => caught);
+
+      expect(error.message).toBe('Upstream response headers timed out after 1000ms.');
+      expect(error.cause).toBeInstanceOf(TypeError);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   it('applies upstream timeouts through a CCR upstream proxy dispatcher', async () => {
     const originalFetch = global.fetch;
     const globalDispatcher = { dispatch: undiciMock.dispatch };

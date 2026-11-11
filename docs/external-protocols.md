@@ -11,6 +11,16 @@ Gateway does not connect to databases, Redis, queue backends, or object storage 
 - A `2xx` response is treated as success. Non-`2xx` responses are failures and may be retried by event sinks.
 - Configured headers are forwarded. If `apiKey` is present, Gateway sends it in `apiKeyHeader`.
 
+#### Interrupted upstream event streams
+
+For `anthropic_messages`, `openai_chat`, and `openai_responses`, an upstream read
+failure before a terminal event becomes a protocol-native error frame. A recognized
+transport code, such as `ECONNRESET`, may be appended to the generic error message;
+arbitrary exception messages, URLs, and objects are not copied into client output.
+The cause walk is bounded to four objects. Client cancellation and a previously
+observed terminal event do not produce a second error. Other adapters pass through
+unchanged; this guard does not add retries or alter provider-error classification.
+
 ### WebSocket
 
 - Gateway opens a connection, sends one JSON request or event, and then waits for one JSON response for source requests.

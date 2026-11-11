@@ -12539,6 +12539,380 @@ export function createGatewayPlugin() {
     }
   });
 
+  it('reports a truncated Anthropic upstream stream as a terminal error event', async () => {
+    const fetchMock = vi.fn(async () =>
+      createTruncatedSseResponse(
+        [
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_cut","type":"message","role":"assistant","model":"claude-sonnet-4","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"live"}}\n\n'
+        ],
+        new Error('terminated')
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([
+        createProviderConfig('anthropic-main', 'anthropic_messages', ['claude-sonnet-4'])
+      ]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'anthropic-main'
+        },
+        payload: {
+          model: 'claude-sonnet-4',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'Think about it' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // The chunk that was mid-flight when the body failed is lost with the
+      // destroyed source stream, so assert on the bytes the client did get.
+      expect(response.body).toContain('"type":"message_start"');
+      expect(response.body.match(/^event: error$/gm)).toHaveLength(1);
+      expect(response.body).toContain('"type":"api_error"');
+      expect(response.body).toContain('Upstream stream failed before the response completed.');
+      expect(response.body).not.toContain('event: message_stop');
+      expect(response.body.indexOf('event: error')).toBeGreaterThan(
+        response.body.indexOf('event: message_start')
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('reports a truncated OpenAI chat upstream stream as an error chunk and done sentinel', async () => {
+    const fetchMock = vi.fn(async () =>
+      createTruncatedSseResponse(
+        [
+          'data: {"id":"chatcmpl_cut","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n',
+          'data: {"id":"chatcmpl_cut","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":" there"}}]}\n\n'
+        ],
+        new Error('terminated')
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          stream: true,
+          messages: [{ role: 'user', content: 'Say hi' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('"delta":{"content":"hi"}');
+      expect(response.body).toContain('"code":"upstream_stream_error"');
+      expect(response.body.endsWith('data: [DONE]\n\n')).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('reports a truncated OpenAI Responses upstream stream as a failed response event', async () => {
+    const fetchMock = vi.fn(async () =>
+      createTruncatedSseResponse(
+        [
+          'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_cut","object":"response","status":"in_progress","model":"gpt-5","output":[]}}\n\n'
+        ],
+        new Error('terminated')
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('responses-main', 'openai_responses', ['gpt-5'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'responses-main'
+        },
+        payload: {
+          model: 'gpt-5',
+          stream: true,
+          input: 'Say hi'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('event: response.created');
+      expect(response.body.match(/^event: response\.failed$/gm)).toHaveLength(1);
+      expect(response.body).toContain('"status":"failed"');
+      expect(response.body.endsWith('data: [DONE]\n\n')).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  describe('upstream stream idle watchdog', () => {
+    const anthropicStart =
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_idle","type":"message","role":"assistant","model":"claude-sonnet-4","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":0}}}\n\n';
+    const anthropicTextDelta =
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n';
+    const openAIChatDelta =
+      'data: {"id":"chatcmpl_idle","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}\n\n';
+
+    async function injectWithIdleTimeout(
+      provider: ProviderConfig,
+      request: { url: string; payload: Record<string, unknown> }
+    ) {
+      const app = Fastify({ logger: false });
+      registerGatewayRoutes(
+        app,
+        { ...createConfig([provider]), upstreamStreamIdleTimeoutMs: 50 },
+        createGatewayRuntime()
+      );
+      await app.ready();
+      try {
+        return await app.inject({
+          method: 'POST',
+          url: request.url,
+          headers: {
+            'content-type': 'application/json',
+            'x-target-provider': provider.name
+          },
+          payload: request.payload
+        });
+      } finally {
+        await app.close();
+      }
+    }
+
+    const anthropicRequest = {
+      url: '/v1/messages',
+      payload: {
+        model: 'claude-sonnet-4',
+        max_tokens: 128,
+        stream: true,
+        messages: [{ role: 'user', content: 'Say hi' }]
+      }
+    };
+    const openAIChatRequest = {
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'glm-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'Say hi' }]
+      }
+    };
+
+    it('ends a stalled Anthropic passthrough stream with an error event and releases upstream', async () => {
+      const upstream = createStalledSseResponse([anthropicStart, anthropicTextDelta]);
+      vi.stubGlobal('fetch', vi.fn(async () => upstream.response) as typeof fetch);
+
+      const response = await injectWithIdleTimeout(
+        createProviderConfig('anthropic-main', 'anthropic_messages', ['claude-sonnet-4']),
+        anthropicRequest
+      );
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('"text":"hi"');
+      expect(response.body.match(/^event: error$/gm)).toHaveLength(1);
+      expect(response.body).toContain('"type":"api_error"');
+      expect(response.body).toContain('Upstream stream sent no data for 50ms.');
+      expect(response.body).not.toContain('event: message_stop');
+      expect(upstream.cancelled()).toBe(true);
+    });
+
+    it('ends a stalled OpenAI chat passthrough stream with an error chunk and done sentinel', async () => {
+      const upstream = createStalledSseResponse([openAIChatDelta]);
+      vi.stubGlobal('fetch', vi.fn(async () => upstream.response) as typeof fetch);
+
+      const response = await injectWithIdleTimeout(
+        createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5']),
+        openAIChatRequest
+      );
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('"content":"hi"');
+      expect(response.body).toContain('"code":"upstream_stream_idle_timeout"');
+      expect(response.body.match(/^data: \[DONE\]$/gm)).toHaveLength(1);
+      expect(response.body.endsWith('data: [DONE]\n\n')).toBe(true);
+      expect(upstream.cancelled()).toBe(true);
+    });
+
+    it('closes a stalled passthrough stream without an error once the terminal event was relayed', async () => {
+      const upstream = createStalledSseResponse([
+        anthropicStart,
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      ]);
+      vi.stubGlobal('fetch', vi.fn(async () => upstream.response) as typeof fetch);
+
+      const response = await injectWithIdleTimeout(
+        createProviderConfig('anthropic-main', 'anthropic_messages', ['claude-sonnet-4']),
+        anthropicRequest
+      );
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('event: message_stop');
+      expect(response.body).not.toContain('event: error');
+      expect(upstream.cancelled()).toBe(true);
+    });
+
+    it('still publishes billing when upstream stalls after its terminal event', async () => {
+      const upstream = createStalledSseResponse([
+        anthropicStart,
+        anthropicTextDelta,
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+          'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}\n\n' +
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      ]);
+      const fetchMock = vi.fn(async (url: string) => {
+        if (String(url) === 'http://billing.local/events') {
+          return new Response(null, { status: 200 });
+        }
+        return upstream.response;
+      });
+      vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+      const config = {
+        ...createConfig([createProviderConfig('anthropic-main', 'anthropic_messages', ['claude-sonnet-4'])]),
+        upstreamStreamIdleTimeoutMs: 50
+      };
+      config.billing.enabled = true;
+      config.billingWebhook = {
+        enabled: true,
+        transport: 'http',
+        endpoint: 'http://billing.local/events',
+        timeoutMs: 1000,
+        maxAttempts: 1,
+        baseDelayMs: 10,
+        maxDelayMs: 10,
+        requireAck: false,
+        headers: {}
+      };
+      await initializeBillingPublisher(config.billingQueue, config.billingWebhook);
+
+      const app = Fastify({ logger: false });
+      registerGatewayRoutes(app, config, createGatewayRuntime(config));
+      await app.ready();
+      try {
+        const response = await app.inject({
+          method: 'POST',
+          url: anthropicRequest.url,
+          headers: { 'content-type': 'application/json', 'x-target-provider': 'anthropic-main' },
+          payload: anthropicRequest.payload
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.body).toContain('event: message_stop');
+        await vi.waitFor(() => {
+          expect(fetchMock.mock.calls.some(([url]) => String(url) === 'http://billing.local/events')).toBe(true);
+        });
+        const billingCall = fetchMock.mock.calls.find(([url]) => String(url) === 'http://billing.local/events');
+        const billingPayload = JSON.parse(String((billingCall as unknown as [string, RequestInit])[1].body));
+        expect(billingPayload.billing.usage.output_tokens).toBe(5);
+      } finally {
+        await app.close();
+      }
+    });
+
+    it('answers 504 when upstream sends headers but no body bytes', async () => {
+      const upstream = createStalledSseResponse([]);
+      vi.stubGlobal('fetch', vi.fn(async () => upstream.response) as typeof fetch);
+
+      const response = await injectWithIdleTimeout(
+        createProviderConfig('anthropic-main', 'anthropic_messages', ['claude-sonnet-4']),
+        anthropicRequest
+      );
+
+      expect(response.statusCode).toBe(504);
+      expect(response.headers['content-type']).toContain('application/json');
+      expect(JSON.parse(response.body)).toMatchObject({ code: 'UPSTREAM_STREAM_IDLE_TIMEOUT' });
+      expect(response.body).toContain('Upstream stream sent no data for 50ms.');
+      expect(upstream.cancelled()).toBe(true);
+    });
+
+    it('ends a stalled converted stream with an Anthropic error event', async () => {
+      const upstream = createStalledSseResponse([openAIChatDelta]);
+      vi.stubGlobal('fetch', vi.fn(async () => upstream.response) as typeof fetch);
+
+      const response = await injectWithIdleTimeout(
+        createProviderConfig('openai-main', 'openai_chat_completions', ['claude-sonnet-4']),
+        anthropicRequest
+      );
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('event: message_start');
+      expect(response.body).toContain('"text":"hi"');
+      expect(response.body.match(/^event: error$/gm)).toHaveLength(1);
+      expect(response.body).toContain('Upstream stream sent no data for 50ms.');
+      expect(response.body).not.toContain('event: message_stop');
+      expect(upstream.cancelled()).toBe(true);
+    });
+
+    it('answers 504 on a converted stream when upstream sends headers but no body bytes', async () => {
+      const upstream = createStalledSseResponse([]);
+      vi.stubGlobal('fetch', vi.fn(async () => upstream.response) as typeof fetch);
+
+      const response = await injectWithIdleTimeout(
+        createProviderConfig('openai-main', 'openai_chat_completions', ['claude-sonnet-4']),
+        anthropicRequest
+      );
+
+      expect(response.statusCode).toBe(504);
+      expect(response.headers['content-type']).toContain('application/json');
+      expect(response.body).toContain('Upstream stream sent no data for 50ms.');
+      expect(upstream.cancelled()).toBe(true);
+    });
+
+    it('ends a stalled converted stream with an OpenAI chat error chunk and done sentinel', async () => {
+      const upstream = createStalledSseResponse([anthropicStart, anthropicTextDelta]);
+      vi.stubGlobal('fetch', vi.fn(async () => upstream.response) as typeof fetch);
+
+      const response = await injectWithIdleTimeout(
+        createProviderConfig('anthropic-main', 'anthropic_messages', ['glm-5']),
+        openAIChatRequest
+      );
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('"content":"hi"');
+      expect(response.body).toContain('"code":"upstream_stream_idle_timeout"');
+      expect(response.body.match(/^data: \[DONE\]$/gm)).toHaveLength(1);
+      expect(response.body.endsWith('data: [DONE]\n\n')).toBe(true);
+      expect(upstream.cancelled()).toBe(true);
+    });
+  });
+
   it('streams buffered virtual model responses as OpenAI Responses events', async () => {
     const fetchMock = vi
       .fn()
@@ -13588,6 +13962,60 @@ function createSseResponse(chunks: string[]): Response {
       'content-type': 'text/event-stream; charset=utf-8'
     }
   });
+}
+
+function createTruncatedSseResponse(chunks: string[], error: Error): Response {
+  let index = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(new TextEncoder().encode(chunks[index]));
+        index += 1;
+        return;
+      }
+      controller.error(error);
+    }
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8'
+    }
+  });
+}
+
+// Sends `chunks`, then keeps the body open without producing anything more,
+// like a provider that stops mid-generation but never closes the socket.
+function createStalledSseResponse(chunks: string[]): {
+  response: Response;
+  cancelled: () => boolean;
+} {
+  let index = 0;
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(new TextEncoder().encode(chunks[index]));
+        index += 1;
+        return;
+      }
+      return new Promise<void>(() => undefined);
+    },
+    cancel() {
+      cancelled = true;
+    }
+  });
+
+  return {
+    response: new Response(stream, {
+      status: 200,
+      headers: {
+        'content-type': 'text/event-stream; charset=utf-8'
+      }
+    }),
+    cancelled: () => cancelled
+  };
 }
 
 function parseJsonSseEvents(body: string): Array<{

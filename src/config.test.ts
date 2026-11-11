@@ -290,6 +290,7 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.PROVIDER_EXTERNAL_STDIO_ARGS;
     delete process.env.PROVIDER_EXTERNAL_STDIO_CWD;
     delete process.env.UPSTREAM_TIMEOUT_MS;
+    delete process.env.UPSTREAM_STREAM_IDLE_TIMEOUT_MS;
   });
 
   it('parses the production Docker gateway config', () => {
@@ -378,6 +379,27 @@ describe('Gateway config providerPlugins', () => {
 
     process.env.UPSTREAM_TIMEOUT_MS = '0';
     expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: 5000 }).upstreamTimeoutMs).toBe(0);
+  });
+
+  it('defaults the upstream stream idle timeout to two minutes and lets the environment win', () => {
+    expect(parseGatewayConfigFromRaw({}).upstreamStreamIdleTimeoutMs).toBe(120000);
+    expect(
+      parseGatewayConfigFromRaw({ upstreamStreamIdleTimeoutMs: 30000 }).upstreamStreamIdleTimeoutMs
+    ).toBe(30000);
+    expect(parseGatewayConfigFromRaw({ upstreamStreamIdleTimeoutMs: -1 }).upstreamStreamIdleTimeoutMs).toBe(
+      120000
+    );
+    expect(parseGatewayConfigFromRaw({ upstreamStreamIdleTimeoutMs: 0 }).upstreamStreamIdleTimeoutMs).toBe(0);
+
+    process.env.UPSTREAM_STREAM_IDLE_TIMEOUT_MS = 'soon';
+    expect(
+      parseGatewayConfigFromRaw({ upstreamStreamIdleTimeoutMs: 30000 }).upstreamStreamIdleTimeoutMs
+    ).toBe(30000);
+
+    process.env.UPSTREAM_STREAM_IDLE_TIMEOUT_MS = '0';
+    expect(
+      parseGatewayConfigFromRaw({ upstreamStreamIdleTimeoutMs: 30000 }).upstreamStreamIdleTimeoutMs
+    ).toBe(0);
   });
 
   it('defaults billing trace request body capture to disabled', () => {

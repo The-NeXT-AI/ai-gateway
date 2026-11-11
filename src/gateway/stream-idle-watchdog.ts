@@ -14,10 +14,24 @@ export class UpstreamStreamIdleTimeoutError extends Error {
   readonly code = 'UPSTREAM_STREAM_IDLE_TIMEOUT';
   readonly statusCode = 504;
 
-  constructor(readonly idleTimeoutMs: number) {
-    super(`Upstream stream sent no data for ${idleTimeoutMs}ms.`);
+  // `idleTimeoutMs` is unset when undici's own body timeout fired first; that
+  // limit comes from the dispatcher, not from this watchdog.
+  constructor(readonly idleTimeoutMs?: number, options?: ErrorOptions) {
+    super(
+      idleTimeoutMs === undefined
+        ? 'Upstream stream stopped sending data.'
+        : `Upstream stream sent no data for ${idleTimeoutMs}ms.`,
+      options
+    );
     this.name = 'UpstreamStreamIdleTimeoutError';
   }
+}
+
+// fetch reports undici's per-chunk body timeout as a bare `TypeError: terminated`
+// with the undici error as its cause.
+function isUndiciBodyTimeout(error: unknown): boolean {
+  const cause = (error as { cause?: { code?: unknown } } | null)?.cause;
+  return cause?.code === 'UND_ERR_BODY_TIMEOUT';
 }
 
 export interface RelayedStreamIdleGuardInput {
@@ -103,8 +117,15 @@ export function withUpstreamStreamIdleTimeout(
         let result: UpstreamRead;
         try {
           result = await readWithinIdleTimeout(reader, idleTimeoutMs);
-        } catch (error) {
+        } catch (caught) {
           release();
+          // The dispatcher's bodyTimeout is the same stall seen by a different
+          // timer, and whichever is shorter wins. Treat both alike so the 504,
+          // the in-band error frame and the clean close after a terminal event
+          // do not depend on which one fired.
+          const error = isUndiciBodyTimeout(caught)
+            ? new UpstreamStreamIdleTimeoutError(undefined, { cause: caught })
+            : caught;
           if (error instanceof UpstreamStreamIdleTimeoutError) {
             cancelQuietly(reader, error);
             if (detector.hasTerminalEvent()) {

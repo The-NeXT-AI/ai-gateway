@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { afterEach, describe, expect, it } from 'vitest';
+import { callUpstream } from '../upstream/client';
 import {
   endConvertedStreamOnIdle,
   guardRelayedStreamIdle,
@@ -134,6 +137,51 @@ describe('withUpstreamStreamIdleTimeout', () => {
 
     await expect(watched.text()).rejects.toBeInstanceOf(UpstreamStreamIdleTimeoutError);
   });
+});
+
+// A real socket, so undici's own bodyTimeout (set from the overall upstream
+// timeout) can fire before the watchdog does.
+describe('withUpstreamStreamIdleTimeout behind the undici body timeout', () => {
+  let server: Server | undefined;
+
+  afterEach(() => {
+    server?.closeAllConnections();
+    server?.close();
+    server = undefined;
+  });
+
+  async function stallAfter(firstEvent: string): Promise<Response> {
+    server = createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.write(firstEvent);
+    });
+    await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    // undici checks its body timeout on a coarse clock, so it fires after
+    // roughly 1-2s here; the watchdog is set well beyond that.
+    const upstream = await callUpstream(`http://127.0.0.1:${port}/`, {}, { stream: true }, 1_000);
+    return withUpstreamStreamIdleTimeout(upstream, 10_000);
+  }
+
+  it('fails with the idle error when undici gives up first', async () => {
+    const response = await stallAfter('data: {"type":"message_start"}\n\n');
+
+    const error = await response.text().then(
+      () => undefined,
+      (caught: unknown) => caught
+    );
+
+    expect(error).toBeInstanceOf(UpstreamStreamIdleTimeoutError);
+    expect((error as UpstreamStreamIdleTimeoutError).statusCode).toBe(504);
+    expect((error as Error).cause).toMatchObject({ cause: { code: 'UND_ERR_BODY_TIMEOUT' } });
+  }, 8_000);
+
+  it('closes cleanly when undici gives up after the terminal event', async () => {
+    const terminal = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+    const response = await stallAfter(terminal);
+
+    await expect(response.text()).resolves.toBe(terminal);
+  }, 8_000);
 });
 
 describe('withUpstreamStreamIdleTimeout client abort', () => {

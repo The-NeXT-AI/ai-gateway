@@ -45,6 +45,20 @@ async function startServer(
   return { url: `http://127.0.0.1:${port}/v1/responses`, requests: () => requestCount };
 }
 
+async function startStallingBodyServer(): Promise<string> {
+  server = createServer((request, response) => {
+    request.resume();
+    request.on('end', () => {
+      pendingResponses.push(response);
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.write('data: {"type":"ping"}\n\n');
+    });
+  });
+  await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  return `http://127.0.0.1:${port}/v1/responses`;
+}
+
 describe('callUpstream headers timeout against a real server', () => {
   beforeEach(() => {
     for (const name of proxyEnvNames) {
@@ -101,12 +115,37 @@ describe('callUpstream headers timeout against a real server', () => {
       500,
       undefined,
       undefined,
-      { maxAttempts: 5 },
+      // Attempt 2 starts at ~300ms and is cut by the 500ms deadline, leaving 200ms either side.
+      { maxAttempts: 5, baseDelayMs: 0 },
       { headersTimeoutMs: 300, bodyIdleTimeoutMs: 1000 }
     ).catch((caught) => caught);
 
     expect(error).toBeInstanceOf(Error);
     expect(error.message).toBe('Upstream request timed out after 500ms.');
     expect(upstream.requests()).toBe(2);
+  });
+
+  it('fails a body that stalls longer than the body idle timeout', async () => {
+    const url = await startStallingBodyServer();
+    const startedAt = Date.now();
+
+    const response = await callUpstream(
+      url,
+      { 'content-type': 'application/json' },
+      { model: 'test-model', input: 'hello', stream: true },
+      5000,
+      undefined,
+      undefined,
+      undefined,
+      { headersTimeoutMs: 1000, bodyIdleTimeoutMs: 300 }
+    );
+    expect(response.status).toBe(200);
+
+    const error = await response.text().catch((caught) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error & { cause?: { code?: string } }).cause?.code).toBe(
+      'UND_ERR_BODY_TIMEOUT'
+    );
+    expect(Date.now() - startedAt).toBeLessThan(3000);
   });
 });

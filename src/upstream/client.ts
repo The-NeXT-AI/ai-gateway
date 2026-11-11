@@ -29,6 +29,10 @@ export interface UpstreamRequestOptions {
   method?: string;
   bodyEncoding?: 'json' | 'text' | 'form' | 'bytes' | 'none';
   skipResponseBodyLog?: boolean;
+  /** Per-attempt deadline for response headers; a miss is retried. Falls back to the overall timeout. */
+  headersTimeoutMs?: number;
+  /** Maximum gap between response body chunks. Falls back to the overall timeout. */
+  bodyIdleTimeoutMs?: number;
 }
 
 interface NormalizedUpstreamRetryOptions {
@@ -161,7 +165,13 @@ export async function callUpstream(
       'Upstream request dispatched.'
     );
   }
-  const dispatcher = upstreamFetchDispatcher(timeoutMs);
+  // 0 means "not set separately": fall back to the overall timeout, never to undici's 300s default.
+  const headersTimeoutMs = normalizeDispatcherTimeoutMs(requestOptions?.headersTimeoutMs ?? 0);
+  const bodyIdleTimeoutMs = normalizeDispatcherTimeoutMs(requestOptions?.bodyIdleTimeoutMs ?? 0);
+  const dispatcher = upstreamFetchDispatcher({
+    headersTimeoutMs: headersTimeoutMs ?? timeoutMs,
+    bodyTimeoutMs: bodyIdleTimeoutMs ?? timeoutMs
+  });
 
   let lastError: unknown;
   let timedOut = false;
@@ -185,6 +195,20 @@ export async function callUpstream(
       const onAbort = () => {
         controller.abort();
       };
+      let headersTimedOut = false;
+      let headersTimeout: ReturnType<typeof setTimeout> | undefined =
+        headersTimeoutMs !== undefined
+          ? setTimeout(() => {
+              headersTimedOut = true;
+              controller.abort();
+            }, headersTimeoutMs)
+          : undefined;
+      const clearHeadersTimeout = () => {
+        if (headersTimeout) {
+          clearTimeout(headersTimeout);
+          headersTimeout = undefined;
+        }
+      };
 
       if (signal) {
         if (signal.aborted) {
@@ -206,6 +230,7 @@ export async function callUpstream(
         const response = dispatcher
           ? await dispatcherFetch(url, fetchInit)
           : await fetch(url, fetchInit);
+        clearHeadersTimeout();
 
         if (shouldLog && requestLogPayload) {
           const responseBody =
@@ -252,7 +277,14 @@ export async function callUpstream(
         }
 
         return response;
-      } catch (error) {
+      } catch (caught) {
+        const error =
+          headersTimedOut || isUndiciHeadersTimeoutError(caught)
+            ? buildUpstreamHeadersTimeoutError(
+                headersTimeoutMs ?? normalizeDispatcherTimeoutMs(timeoutMs) ?? 0,
+                caught
+              )
+            : caught;
         lastError = error;
         if (timedOut) {
           const timeoutError = buildUpstreamTimeoutError(timeoutMs);
@@ -303,6 +335,7 @@ export async function callUpstream(
 
         await delay(resolveRetryDelayMs(retry, attempt), signal);
       } finally {
+        clearHeadersTimeout();
         signal?.removeEventListener('abort', onAbort);
         if (activeController === controller) {
           activeController = undefined;
@@ -362,19 +395,28 @@ function normalizeUpstreamAcceptEncoding(value: string, fallback: string): strin
   return supportedEncodings.length > 0 ? supportedEncodings.join(', ') : fallback;
 }
 
-function upstreamFetchDispatcher(timeoutMs: number): FetchDispatcher | undefined {
-  const normalizedTimeoutMs = normalizeDispatcherTimeoutMs(timeoutMs);
+interface UpstreamDispatcherTimeouts {
+  headersTimeoutMs: number;
+  bodyTimeoutMs: number;
+}
+
+function upstreamFetchDispatcher(timeouts: UpstreamDispatcherTimeouts): FetchDispatcher | undefined {
+  const headersTimeoutMs = normalizeDispatcherTimeoutMs(timeouts.headersTimeoutMs);
+  const bodyTimeoutMs = normalizeDispatcherTimeoutMs(timeouts.bodyTimeoutMs);
   const proxyOptions = readUpstreamProxyEnvOptions();
-  if (normalizedTimeoutMs === undefined && !proxyOptions) {
+  if (headersTimeoutMs === undefined && bodyTimeoutMs === undefined && !proxyOptions) {
     return undefined;
   }
 
   const baseDispatcher = upstreamBaseDispatcher(proxyOptions);
-  if (normalizedTimeoutMs === undefined) {
+  if (headersTimeoutMs === undefined && bodyTimeoutMs === undefined) {
     return baseDispatcher as unknown as FetchDispatcher;
   }
 
-  return new UpstreamTimeoutDispatcher(normalizedTimeoutMs, baseDispatcher) as unknown as FetchDispatcher;
+  return new UpstreamTimeoutDispatcher(
+    { headersTimeout: headersTimeoutMs, bodyTimeout: bodyTimeoutMs },
+    baseDispatcher
+  ) as unknown as FetchDispatcher;
 }
 
 function normalizeDispatcherTimeoutMs(timeoutMs: number): number | undefined {
@@ -495,7 +537,7 @@ class UpstreamEnvProxyDispatcher extends Dispatcher {
 
 class UpstreamTimeoutDispatcher extends Dispatcher {
   constructor(
-    private readonly timeoutMs: number,
+    private readonly timeouts: { headersTimeout?: number; bodyTimeout?: number },
     private readonly baseDispatcher: UpstreamDispatchTarget
   ) {
     super();
@@ -512,8 +554,10 @@ class UpstreamTimeoutDispatcher extends Dispatcher {
     return this.baseDispatcher.dispatch(
       {
         ...options,
-        bodyTimeout: this.timeoutMs,
-        headersTimeout: this.timeoutMs
+        ...(this.timeouts.bodyTimeout !== undefined ? { bodyTimeout: this.timeouts.bodyTimeout } : {}),
+        ...(this.timeouts.headersTimeout !== undefined
+          ? { headersTimeout: this.timeouts.headersTimeout }
+          : {})
       },
       handler
     );
@@ -1043,6 +1087,20 @@ function normalizePositiveNumber(value: number | undefined, fallback: number): n
 
 function buildUpstreamTimeoutError(timeoutMs: number): Error {
   return new Error(`Upstream request timed out after ${timeoutMs}ms.`);
+}
+
+function buildUpstreamHeadersTimeoutError(timeoutMs: number, cause: unknown): Error {
+  return new Error(`Upstream response headers timed out after ${timeoutMs}ms.`, { cause });
+}
+
+// undici's fetch wraps dispatcher failures, so the HeadersTimeoutError usually sits on `cause`.
+function isUndiciHeadersTimeoutError(error: unknown): boolean {
+  const code = (value: unknown) =>
+    value && typeof value === 'object' ? (value as { code?: unknown }).code : undefined;
+  return (
+    code(error) === 'UND_ERR_HEADERS_TIMEOUT' ||
+    code((error as { cause?: unknown } | undefined)?.cause) === 'UND_ERR_HEADERS_TIMEOUT'
+  );
 }
 
 function redactSensitiveValues(value: unknown, depth: number): unknown {

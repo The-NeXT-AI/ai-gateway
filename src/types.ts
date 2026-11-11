@@ -956,6 +956,8 @@ export interface GatewayConfig {
   geminiApiVersion: string;
   bodyLimitBytes: number;
   upstreamTimeoutMs: number;
+  upstreamHeadersTimeoutMs: number;
+  upstreamBodyIdleTimeoutMs: number;
   defaultOpenAIModel?: string;
   defaultAnthropicModel?: string;
   defaultGeminiModel?: string;

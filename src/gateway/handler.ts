@@ -8049,7 +8049,9 @@ async function callUpstreamWithFailureCapture(
       context.config.upstreamRetry,
       {
         method: upstreamRequest.method,
-        bodyEncoding: upstreamRequest.bodyEncoding
+        bodyEncoding: upstreamRequest.bodyEncoding,
+        headersTimeoutMs: context.config.upstreamHeadersTimeoutMs,
+        bodyIdleTimeoutMs: context.config.upstreamBodyIdleTimeoutMs
       }
     );
     cancelResponseBodyOnAbort(response, context.clientAbortSignal);

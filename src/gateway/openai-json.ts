@@ -2058,7 +2058,9 @@ async function callOpenAIJsonUpstream(
       {
         method: upstreamRequest.method,
         bodyEncoding: upstreamRequest.bodyEncoding,
-        skipResponseBodyLog: upstreamRequest.skipResponseBodyLog
+        skipResponseBodyLog: upstreamRequest.skipResponseBodyLog,
+        headersTimeoutMs: context.config.upstreamHeadersTimeoutMs,
+        bodyIdleTimeoutMs: context.config.upstreamBodyIdleTimeoutMs
       }
     );
     cancelResponseBodyOnAbort(response, context.clientAbortSignal);

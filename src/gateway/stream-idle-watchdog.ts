@@ -82,7 +82,14 @@ export function withUpstreamStreamIdleTimeout(
 
   const reader = response.body.getReader();
   const onAbort = () => cancelQuietly(reader, signal?.reason);
-  signal?.addEventListener('abort', onAbort, { once: true });
+  if (signal?.aborted) {
+    // An abort that already fired never reaches a new listener, and callUpstream
+    // stopped forwarding the client signal to fetch once headers arrived, so the
+    // client leaving in between would otherwise hold the provider socket open.
+    onAbort();
+  } else {
+    signal?.addEventListener('abort', onAbort, { once: true });
+  }
   const release = () => signal?.removeEventListener('abort', onAbort);
 
   const body = new ReadableStream<Uint8Array>(

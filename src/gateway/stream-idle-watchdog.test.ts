@@ -118,6 +118,33 @@ describe('withUpstreamStreamIdleTimeout', () => {
   });
 });
 
+describe('withUpstreamStreamIdleTimeout client abort', () => {
+  it('cancels upstream when the client goes away mid-stream', async () => {
+    const upstream = createStalledEventStream([anthropicDelta]);
+    const client = new AbortController();
+    const watched = withUpstreamStreamIdleTimeout(upstream.response, 10_000, client.signal);
+    const reader = watched.body!.getReader();
+
+    await reader.read();
+    const pending = reader.read();
+    client.abort(new Error('client gone'));
+
+    expect(await pending).toEqual({ done: true, value: undefined });
+    expect(upstream.cancelled()).toBe(true);
+  });
+
+  it('cancels upstream when the client left before the body was wrapped', async () => {
+    const upstream = createStalledEventStream([anthropicDelta]);
+    const client = new AbortController();
+    client.abort(new Error('client gone'));
+
+    withUpstreamStreamIdleTimeout(upstream.response, 10_000, client.signal);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(upstream.cancelled()).toBe(true);
+  });
+});
+
 describe('guardRelayedStreamIdle', () => {
   it('ends an idle Anthropic stream with one error event', async () => {
     const upstream = createStalledEventStream([anthropicDelta]);

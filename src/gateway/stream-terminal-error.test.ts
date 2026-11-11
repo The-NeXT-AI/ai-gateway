@@ -683,10 +683,11 @@ describe('guardStreamTerminalError backpressure', () => {
     const reader = guarded.body!.getReader();
 
     await reader.read();
-    await Promise.resolve();
+    // Let the one-chunk read-ahead settle; how many microtasks it takes is a
+    // runtime detail, a macrotask turn is not.
+    await new Promise((resolve) => setImmediate(resolve));
     await reader.cancel(new Error('client gone'));
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
 
     expect(source.cancelReason()).toEqual(new Error('client gone'));
     // One served chunk plus the single queued one; no further reads after cancel.

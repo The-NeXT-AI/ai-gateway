@@ -12788,6 +12788,64 @@ export function createGatewayPlugin() {
       expect(upstream.cancelled()).toBe(true);
     });
 
+    it('still publishes billing when upstream stalls after its terminal event', async () => {
+      const upstream = createStalledSseResponse([
+        anthropicStart,
+        anthropicTextDelta,
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+          'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}\n\n' +
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      ]);
+      const fetchMock = vi.fn(async (url: string) => {
+        if (String(url) === 'http://billing.local/events') {
+          return new Response(null, { status: 200 });
+        }
+        return upstream.response;
+      });
+      vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+      const config = {
+        ...createConfig([createProviderConfig('anthropic-main', 'anthropic_messages', ['claude-sonnet-4'])]),
+        upstreamStreamIdleTimeoutMs: 50
+      };
+      config.billing.enabled = true;
+      config.billingWebhook = {
+        enabled: true,
+        transport: 'http',
+        endpoint: 'http://billing.local/events',
+        timeoutMs: 1000,
+        maxAttempts: 1,
+        baseDelayMs: 10,
+        maxDelayMs: 10,
+        requireAck: false,
+        headers: {}
+      };
+      await initializeBillingPublisher(config.billingQueue, config.billingWebhook);
+
+      const app = Fastify({ logger: false });
+      registerGatewayRoutes(app, config, createGatewayRuntime(config));
+      await app.ready();
+      try {
+        const response = await app.inject({
+          method: 'POST',
+          url: anthropicRequest.url,
+          headers: { 'content-type': 'application/json', 'x-target-provider': 'anthropic-main' },
+          payload: anthropicRequest.payload
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.body).toContain('event: message_stop');
+        await vi.waitFor(() => {
+          expect(fetchMock.mock.calls.some(([url]) => String(url) === 'http://billing.local/events')).toBe(true);
+        });
+        const billingCall = fetchMock.mock.calls.find(([url]) => String(url) === 'http://billing.local/events');
+        const billingPayload = JSON.parse(String((billingCall as unknown as [string, RequestInit])[1].body));
+        expect(billingPayload.billing.usage.output_tokens).toBe(5);
+      } finally {
+        await app.close();
+      }
+    });
+
     it('answers 504 when upstream sends headers but no body bytes', async () => {
       const upstream = createStalledSseResponse([]);
       vi.stubGlobal('fetch', vi.fn(async () => upstream.response) as typeof fetch);
@@ -12798,6 +12856,8 @@ export function createGatewayPlugin() {
       );
 
       expect(response.statusCode).toBe(504);
+      expect(response.headers['content-type']).toContain('application/json');
+      expect(JSON.parse(response.body)).toMatchObject({ code: 'UPSTREAM_STREAM_IDLE_TIMEOUT' });
       expect(response.body).toContain('Upstream stream sent no data for 50ms.');
       expect(upstream.cancelled()).toBe(true);
     });
@@ -12817,6 +12877,21 @@ export function createGatewayPlugin() {
       expect(response.body.match(/^event: error$/gm)).toHaveLength(1);
       expect(response.body).toContain('Upstream stream sent no data for 50ms.');
       expect(response.body).not.toContain('event: message_stop');
+      expect(upstream.cancelled()).toBe(true);
+    });
+
+    it('answers 504 on a converted stream when upstream sends headers but no body bytes', async () => {
+      const upstream = createStalledSseResponse([]);
+      vi.stubGlobal('fetch', vi.fn(async () => upstream.response) as typeof fetch);
+
+      const response = await injectWithIdleTimeout(
+        createProviderConfig('openai-main', 'openai_chat_completions', ['claude-sonnet-4']),
+        anthropicRequest
+      );
+
+      expect(response.statusCode).toBe(504);
+      expect(response.headers['content-type']).toContain('application/json');
+      expect(response.body).toContain('Upstream stream sent no data for 50ms.');
       expect(upstream.cancelled()).toBe(true);
     });
 

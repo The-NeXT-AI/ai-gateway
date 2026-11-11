@@ -70,6 +70,10 @@ function cancelQuietly(reader: ReadableStreamDefaultReader<Uint8Array>, reason: 
  * upstream goes quiet for `idleTimeoutMs`, and cancels the upstream body so the
  * provider socket is released. Every reader downstream, including clones, sees
  * an ordinary stream error; other bodies are returned untouched.
+ *
+ * A provider that already sent its terminal event and then just never hangs up
+ * has finished the answer, so the body closes cleanly instead: billing and
+ * trace readers on a clone still get a complete stream to account for.
  */
 export function withUpstreamStreamIdleTimeout(
   response: Response,
@@ -91,6 +95,7 @@ export function withUpstreamStreamIdleTimeout(
     signal?.addEventListener('abort', onAbort, { once: true });
   }
   const release = () => signal?.removeEventListener('abort', onAbort);
+  const detector = createSseTerminalEventDetector();
 
   const body = new ReadableStream<Uint8Array>(
     {
@@ -102,6 +107,10 @@ export function withUpstreamStreamIdleTimeout(
           release();
           if (error instanceof UpstreamStreamIdleTimeoutError) {
             cancelQuietly(reader, error);
+            if (detector.hasTerminalEvent()) {
+              controller.close();
+              return;
+            }
           }
           controller.error(error);
           return;
@@ -111,6 +120,7 @@ export function withUpstreamStreamIdleTimeout(
           controller.close();
           return;
         }
+        detector.push(result.value);
         controller.enqueue(result.value);
       },
       cancel(reason) {

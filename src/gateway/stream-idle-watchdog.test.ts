@@ -116,6 +116,24 @@ describe('withUpstreamStreamIdleTimeout', () => {
     expect(upstream.cancelled()).toBe(true);
     await expect(unreadClone.text()).rejects.toBeInstanceOf(UpstreamStreamIdleTimeoutError);
   });
+
+  it('closes cleanly when upstream goes quiet after its terminal event', async () => {
+    const stop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+    const upstream = createStalledEventStream([anthropicDelta, stop]);
+    const watched = withUpstreamStreamIdleTimeout(upstream.response, 20);
+    const billingClone = watched.clone();
+
+    expect(await watched.text()).toBe(anthropicDelta + stop);
+    expect(await billingClone.text()).toBe(anthropicDelta + stop);
+    expect(upstream.cancelled()).toBe(true);
+  });
+
+  it('still fails when the terminal event was cut off before its blank line', async () => {
+    const upstream = createStalledEventStream([anthropicDelta, 'event: message_stop\ndata: {"type":"message_stop"}\n']);
+    const watched = withUpstreamStreamIdleTimeout(upstream.response, 20);
+
+    await expect(watched.text()).rejects.toBeInstanceOf(UpstreamStreamIdleTimeoutError);
+  });
 });
 
 describe('withUpstreamStreamIdleTimeout client abort', () => {

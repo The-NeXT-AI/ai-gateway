@@ -165,10 +165,12 @@ export async function callUpstream(
       'Upstream request dispatched.'
     );
   }
+  // 0 means "not set separately": fall back to the overall timeout, never to undici's 300s default.
   const headersTimeoutMs = normalizeDispatcherTimeoutMs(requestOptions?.headersTimeoutMs ?? 0);
+  const bodyIdleTimeoutMs = normalizeDispatcherTimeoutMs(requestOptions?.bodyIdleTimeoutMs ?? 0);
   const dispatcher = upstreamFetchDispatcher({
-    headersTimeoutMs: requestOptions?.headersTimeoutMs ?? timeoutMs,
-    bodyTimeoutMs: requestOptions?.bodyIdleTimeoutMs ?? timeoutMs
+    headersTimeoutMs: headersTimeoutMs ?? timeoutMs,
+    bodyTimeoutMs: bodyIdleTimeoutMs ?? timeoutMs
   });
 
   let lastError: unknown;

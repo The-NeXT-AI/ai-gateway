@@ -298,6 +298,54 @@ describe('callUpstream', () => {
     }
   });
 
+  it('falls back to the overall timeout when headers and body idle timeouts are 0', async () => {
+    const originalFetch = global.fetch;
+    const globalDispatcher = { dispatch: undiciMock.dispatch };
+    undiciMock.getGlobalDispatcher.mockReturnValue(globalDispatcher);
+
+    try {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response('{}', { status: 200 })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      await callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        600000,
+        undefined,
+        undefined,
+        undefined,
+        { headersTimeoutMs: 0, bodyIdleTimeoutMs: 0 }
+      );
+
+      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+      const handler = {};
+      (fetchInit?.dispatcher as TestDispatcher | undefined)?.dispatch(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST'
+        },
+        handler
+      );
+
+      expect(undiciMock.dispatch).toHaveBeenCalledWith(
+        {
+          origin: 'https://example.test',
+          path: '/v1/responses',
+          method: 'POST',
+          bodyTimeout: 600000,
+          headersTimeout: 600000
+        },
+        handler
+      );
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   it('retries an attempt whose response headers miss the headers deadline', async () => {
     vi.useFakeTimers();
     const originalFetch = global.fetch;

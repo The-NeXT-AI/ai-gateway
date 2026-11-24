@@ -218,6 +218,12 @@ interface OpenAIReasoningAccumulator {
   rawDetails: unknown[];
 }
 
+interface OpenAIStreamError {
+  code?: string;
+  type?: string;
+  message: string;
+}
+
 interface OpenAINonStreamCollectionState {
   id: string;
   model: string;
@@ -228,6 +234,7 @@ interface OpenAINonStreamCollectionState {
   outputItems: Record<string, unknown>[];
   toolCalls: Map<number, OpenAIStreamToolCallAccumulator>;
   reasoning: OpenAIReasoningAccumulator;
+  streamError?: OpenAIStreamError;
 }
 
 interface AnthropicStreamToolUseAccumulator {
@@ -953,6 +960,12 @@ export async function collectOpenAINonStreamPayloadFromEventStream(
       continue;
     }
 
+    const eventType = asString(payload.type) || chunk.event || '';
+    if (eventType === 'error' || eventType === 'response.error' || eventType === 'response.failed') {
+      state.streamError ??= extractOpenAIStreamError(payload);
+      continue;
+    }
+
     if (isOpenAIResponsesStreamEvent(payload)) {
       collectOpenAINonStreamStateFromResponsesEvent(state, payload);
       continue;
@@ -980,9 +993,42 @@ function createOpenAINonStreamCollectionState(): OpenAINonStreamCollectionState 
   };
 }
 
+function extractOpenAIStreamError(payload: Record<string, unknown>): OpenAIStreamError {
+  const response = isObject(payload.response) ? payload.response : undefined;
+  const error = isObject(payload.error)
+    ? payload.error
+    : isObject(response?.error)
+      ? response.error
+      : undefined;
+  const code = asString(error?.code) || undefined;
+  const type = asString(error?.type) || undefined;
+  return {
+    ...(code ? { code } : {}),
+    ...(type ? { type } : {}),
+    message:
+      asString(error?.message) ||
+      asString(error?.detail) ||
+      asString(error?.reason) ||
+      asString(payload.message) ||
+      'Upstream Responses stream failed.'
+  };
+}
+
 function buildOpenAINonStreamPayloadFromCollectionState(
   state: OpenAINonStreamCollectionState
 ): Record<string, unknown> {
+  // An upstream that answers with an error event (or a failed response) carries no output,
+  // so the aggregated payload would look like an empty model answer. Surface the upstream
+  // reason instead: the response-parse step rejects empty payloads as
+  // "does not contain text output, reasoning output, or tool calls", which hides the real
+  // cause behind a generic 502.
+  if (!state.outputText && state.streamError) {
+    const label = state.streamError.code || state.streamError.type;
+    state.outputText = label
+      ? `Upstream error ${label}: ${state.streamError.message}`
+      : `Upstream error: ${state.streamError.message}`;
+  }
+
   if (state.completedResponse) {
     const completedResponse = { ...state.completedResponse };
     const output = Array.isArray(completedResponse.output) ? completedResponse.output : [];
